@@ -25,6 +25,10 @@ workflow = [
     "temporalio>=1.5",
     "langgraph>=0.2",
 ]
+# LLM-backed engines (OpenAI / GPT-5.5). Not required for the heuristic default.
+llm = [
+    "openai>=1.40",
+]
 server = [
     "uvicorn[standard]>=0.29",
 ]

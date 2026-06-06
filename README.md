@@ -42,7 +42,7 @@ agents) plug into these contracts later.
 | Package | Responsibility |
 | --- | --- |
 | `foundry.schemas` | Pydantic contracts for every run artifact: `RawTicket`, `TicketAnalysis`, `ContextBundle`, `RiskAssessment`, `DeliveryPlan`, `PullRequestState`, coding-agent job I/O. |
-| `foundry.engines` | The intelligence stages as `Protocol`s + deterministic reference implementations: `HeuristicAnalyzer`, `StaticContextEnricher`, `HeuristicRiskClassifier`, `TemplatePlanner`. Real LLM/LangGraph backends implement the same protocols. |
+| `foundry.engines` | The intelligence stages as `Protocol`s + implementations. Deterministic defaults: `HeuristicAnalyzer`, `StaticContextEnricher`, `HeuristicRiskClassifier`, `TemplatePlanner`. LLM-backed: `OpenAITicketAnalyzer` (GPT-5.5) behind a `StructuredLLM` abstraction — the *pre-approval gate* intelligence (readiness, missing requirements, acceptance-criteria normalisation), not implementation planning (that stays Cursor's job). |
 | `foundry.orchestrator` | `FoundryOrchestrator` — drives a run through analyse → enrich → risk → plan → policy gate → human approval → agent dispatch → PR monitoring, persisting every artifact, audit event and policy decision. |
 | `foundry.policy`  | The policy gate — **hard rules, not prompts**. `LocalPolicyEngine` (pure-Python, default) mirrors `foundry.rego` for an OPA server. |
 | `foundry.agents`  | The `CodingAgentProvider` abstraction + registry. Backends: `ManualProvider`, `InMemoryFakeProvider`, and **Cursor** — `CursorViaLinearProvider` (delegates approved work to Cursor by `@Cursor`-commenting the Linear issue) and `CursorCloudAgentProvider` (direct `POST /v0/agents`). Foundry is never built around one coding tool. |
@@ -166,6 +166,23 @@ Optional extras:
 - `pip install -e ".[server]"` then `uvicorn foundry.api.app:create_app --factory`
   (provide a webhook secret).
 - `pip install -e ".[workflow]"` for the Temporal / LangGraph adapters (added later).
+- `pip install -e ".[llm]"` for the OpenAI (GPT-5.5) analyzer.
+
+### Enabling the GPT-5.5 analyzer
+
+The heuristic analyzer is the default so the loop runs with no key. To use GPT-5.5
+for the pre-approval gate, inject the OpenAI-backed analyzer (needs `OPENAI_API_KEY`
++ network egress):
+
+```python
+from foundry.engines import build_openai_analyzer
+from foundry.orchestrator import FoundryOrchestrator
+
+orch = FoundryOrchestrator(session_factory, analyzer=build_openai_analyzer(model="gpt-5.5"))
+```
+
+The OpenAI call is isolated behind `StructuredLLM`; tests use `FakeStructuredLLM`,
+so none of the engine logic depends on a live model.
 
 ### Policy
 
@@ -185,7 +202,8 @@ mirrors `foundry_test.rego`).
 ```
 src/foundry/
   schemas/        artifact contracts (+ shared enums in common.py)
-  engines/        analyzer.py, enrichment.py, risk.py, planner.py
+  engines/        analyzer.py, enrichment.py, risk.py, planner.py,
+                  llm.py + openai_analyzer.py (GPT-5.5 gate intelligence)
   orchestrator.py the run state machine wiring it all together
   policy/         engine.py (Local + OPA), foundry.rego, foundry_test.rego
   agents/         provider.py, manual.py, cursor.py, registry.py
