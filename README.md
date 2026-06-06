@@ -41,7 +41,7 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.orchestrator` | The state machine that runs one ticket through the whole loop and writes down every decision. |
 | `foundry.drivers` | One seam for *how* a run executes: inline in-process today, durable Temporal later, same interface. |
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
-| `foundry.agents` | The coding-agent abstraction. `manual`, a test fake, and **Cursor** two ways (see below). |
+| `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, and **Cursor** two ways (see below). |
 | `foundry.connectors` | Adapters for the tools Foundry talks to: Linear (read the issue, write back status and comments) and GitHub (watch the PR). |
 | `foundry.api` | FastAPI app: signed Linear and GitHub webhooks, approval commands, run status. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
@@ -172,6 +172,10 @@ src/foundry/
   api/             the FastAPI app, webhook security, payload mapping
 tests/             one module per package, plus the gated Temporal tests
 ```
+
+## A note on the name
+
+Foundry takes its name from the Mandalorian forge, where the Armorer works raw beskar into something built to last and keeps to a strict creed the whole time. It fit a little too well. This thing takes raw tickets, forges them into solid reviewed work, and won't break its own rules to get there. The policy gate is the Armorer, the safety rules are the creed, and the coding agents are the ones swinging the hammer. Foundry just makes sure nobody melts something important. (If none of that means anything to you, no harm done, it still ships PRs.)
 
 ## Where it's going
 
