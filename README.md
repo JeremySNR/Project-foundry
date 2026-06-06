@@ -2,9 +2,13 @@
 
 **Foundry turns a Linear ticket into a reviewed pull request, safely, by letting an approved AI agent do the work under supervision.**
 
-That's the whole pitch. It is not another coding AI. It is the thing that sits *above* your coding AI and decides whether a piece of work is actually ready, what context it needs, whether it's safe to hand to an agent, who has to approve it, and what happened afterwards. The agent (Cursor, Claude, OpenAI, whatever) is the muscle. Foundry is the brain and the seatbelt.
+*Raw tickets go in. Reviewed pull requests come out. Nothing unsafe makes it through the forge.*
 
-If you want the formal product statement, it lives in [`VISION.md`](./VISION.md). This README is the practical, slightly more caffeinated version.
+That's the whole pitch. Foundry is not another coding AI. It is the thing that sits *above* your coding AI and decides whether a piece of work is actually ready, what context it needs, whether it's safe to hand to an agent, who has to approve it, and what happened afterwards. The agent (Cursor, Claude, OpenAI, whatever) is the muscle. Foundry is the brain and the seatbelt.
+
+The quick version: it's a bit like Terraform, but for shipping code with AI agents. You describe the intent, Foundry produces a plan, a human approves it, and only then does anything actually happen. Plan, approve, apply.
+
+The formal product statement lives in [`VISION.md`](./VISION.md). This README is the practical, slightly more caffeinated version.
 
 ## So what is it, really?
 
@@ -25,16 +29,6 @@ Linear ticket
 
 And it deliberately **stops at a reviewed PR**. No auto-merge, no auto-deploy to production, no autonomous database migrations, no touching auth or payments without a human saying yes. The brakes are the product, not a missing feature.
 
-## Is this "the Kubernetes of agentic engineering"?
-
-Sort of, and it's worth being honest about where the analogy helps and where it lies to you.
-
-Where it fits: Kubernetes is a control plane that sits above interchangeable workloads (containers) and schedules and governs them. Foundry sits above interchangeable coding agents and schedules and governs them. Same shape. Swappable providers are basically the driver/CRD pattern, and we even use OPA, which is literally Kubernetes admission-control tech.
-
-Where it breaks: Kubernetes is about autonomous reconciliation at scale with no human in the loop. Foundry is almost the opposite on purpose. It runs a bounded, per-ticket workflow with a human approval gate in the middle, and the two things that make it valuable have no Kubernetes equivalent at all: it reasons about *intent* (is this work any good?), and it treats human approval as a first-class state, not a failure.
-
-So "Kubernetes of agentic engineering" is a great hook for the *shape*, but if you take it literally you'll miss the point. A more honest one-liner is "a control plane for agentic software delivery": it borrows the control-plane idea from Kubernetes, the durable-workflow idea from Temporal, and the admission-control idea from OPA, then adds the thing those don't have, which is judgement about the work itself. Use the k8s line in the pitch deck, just know what it's papering over.
-
 ## What actually exists today
 
 The whole governed loop is built and tested, with swappable parts at every layer so no single vendor or piece of infra can hold you hostage. Nothing here needs the network or a paid API key to run the test suite, because every external thing hides behind a seam with a fake on the other side.
@@ -54,7 +48,7 @@ The whole governed loop is built and tested, with swappable parts at every layer
 
 ### The Cursor handoff (the nice bit)
 
-You asked for the [Cursor Linear integration](https://cursor.com/blog/linear) and it's honestly the cleanest way to do this. Once a plan is approved, `CursorViaLinearProvider` drops an `@Cursor` comment with the governed instructions onto the Linear issue. Cursor's own integration runs the cloud agent, shows live status in Linear, and opens the PR. Foundry then watches that PR via the GitHub webhook and keeps Linear in sync. Foundry stays the control plane and never tries to be the agent. There's also `CursorCloudAgentProvider` that calls the Cursor API directly (`POST /v0/agents`) for triggers that don't come through Linear.
+The cleanest way to hand work off is the [Cursor Linear integration](https://cursor.com/blog/linear). Once a plan is approved, `CursorViaLinearProvider` drops an `@Cursor` comment with the governed instructions onto the Linear issue. Cursor's own integration runs the cloud agent, shows live status in Linear, and opens the PR. Foundry then watches that PR via the GitHub webhook and keeps Linear in sync. Foundry stays the control plane and never tries to be the agent. For triggers that don't come through Linear, `CursorCloudAgentProvider` calls the Cursor API directly (`POST /v0/agents`).
 
 ## Customising it
 
@@ -133,6 +127,8 @@ These are enforced, tested, and not negotiable by a prompt:
 - Secrets never end up in an agent prompt; job inputs are scanned before dispatch.
 - Every decision, every artifact, every approval is content-hashed and written down, so you can always answer "why did the agent do that?".
 
+These aren't suggestions, they're the creed. This is the Way.
+
 ## How it's wired
 
 ```
@@ -180,3 +176,7 @@ tests/             one module per package, plus the gated Temporal tests
 ## Where it's going
 
 The loop is complete and the seams are in place. What's left is mostly the stuff that needs real credentials or live infra to be worth doing: finishing the Temporal driver against a real server, Postgres migrations, container and deploy manifests, and a proper end-to-end smoke test against live Linear, GitHub, Cursor and OpenAI. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
+
+---
+
+*Forged in the covert. Raw ore in, beskar out.*
