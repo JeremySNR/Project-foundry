@@ -28,6 +28,7 @@ from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRun
 from foundry.engines import build_openai_analyzer
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
+from foundry.policy import LocalPolicyEngine
 from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
@@ -61,14 +62,14 @@ def _extract_event_id(payload: dict[str, Any], delivery_header: str | None) -> s
     return delivery_header or payload.get("deliveryId") or payload.get("id")
 
 
-def _is_trigger(payload: dict[str, Any]) -> bool:
+def _is_trigger(payload: dict[str, Any], *, label: str, status: str) -> bool:
     data = payload.get("data", {}) or {}
     labels = {
         lab.get("name") for lab in data.get("labels", []) if isinstance(lab, dict)
     }
-    if _TRIGGER_LABEL in labels:
+    if label in labels:
         return True
-    if (data.get("state") or {}).get("name") == _TRIGGER_STATUS:
+    if (data.get("state") or {}).get("name") == status:
         return True
     body = data.get("body") or payload.get("body") or ""
     command = parse_command(body)
@@ -77,12 +78,12 @@ def _is_trigger(payload: dict[str, Any]) -> bool:
     return body.strip().startswith("/foundry analyse")
 
 
-def _trigger_type(payload: dict[str, Any]) -> str:
+def _trigger_type(payload: dict[str, Any], *, status: str) -> str:
     data = payload.get("data", {}) or {}
     body = data.get("body") or payload.get("body") or ""
     if body.strip().startswith("/foundry"):
         return "comment_command"
-    if (data.get("state") or {}).get("name") == _TRIGGER_STATUS:
+    if (data.get("state") or {}).get("name") == status:
         return "status"
     return "label"
 
@@ -97,6 +98,8 @@ def create_app(
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
     driver: RunDriver | None = None,
+    trigger_label: str = _TRIGGER_LABEL,
+    trigger_status: str = _TRIGGER_STATUS,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -115,6 +118,8 @@ def create_app(
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
     app.state.github_connector = github_connector or GitHubConnector()
+    app.state.trigger_label = trigger_label
+    app.state.trigger_status = trigger_status
     # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
     app.state.processed_events = set()
 
@@ -142,7 +147,9 @@ def create_app(
         if event_id and event_id in app.state.processed_events:
             return {"status": "duplicate", "run": _existing_run(orch, ticket.issue_id)}
 
-        if not _is_trigger(payload):
+        if not _is_trigger(
+            payload, label=app.state.trigger_label, status=app.state.trigger_status
+        ):
             if event_id:
                 app.state.processed_events.add(event_id)
             return {"status": "ignored", "reason": "no trigger condition matched"}
@@ -160,7 +167,7 @@ def create_app(
         data = payload.get("data", {}) or {}
         run_id = app.state.driver.start(
             ticket,
-            trigger_type=_trigger_type(payload),
+            trigger_type=_trigger_type(payload, status=app.state.trigger_status),
             created_by=(data.get("actor") or {}).get("name"),
         )
         if event_id:
@@ -265,7 +272,7 @@ def _existing_run(orch: FoundryOrchestrator, issue_id: str) -> dict[str, Any] | 
 
 
 def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrator:
-    """Assemble an orchestrator from settings: GPT-5.5 + Linear wired if configured."""
+    """Assemble an orchestrator from settings: analyzer, policy thresholds, Linear."""
     analyzer = (
         build_openai_analyzer(model=settings.openai_model)
         if settings.use_openai_analyzer
@@ -277,7 +284,14 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
             transport=linear_transport(settings.linear_api_token)
         )
     return FoundryOrchestrator(
-        session_factory, analyzer=analyzer, issue_tracker=tracker
+        session_factory,
+        analyzer=analyzer,
+        issue_tracker=tracker,
+        policy_engine=LocalPolicyEngine(
+            repo_confidence_threshold=settings.repo_confidence_threshold
+        ),
+        max_files_changed=settings.max_files_changed,
+        forbidden_globs=settings.forbidden_globs,
     )
 
 
@@ -294,11 +308,19 @@ def app_from_settings(settings: Settings) -> FastAPI:
         webhook_secret=settings.linear_webhook_secret,
         session_factory=session_factory,
         orchestrator=build_orchestrator(settings, session_factory),
+        authorised_approvers=set(settings.authorised_approvers),
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
+        trigger_label=settings.trigger_label,
+        trigger_status=settings.trigger_status,
     )
 
 
 def app_from_env() -> FastAPI:
-    """Uvicorn factory entrypoint: ``uvicorn foundry.api.app:app_from_env --factory``."""
-    return app_from_settings(Settings.from_env())
+    """Uvicorn factory entrypoint: ``uvicorn foundry.api.app:app_from_env --factory``.
+
+    Reads ``FOUNDRY_CONFIG`` (path to a YAML file) plus environment overrides.
+    """
+    import os
+
+    return app_from_settings(Settings.load(os.environ.get("FOUNDRY_CONFIG"), env=os.environ))

@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.6,<3",
     "fastapi>=0.110",
     "sqlalchemy>=2.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

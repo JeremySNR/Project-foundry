@@ -98,6 +98,7 @@ class FoundryOrchestrator:
         provider: CodingAgentProvider | None = None,
         issue_tracker: IssueTracker | None = None,
         max_files_changed: int = 12,
+        forbidden_globs: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         self._sf = session_factory
         self._analyzer = analyzer or HeuristicAnalyzer()
@@ -109,6 +110,9 @@ class FoundryOrchestrator:
         # Optional: when set, Foundry writes progress/state back to the tracker.
         self._tracker = issue_tracker
         self._max_files_changed = max_files_changed
+        self._forbidden_globs = list(
+            forbidden_globs if forbidden_globs is not None else DEFAULT_FORBIDDEN_GLOBS
+        )
 
     # -- intake + planning ----------------------------------------------------
 
@@ -481,7 +485,7 @@ class FoundryOrchestrator:
             delivery_plan=plan,
             agent_instructions=plan.agent_instructions or "",
             constraints=JobConstraints(
-                do_not_modify=list(DEFAULT_FORBIDDEN_GLOBS),
+                do_not_modify=list(self._forbidden_globs),
                 required_tests=list(context.test_commands),
                 max_files_changed=self._max_files_changed,
             ),
@@ -514,11 +518,10 @@ class FoundryOrchestrator:
             approval={role: True for role in (approvals or set())},
         )
 
-    @staticmethod
-    def _forbidden_violations(files: list[str]) -> list[str]:
+    def _forbidden_violations(self, files: list[str]) -> list[str]:
         violations: list[str] = []
         for path in files:
-            for pattern in DEFAULT_FORBIDDEN_GLOBS:
+            for pattern in self._forbidden_globs:
                 if fnmatch.fnmatch(path, pattern):
                     violations.append(path)
                     break

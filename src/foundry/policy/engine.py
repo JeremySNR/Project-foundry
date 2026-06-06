@@ -137,9 +137,15 @@ class LocalPolicyEngine:
 
     policy_name = "foundry.ticket_to_pr.v1"
 
+    def __init__(
+        self, *, repo_confidence_threshold: int = REPO_CONFIDENCE_THRESHOLD
+    ) -> None:
+        self._repo_confidence_threshold = repo_confidence_threshold
+
     def evaluate(self, payload: PolicyInput) -> PolicyDecision:
         reasons: list[str] = []
         required = _required_approvals(payload.risk)
+        threshold = self._repo_confidence_threshold
 
         # Read-only actions never need the autonomous-work gate, but we still
         # surface required approvals so the UI can plan ahead.
@@ -157,10 +163,10 @@ class LocalPolicyEngine:
             reasons.append("production deployment is blocked in the MVP")
         if payload.risk.database_migration:
             reasons.append("database migrations are blocked in the MVP")
-        if payload.repo.confidence < REPO_CONFIDENCE_THRESHOLD:
+        if payload.repo.confidence < threshold:
             reasons.append(
                 f"repository confidence {payload.repo.confidence} is below the "
-                f"threshold of {REPO_CONFIDENCE_THRESHOLD}"
+                f"threshold of {threshold}"
             )
         if payload.ticket.readiness is not ImplementationReadiness.READY:
             reasons.append(

@@ -1,0 +1,42 @@
+# Project Foundry config. Copy to foundry.yaml and point FOUNDRY_CONFIG at it.
+#
+# This file is for BEHAVIOUR. Secrets (webhook signing secrets, API tokens, the
+# database URL) come from the environment, never from here. Anything you set in
+# the environment overrides what's written below.
+
+database:
+  # Usually set via FOUNDRY_DATABASE_URL instead. SQLite is the default.
+  url: "sqlite+pysqlite:///:memory:"
+
+analyzer:
+  # "heuristic" needs no API key and is fully deterministic.
+  # "openai" uses GPT-5.5 for the pre-approval gate (set OPENAI_API_KEY).
+  provider: heuristic
+  model: gpt-5.5
+
+policy:
+  # A run is blocked unless one repo clears this confidence (0-100).
+  repo_confidence_threshold: 70
+  # PRs larger than this are routed to human review.
+  max_files_changed: 12
+  # Paths an agent may never touch. Matches are blocked.
+  forbidden_globs:
+    - "infra/**"
+    - "migrations/**"
+    - "**/.env*"
+    - "**/secrets/**"
+
+triggers:
+  # A run starts only on an explicit opt-in, never for every new issue.
+  label: "foundry:candidate"
+  status: "Ready for AI Analysis"
+
+approval:
+  # Who may run /foundry approve. Empty means nobody can approve yet.
+  authorised_approvers:
+    - "lead@example.com"
+
+temporal:
+  # Durable execution worker. Address is often set via TEMPORAL_ADDRESS.
+  address: "localhost:7233"
+  task_queue: "foundry-ticket-to-pr"

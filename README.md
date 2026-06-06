@@ -1,168 +1,100 @@
 # Project Foundry
 
-Project Foundry is an **AI-native engineering control plane** that turns product
-intent into governed software delivery. It is not the AI that writes code — it is
-the system that decides what work is requested, whether there is enough
-information, what context is needed, which system is affected, whether the work is
-safe for an agent, which agent to use, what approvals are required, and what
-happened afterwards.
+**Foundry turns a Linear ticket into a reviewed pull request, safely, by letting an approved AI agent do the work under supervision.**
 
-> **Read [`VISION.md`](./VISION.md) first** — it is the canonical product
-> description and the north star that keeps this build honest.
+That's the whole pitch. It is not another coding AI. It is the thing that sits *above* your coding AI and decides whether a piece of work is actually ready, what context it needs, whether it's safe to hand to an agent, who has to approve it, and what happened afterwards. The agent (Cursor, Claude, OpenAI, whatever) is the muscle. Foundry is the brain and the seatbelt.
 
-## Module 1 — Ticket-to-PR
+If you want the formal product statement, it lives in [`VISION.md`](./VISION.md). This README is the practical, slightly more caffeinated version.
 
-> **Promise:** Connect Linear and GitHub. Let approved AI agents turn well-formed
-> tickets into reviewed PRs, safely.
+## So what is it, really?
 
-The first Foundry loop:
+Picture the journey of a ticket today: someone writes "add customer favourites", an engineer reads it, fills in the gaps in their head, maybe asks an AI to write it, eyeballs the result, opens a PR. Foundry makes every one of those invisible steps explicit and governed:
 
 ```
 Linear ticket
-  → Foundry analyses & enriches it
-  → Foundry creates a delivery plan
-  → Human approves
-  → Foundry launches a coding agent
-  → Agent creates branch / PR
-  → PR reviewed by CI + CodeRabbit + human as needed
-  → Linear updated with status, summary, next action
+   -> Foundry reads it and asks: is this even clear enough to build?
+   -> gathers context (which repo, which files, what tests)
+   -> classifies risk (does this touch auth? payments? customer data?)
+   -> writes a delivery plan a human can actually sign off on
+   -> a human approves (this is a real step, not an afterthought)
+   -> Foundry hands the approved plan to a coding agent
+   -> the agent opens a PR
+   -> CI, CodeRabbit and humans review it
+   -> Linear gets updated with status, summary and next action
 ```
 
-The MVP **stops at a draft / ready-for-review PR**. Explicit non-goals: auto-merge,
-auto production deploy, incident-to-fix automation, a custom developer portal,
-multi-team marketplace, org-wide agent memory, and autonomous
-migration/auth/payment/customer-data changes.
+And it deliberately **stops at a reviewed PR**. No auto-merge, no auto-deploy to production, no autonomous database migrations, no touching auth or payments without a human saying yes. The brakes are the product, not a missing feature.
 
-## What's in this repository (the testable core foundation)
+## Is this "the Kubernetes of agentic engineering"?
 
-This first increment is the governed, fully unit-tested core — **no live external
-calls**. Live adapters (Temporal, LangGraph, OPA server, Linear/GitHub MCP, coding
-agents) plug into these contracts later.
+Sort of, and it's worth being honest about where the analogy helps and where it lies to you.
 
-| Package | Responsibility |
+Where it fits: Kubernetes is a control plane that sits above interchangeable workloads (containers) and schedules and governs them. Foundry sits above interchangeable coding agents and schedules and governs them. Same shape. Swappable providers are basically the driver/CRD pattern, and we even use OPA, which is literally Kubernetes admission-control tech.
+
+Where it breaks: Kubernetes is about autonomous reconciliation at scale with no human in the loop. Foundry is almost the opposite on purpose. It runs a bounded, per-ticket workflow with a human approval gate in the middle, and the two things that make it valuable have no Kubernetes equivalent at all: it reasons about *intent* (is this work any good?), and it treats human approval as a first-class state, not a failure.
+
+So "Kubernetes of agentic engineering" is a great hook for the *shape*, but if you take it literally you'll miss the point. A more honest one-liner is "a control plane for agentic software delivery": it borrows the control-plane idea from Kubernetes, the durable-workflow idea from Temporal, and the admission-control idea from OPA, then adds the thing those don't have, which is judgement about the work itself. Use the k8s line in the pitch deck, just know what it's papering over.
+
+## What actually exists today
+
+The whole governed loop is built and tested, with swappable parts at every layer so no single vendor or piece of infra can hold you hostage. Nothing here needs the network or a paid API key to run the test suite, because every external thing hides behind a seam with a fake on the other side.
+
+| Piece | What it does |
 | --- | --- |
-| `foundry.schemas` | Pydantic contracts for every run artifact: `RawTicket`, `TicketAnalysis`, `ContextBundle`, `RiskAssessment`, `DeliveryPlan`, `PullRequestState`, coding-agent job I/O. |
-| `foundry.engines` | The intelligence stages as `Protocol`s + implementations. Deterministic defaults: `HeuristicAnalyzer`, `StaticContextEnricher`, `HeuristicRiskClassifier`, `TemplatePlanner`. LLM-backed: `OpenAITicketAnalyzer` (GPT-5.5) behind a `StructuredLLM` abstraction — the *pre-approval gate* intelligence (readiness, missing requirements, acceptance-criteria normalisation), not implementation planning (that stays Cursor's job). |
-| `foundry.orchestrator` | `FoundryOrchestrator` — drives a run through analyse → enrich → risk → plan → policy gate → human approval → agent dispatch → PR monitoring, persisting every artifact, audit event and policy decision. |
-| `foundry.drivers` | The single seam for *how* a run executes. The API drives runs through a `RunDriver` rather than calling the orchestrator directly. `InlineDriver` runs steps in-process (default, tested); a Temporal-backed driver implementing the same interface is the documented swap point. |
-| `foundry.workflows` | Durable execution (Temporal). `TicketToPrWorkflow` wraps the orchestrator steps as retried activities and waits — for days if needed — on the approval and PR signals. Sequencing lives in pure, testable `decisions.py`; the Temporal pieces are the optional `workflow` extra. |
-| `foundry.policy`  | The policy gate — **hard rules, not prompts**. `LocalPolicyEngine` (pure-Python, default) mirrors `foundry.rego` for an OPA server. |
-| `foundry.agents`  | The `CodingAgentProvider` abstraction + registry. Backends: `ManualProvider`, `InMemoryFakeProvider`, and **Cursor** — `CursorViaLinearProvider` (delegates approved work to Cursor by `@Cursor`-commenting the Linear issue) and `CursorCloudAgentProvider` (direct `POST /v0/agents`). Foundry is never built around one coding tool. |
-| `foundry.connectors` | Adapters for the tools Foundry coordinates. `IssueTracker` protocol; `LinearConnector` (GraphQL via an injected transport); comment/state rendering that writes Foundry's analysis and `Foundry: …` states back to the issue; `GitHubConnector` that maps PR / review / check-suite webhooks to `PullRequestState` (no network in tests). |
-| `foundry.db`      | SQLAlchemy data model: runs, versioned content-hashed artifacts, append-only audit events, policy decisions, agent jobs. |
-| `foundry.audit`   | Content hashing + helpers to persist the run's verifiable trail. |
-| `foundry.api`     | FastAPI app **wired to the orchestrator**: signed + idempotent Linear webhook intake runs `intake_and_plan` and persists a real run; authorised `/foundry approve\|reject\|stop` commands drive approval + dispatch; run-status endpoints read from the DB. |
+| `foundry.schemas` | The contracts for everything a run produces: the ticket snapshot, analysis, context, risk, plan, PR state, agent job. Pydantic, strict, validated. |
+| `foundry.engines` | The intelligence. Deterministic heuristics by default; `OpenAITicketAnalyzer` (GPT-5.5) when you want a real brain at the gate. It judges readiness and missing info, it does not write code (that's the agent's job). |
+| `foundry.policy` | The hard rules, as actual rules and not vibes. A pure-Python engine plus a matching OPA/Rego bundle. This is what blocks unsafe or unclear work. |
+| `foundry.orchestrator` | The state machine that runs one ticket through the whole loop and writes down every decision. |
+| `foundry.drivers` | One seam for *how* a run executes: inline in-process today, durable Temporal later, same interface. |
+| `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
+| `foundry.agents` | The coding-agent abstraction. `manual`, a test fake, and **Cursor** two ways (see below). |
+| `foundry.connectors` | Adapters for the tools Foundry talks to: Linear (read the issue, write back status and comments) and GitHub (watch the PR). |
+| `foundry.api` | FastAPI app: signed Linear and GitHub webhooks, approval commands, run status. |
+| `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
-### The run loop (today, no live calls)
+### The Cursor handoff (the nice bit)
 
-```python
-from foundry.db import create_all, make_engine, make_session_factory
-from foundry.orchestrator import FoundryOrchestrator
-from foundry.schemas.ticket import RawTicket
+You asked for the [Cursor Linear integration](https://cursor.com/blog/linear) and it's honestly the cleanest way to do this. Once a plan is approved, `CursorViaLinearProvider` drops an `@Cursor` comment with the governed instructions onto the Linear issue. Cursor's own integration runs the cloud agent, shows live status in Linear, and opens the PR. Foundry then watches that PR via the GitHub webhook and keeps Linear in sync. Foundry stays the control plane and never tries to be the agent. There's also `CursorCloudAgentProvider` that calls the Cursor API directly (`POST /v0/agents`) for triggers that don't come through Linear.
 
-engine = make_engine()                 # SQLite by default
-create_all(engine)
-orch = FoundryOrchestrator(make_session_factory(engine))
+## Customising it
 
-ticket = RawTicket(
-    issue_id="i-1", issue_key="LIN-123", title="Add customer favourites",
-    description="Acceptance Criteria:\n- A favourites button exists",
-    known_repositories=["customer-web"],
-)
-run_id = orch.intake_and_plan(ticket, trigger_type="label")   # -> WAITING_APPROVAL
-orch.approve(run_id, user="lead@example.com")                  # -> APPROVED
-job = orch.dispatch_agent(run_id)                              # -> AGENT_RUNNING (policy re-checked)
-# ...later, when a PR is observed:
-# orch.record_pr(run_id, pr_state)                             # -> PR_OPEN | REVIEW_REQUIRED | BLOCKED
+Two kinds of config, kept deliberately separate:
+
+- **Behaviour goes in a YAML file.** Which analyzer, the policy thresholds, the trigger label, who's allowed to approve. Commit this.
+- **Secrets go in the environment.** Webhook signing secrets, API tokens, the database URL. Never commit these.
+
+Copy [`foundry.example.yaml`](./foundry.example.yaml) to `foundry.yaml`, edit it, and point `FOUNDRY_CONFIG` at it. The layering is: built-in defaults, then your YAML, then environment variables on top, so each deployment can override the sensitive and operational bits without editing the file.
+
+```yaml
+analyzer:
+  provider: openai          # or "heuristic" for the no-key default
+  model: gpt-5.5
+policy:
+  repo_confidence_threshold: 70   # block work we can't confidently place in a repo
+  max_files_changed: 12           # bigger PRs go to a human
+  forbidden_globs: ["infra/**", "migrations/**", "**/.env*", "**/secrets/**"]
+triggers:
+  label: "foundry:candidate"      # runs only start on an explicit opt-in
+approval:
+  authorised_approvers: ["lead@example.com"]
 ```
 
-The same loop is exposed over HTTP: a signed `POST /webhooks/linear` runs
-`intake_and_plan`, and `POST /runs/{id}/approval` with `/foundry approve` drives
-approval and agent dispatch. Signal the affected repo with a Linear label
-`repo:<name>` so a run can reach a confident repository without a live GitHub
-lookup.
+Secrets via env:
 
-### The Cursor handoff (preferred dispatch)
+| Env var | What it's for |
+| --- | --- |
+| `FOUNDRY_CONFIG` | Path to your YAML file. |
+| `FOUNDRY_DATABASE_URL` | SQLAlchemy URL. SQLite by default, Postgres in prod. |
+| `FOUNDRY_LINEAR_WEBHOOK_SECRET` | Verifies inbound Linear webhooks. |
+| `FOUNDRY_GITHUB_WEBHOOK_SECRET` | Verifies inbound GitHub webhooks. |
+| `FOUNDRY_LINEAR_API_TOKEN` | Turns on the live Linear connector (write-back). |
+| `FOUNDRY_GITHUB_API_TOKEN` | Turns on the live GitHub connector (PR files). |
+| `OPENAI_API_KEY` | Needed when the analyzer provider is `openai`. |
+| `TEMPORAL_ADDRESS` | The Temporal server, for durable runs. |
 
-Foundry's job is to *govern* the work, then delegate the actual coding. The
-recommended path uses Cursor's [Linear integration](https://cursor.com/blog/linear):
-once a plan is approved, `CursorViaLinearProvider` posts an `@Cursor` comment with
-the **governed, approved** instructions onto the Linear issue. Cursor's cloud agent
-then runs, reports status back in Linear, and auto-opens the PR — Foundry observes
-that PR (`record_pr`) and keeps the `Foundry: …` state in sync. This keeps Foundry
-the control plane above the tools rather than re-implementing agent plumbing.
-`CursorCloudAgentProvider` is the alternative for non-Linear triggers, launching an
-agent directly via `POST https://api.cursor.com/v0/agents`.
+The same code runs on a laptop (SQLite, heuristics, no keys) and in production (Postgres, GPT-5.5, live Linear and GitHub) with nothing changing but config. That's the point.
 
-Foundry then **observes** the resulting PR rather than trusting it: a signed
-`POST /webhooks/github` maps `pull_request` / `pull_request_review` / `check_suite`
-events to a `PullRequestState`, associates it back to the run by branch, and runs
-`record_pr` — which blocks forbidden-path changes, flags oversized PRs for human
-review, and syncs the `Foundry: …` state in Linear. That closes the loop:
-**Linear ticket → governed plan → approval → Cursor → PR → back to Linear.**
-
-> Going live needs the Cursor⨉Linear integration enabled (a Cursor admin
-> connection + GitHub), a Linear API token for the connector transport, and the
-> webhook signing secret — none of which are required for the test suite.
-
-### Durable execution (Temporal)
-
-`foundry.workflows.TicketToPrWorkflow` makes a run crash-proof: each orchestrator
-step is a retried Temporal activity, and the workflow can wait days on a
-`submit_decision` (approve/reject/stop) or `pr_observed` signal without holding
-resources. The sequencing is pure (`decisions.py`) and unit-tested; the activities
-are tested against a real orchestrator with no server. Run a worker with
-`foundry.workflows.run_worker(orchestrator)` against `TEMPORAL_ADDRESS`. The
-deterministic engines still swap for GPT-5.5 and the connectors for live
-Linear/GitHub — none of which changes the contracts above.
-
-### Governance guarantees encoded here
-
-- **Idempotent intake** — a redelivered webhook never creates a second run.
-- **Authenticated webhooks** — bad signatures are rejected; no workflow starts.
-- **Acceptance criteria required** — a ticket is not "buildable" without them, even
-  if the LLM claims it is ready.
-- **Repo confidence threshold** — work is blocked when no single repo clears 70.
-- **MVP hard blocks** — production deploy and DB migrations cannot run autonomously.
-- **Sensitive areas need approval** — auth/infra need engineering; customer-data/PII/
-  payments need security. Draft-PR mode only for low/medium risk; never auto-merge.
-- **No secrets to agents** — job inputs are scanned before dispatch.
-
-## Architecture (target)
-
-```
-Linear ──webhook/MCP──▶ Foundry API
-                          │
-                          ▼
-                    Temporal workflow         (crash-proof, long-running, waits)
-                          │
-                          ▼
-              LangGraph / Agents SDK flow      (analysis, context, planning)
-                          │
-                          ▼
-                 Ticket Intelligence Engine
-                          │
-                          ▼
-                      Policy Gate (OPA)         ← foundry.policy mirrors this
-                          │
-                          ▼
-                    Human approval (Linear)
-                          │
-                          ▼
-              CodingAgentProvider adapter        ← foundry.agents
-            (Cursor / Claude Code / OpenAI / manual)
-                          │
-                          ▼
-                  GitHub branch + PR
-                          │
-                          ▼
-              CI + CodeRabbit + human review
-                          │
-                          ▼
-                  Foundry PR monitor ─▶ Linear update
-```
-
-## Getting started
+## Running it
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -170,82 +102,81 @@ pip install -e ".[test]"
 pytest
 ```
 
-Optional extras:
-
-- `pip install -e ".[server]"` then `uvicorn foundry.api.app:app_from_env --factory`
-  (configured from the environment — see below).
-- `pip install -e ".[workflow]"` for the Temporal adapters.
-- `pip install -e ".[llm]"` for the OpenAI (GPT-5.5) analyzer.
-- `pip install -e ".[http]"` for the live Linear/GitHub HTTP transports.
-- `pip install -e ".[otel]"` for OpenTelemetry tracing.
-
-### Configuration & deployment
-
-`foundry.config.Settings.from_env()` reads everything from the environment, and
-`foundry.api.app_from_env()` builds a fully wired app from it — enabling the
-GPT-5.5 analyzer and the live Linear/GitHub connectors only when their tokens are
-present, so the same code runs locally on SQLite + heuristics and in production on
-Postgres + GPT-5.5 + live connectors.
-
-| Env var | Purpose |
-| --- | --- |
-| `FOUNDRY_DATABASE_URL` | SQLAlchemy URL (SQLite default; Postgres in prod). |
-| `FOUNDRY_LINEAR_WEBHOOK_SECRET` | Verifies inbound Linear webhooks. |
-| `FOUNDRY_GITHUB_WEBHOOK_SECRET` | Verifies inbound GitHub webhooks. |
-| `FOUNDRY_LINEAR_API_TOKEN` | Enables the live Linear connector (write-back). |
-| `FOUNDRY_GITHUB_API_TOKEN` | Enables the live GitHub connector (PR files). |
-| `FOUNDRY_USE_OPENAI_ANALYZER` / `FOUNDRY_OPENAI_MODEL` | Use GPT-5.5 at the gate. |
-| `TEMPORAL_ADDRESS` / `FOUNDRY_TASK_QUEUE` | Durable-execution worker. |
-
-Run paths are instrumented with OpenTelemetry spans (`foundry.observability`);
-without the `otel` extra the spans are zero-cost no-ops.
-
-### Enabling the GPT-5.5 analyzer
-
-The heuristic analyzer is the default so the loop runs with no key. To use GPT-5.5
-for the pre-approval gate, inject the OpenAI-backed analyzer (needs `OPENAI_API_KEY`
-+ network egress):
-
-```python
-from foundry.engines import build_openai_analyzer
-from foundry.orchestrator import FoundryOrchestrator
-
-orch = FoundryOrchestrator(session_factory, analyzer=build_openai_analyzer(model="gpt-5.5"))
-```
-
-The OpenAI call is isolated behind `StructuredLLM`; tests use `FakeStructuredLLM`,
-so none of the engine logic depends on a live model.
-
-### Policy
-
-The Python `LocalPolicyEngine` is the default and runs with no external service.
-The equivalent OPA bundle lives at `src/foundry/policy/foundry.rego`; run its tests
-with the OPA CLI:
+Serve the API:
 
 ```bash
-opa test src/foundry/policy
+pip install -e ".[server,http]"
+export FOUNDRY_CONFIG=foundry.yaml
+export FOUNDRY_LINEAR_WEBHOOK_SECRET=...   # and friends
+uvicorn foundry.api.app:app_from_env --factory
 ```
 
-The two backends are held to the same behaviour (`tests/test_policy_engine.py`
-mirrors `foundry_test.rego`).
+Optional extras, install what you need:
+
+- `.[llm]` GPT-5.5 analyzer
+- `.[http]` live Linear and GitHub transports
+- `.[workflow]` Temporal durable execution
+- `.[otel]` OpenTelemetry tracing (without it, the spans are free no-ops)
+
+There's also a real OPA bundle in `src/foundry/policy/foundry.rego`; run `opa test src/foundry/policy` if you have the OPA CLI. It's kept in lock-step with the Python engine and the two are tested against the same cases.
+
+## The safety rules, in plain English
+
+These are enforced, tested, and not negotiable by a prompt:
+
+- No acceptance criteria, no build. Even if the model swears it's ready.
+- If we can't confidently say which repo this belongs in, we stop and ask.
+- Production deploys and database migrations cannot run autonomously. Full stop, for now.
+- Auth, payments, PII and customer data need a human approval before an agent goes near them.
+- Bigger-than-expected PRs and anything touching forbidden paths get bounced to a human.
+- No auto-merge. Ever, in this version.
+- Secrets never end up in an agent prompt; job inputs are scanned before dispatch.
+- Every decision, every artifact, every approval is content-hashed and written down, so you can always answer "why did the agent do that?".
+
+## How it's wired
+
+```
+Linear --webhook--> Foundry API
+                       |
+                       v
+                  RunDriver  (inline now, Temporal-backed later)
+                       |
+                       v
+                FoundryOrchestrator
+                       |
+        analyse -> enrich -> classify risk -> plan
+                       |
+                  Policy gate (OPA-style hard rules)
+                       |
+                  Human approval (in Linear)
+                       |
+              CodingAgentProvider  (Cursor via Linear, Cursor API, manual)
+                       |
+                  GitHub PR opens
+                       |
+   GitHub --webhook--> Foundry watches the PR, updates Linear
+```
 
 ## Project layout
 
 ```
 src/foundry/
-  config.py       env-driven Settings
+  config.py        YAML + env settings
   observability.py OpenTelemetry spans (no-op without the extra)
-  schemas/        artifact contracts (+ shared enums in common.py)
-  engines/        analyzer.py, enrichment.py, risk.py, planner.py,
-                  llm.py + openai_analyzer.py (GPT-5.5 gate intelligence)
-  orchestrator.py the run state machine wiring it all together
-  drivers.py      RunDriver seam (InlineDriver; Temporal driver attaches here)
-  workflows/      decisions.py (pure) + workflow.py/activities.py/worker.py (Temporal)
-  policy/         engine.py (Local + OPA), foundry.rego, foundry_test.rego
-  agents/         provider.py, manual.py, cursor.py, registry.py
-  connectors/     base.py (IssueTracker), linear.py, github.py, comments.py, transport.py
-  db/             base.py, models.py
-  audit/          events.py
-  api/            app.py, security.py, mapping.py
-tests/            one module per package
+  schemas/         the run artifact contracts (+ enums in common.py)
+  engines/         analyzer / enrichment / risk / planner, plus the GPT-5.5 analyzer
+  orchestrator.py  the state machine that runs a ticket end to end
+  drivers.py       the RunDriver seam (inline today, Temporal attaches here)
+  workflows/       decisions.py (pure) + the Temporal workflow, activities, worker
+  policy/          the Python engine + foundry.rego (kept in sync)
+  agents/          provider abstraction: manual, fake, Cursor (two ways)
+  connectors/      Linear, GitHub, comment/state rendering, live HTTP transports
+  db/              SQLAlchemy models (runs, artifacts, audit, policy, jobs)
+  audit/           content hashing + the verifiable trail
+  api/             the FastAPI app, webhook security, payload mapping
+tests/             one module per package, plus the gated Temporal tests
 ```
+
+## Where it's going
+
+The loop is complete and the seams are in place. What's left is mostly the stuff that needs real credentials or live infra to be worth doing: finishing the Temporal driver against a real server, Postgres migrations, container and deploy manifests, and a proper end-to-end smoke test against live Linear, GitHub, Cursor and OpenAI. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.

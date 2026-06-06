@@ -264,6 +264,45 @@ def test_app_from_settings_wires_connectors_when_tokens_present() -> None:
     assert TestClient(app).get("/healthz").status_code == 200
 
 
+def test_settings_custom_trigger_label_is_honored() -> None:
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+
+    settings = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": SECRET})
+    settings = settings._with({"trigger_label": "ai:go"})
+    c = TestClient(app_from_settings(settings))
+
+    # The default label no longer triggers...
+    default_labelled = _basic_payload()
+    body = json.dumps(default_labelled).encode("utf-8")
+    sig = "sha256=" + compute_signature(SECRET, body)
+    resp = c.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": "d1", "Linear-Signature": sig},
+    )
+    assert resp.json()["status"] == "ignored"
+
+    # ...but the configured one does.
+    custom = {
+        "data": {
+            "id": "i2",
+            "issueId": "i2",
+            "identifier": "LIN-2",
+            "title": "x",
+            "labels": [{"name": "ai:go"}],
+        }
+    }
+    body2 = json.dumps(custom).encode("utf-8")
+    sig2 = "sha256=" + compute_signature(SECRET, body2)
+    resp2 = c.post(
+        "/webhooks/linear",
+        content=body2,
+        headers={"Linear-Delivery": "d2", "Linear-Signature": sig2},
+    )
+    assert resp2.json()["status"] == "started"
+
+
 def test_github_pr_closes_loop_to_pr_open(client) -> None:
     run_id = _approve_and_dispatch(client)
     run = client.get(f"/runs/{run_id}").json()
