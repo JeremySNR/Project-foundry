@@ -311,6 +311,17 @@ class FoundryOrchestrator:
             )
             return run.id if run else None
 
+    def find_run_id_for_branch(self, branch: str) -> str | None:
+        """Associate an observed PR back to its run via the agent job's branch."""
+        with self._sf() as session:
+            job = (
+                session.query(FoundryAgentJob)
+                .filter(FoundryAgentJob.branch == branch)
+                .order_by(FoundryAgentJob.started_at.desc())
+                .first()
+            )
+            return job.run_id if job else None
+
     def get_run(self, run_id: str) -> FoundryRun | None:
         with self._sf() as session:
             return session.get(FoundryRun, run_id)

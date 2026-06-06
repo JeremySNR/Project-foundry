@@ -8,12 +8,14 @@ from .comments import (
     format_cursor_delegation,
     state_for,
 )
+from .github import GitHubConnector
 from .linear import LinearConnector
 
 __all__ = [
     "IssueTracker",
     "InMemoryIssueTracker",
     "LinearConnector",
+    "GitHubConnector",
     "format_analysis_comment",
     "format_cursor_delegation",
     "state_for",

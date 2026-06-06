@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from foundry.agents.manual import InMemoryFakeProvider
 from foundry.api import create_app
 from foundry.api.security import compute_signature
+from foundry.connectors import GitHubConnector
 from foundry.db import create_all, make_engine, make_session_factory
 from foundry.orchestrator import FoundryOrchestrator
 
@@ -193,3 +194,66 @@ def test_unrecognised_command_is_rejected(client) -> None:
         json={"user": "lead@example.com", "text": "/foundry frobnicate"},
     )
     assert resp.status_code == 400
+
+
+# -- GitHub webhook closes the loop -------------------------------------------
+
+
+def _post_github(client, payload, *, event, sign=True):
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"X-GitHub-Event": event, "Content-Type": "application/json"}
+    headers["X-Hub-Signature-256"] = (
+        "sha256=" + compute_signature(SECRET, body) if sign else "sha256=bad"
+    )
+    return client.post("/webhooks/github", content=body, headers=headers)
+
+
+def _approve_and_dispatch(client) -> str:
+    run_id = _start_ready_run(client)
+    client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+    )
+    return run_id
+
+
+def test_github_unauthorised_rejected(client) -> None:
+    resp = _post_github(client, {}, event="pull_request", sign=False)
+    assert resp.status_code == 401
+
+
+def test_github_pr_for_unknown_branch_ignored(client) -> None:
+    payload = {
+        "pull_request": {
+            "number": 1,
+            "html_url": "u",
+            "head": {"ref": "someone-elses-branch"},
+            "state": "open",
+        },
+        "repository": {"full_name": "o/customer-web"},
+    }
+    resp = _post_github(client, payload, event="pull_request")
+    assert resp.json()["status"] == "ignored"
+
+
+def test_github_pr_closes_loop_to_pr_open(client) -> None:
+    run_id = _approve_and_dispatch(client)
+    run = client.get(f"/runs/{run_id}").json()
+    branch = "foundry/lin-123-add-customer-favourites"
+    assert run["status"] == "agent_running"
+
+    payload = {
+        "pull_request": {
+            "number": 42,
+            "html_url": "https://github.com/o/customer-web/pull/42",
+            "head": {"ref": branch},
+            "state": "open",
+            "draft": False,
+            "merged": False,
+        },
+        "repository": {"full_name": "o/customer-web"},
+    }
+    resp = _post_github(client, payload, event="pull_request")
+    assert resp.json()["status"] == "recorded"
+    assert resp.json()["run_status"] == "pr_open"
+    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"

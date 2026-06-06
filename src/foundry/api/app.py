@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 
+from foundry.connectors.github import GitHubConnector
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRun
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
@@ -88,6 +89,8 @@ def create_app(
     orchestrator: FoundryOrchestrator | None = None,
     authorised_approvers: set[str] | None = None,
     ticket_mapper: TicketMapper | None = None,
+    github_webhook_secret: str | None = None,
+    github_connector: GitHubConnector | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -99,6 +102,9 @@ def create_app(
     app.state.webhook_secret = webhook_secret
     app.state.authorised_approvers = authorised_approvers or set()
     app.state.ticket_mapper = ticket_mapper or linear_payload_to_ticket
+    # GitHub PR webhooks default to the same signing secret unless given one.
+    app.state.github_webhook_secret = github_webhook_secret or webhook_secret
+    app.state.github_connector = github_connector or GitHubConnector()
     # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
     app.state.processed_events = set()
 
@@ -150,6 +156,31 @@ def create_app(
         if event_id:
             app.state.processed_events.add(event_id)
         return {"status": "started", "run": _run_to_dict(orch.get_run(run_id))}
+
+    @app.post("/webhooks/github", status_code=202)
+    async def github_webhook(
+        request: Request,
+        signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+        event: str | None = Header(default=None, alias="X-GitHub-Event"),
+    ) -> dict[str, Any]:
+        raw = await request.body()
+        if not verify_signature(app.state.github_webhook_secret, raw, signature):
+            raise HTTPException(status_code=401, detail="invalid webhook signature")
+
+        payload = await request.json()
+        connector: GitHubConnector = app.state.github_connector
+        pr_state = connector.pr_state_from_event(event or "", payload)
+        if pr_state is None:
+            return {"status": "ignored", "reason": f"event '{event}' not handled"}
+
+        orch: FoundryOrchestrator = app.state.orchestrator
+        run_id = orch.find_run_id_for_branch(pr_state.branch)
+        if run_id is None:
+            # A PR Foundry did not initiate (no agent job for this branch).
+            return {"status": "ignored", "reason": "no run for branch"}
+
+        result = orch.record_pr(run_id, pr_state)
+        return {"status": "recorded", "run_status": result.value, "run_id": run_id}
 
     @app.get("/runs")
     def list_runs() -> dict[str, Any]:

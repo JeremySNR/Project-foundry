@@ -46,7 +46,7 @@ agents) plug into these contracts later.
 | `foundry.orchestrator` | `FoundryOrchestrator` — drives a run through analyse → enrich → risk → plan → policy gate → human approval → agent dispatch → PR monitoring, persisting every artifact, audit event and policy decision. |
 | `foundry.policy`  | The policy gate — **hard rules, not prompts**. `LocalPolicyEngine` (pure-Python, default) mirrors `foundry.rego` for an OPA server. |
 | `foundry.agents`  | The `CodingAgentProvider` abstraction + registry. Backends: `ManualProvider`, `InMemoryFakeProvider`, and **Cursor** — `CursorViaLinearProvider` (delegates approved work to Cursor by `@Cursor`-commenting the Linear issue) and `CursorCloudAgentProvider` (direct `POST /v0/agents`). Foundry is never built around one coding tool. |
-| `foundry.connectors` | Adapters for the tools Foundry coordinates. `IssueTracker` protocol; `LinearConnector` (GraphQL via an injected transport — no network in tests); comment/state rendering that writes Foundry's analysis and `Foundry: …` workflow states back to the issue. |
+| `foundry.connectors` | Adapters for the tools Foundry coordinates. `IssueTracker` protocol; `LinearConnector` (GraphQL via an injected transport); comment/state rendering that writes Foundry's analysis and `Foundry: …` states back to the issue; `GitHubConnector` that maps PR / review / check-suite webhooks to `PullRequestState` (no network in tests). |
 | `foundry.db`      | SQLAlchemy data model: runs, versioned content-hashed artifacts, append-only audit events, policy decisions, agent jobs. |
 | `foundry.audit`   | Content hashing + helpers to persist the run's verifiable trail. |
 | `foundry.api`     | FastAPI app **wired to the orchestrator**: signed + idempotent Linear webhook intake runs `intake_and_plan` and persists a real run; authorised `/foundry approve\|reject\|stop` commands drive approval + dispatch; run-status endpoints read from the DB. |
@@ -91,6 +91,13 @@ that PR (`record_pr`) and keeps the `Foundry: …` state in sync. This keeps Fou
 the control plane above the tools rather than re-implementing agent plumbing.
 `CursorCloudAgentProvider` is the alternative for non-Linear triggers, launching an
 agent directly via `POST https://api.cursor.com/v0/agents`.
+
+Foundry then **observes** the resulting PR rather than trusting it: a signed
+`POST /webhooks/github` maps `pull_request` / `pull_request_review` / `check_suite`
+events to a `PullRequestState`, associates it back to the run by branch, and runs
+`record_pr` — which blocks forbidden-path changes, flags oversized PRs for human
+review, and syncs the `Foundry: …` state in Linear. That closes the loop:
+**Linear ticket → governed plan → approval → Cursor → PR → back to Linear.**
 
 > Going live needs the Cursor⨉Linear integration enabled (a Cursor admin
 > connection + GitHub), a Linear API token for the connector transport, and the
