@@ -224,17 +224,22 @@ class OpaPolicyEngine:
                 "OpaPolicyEngine requires an injected http_post callable to reach OPA"
             )
         url = f"{self._base_url}/v1/data/foundry/ticket_to_pr/decision"
-        response = self._http_post(url, {"input": payload.model_dump(mode="json")})
-        result = response["result"]
-        return PolicyDecision(
-            policy_name=self.policy_name,
-            allowed=bool(result["allow"]),
-            reasons=list(result.get("reasons", [])),
-            allowed_agent_mode=AgentMode(result.get("allowed_agent_mode", "human_only")),
-            required_approvals=[
-                ApprovalRole(r) for r in result.get("required_approvals", [])
-            ],
-        )
+        try:
+            response = self._http_post(url, {"input": payload.model_dump(mode="json")})
+            result = response.get("result")
+            if not result:
+                raise ValueError("OPA returned no decision result")
+            return PolicyDecision(
+                policy_name=self.policy_name,
+                allowed=bool(result["allow"]),
+                reasons=list(result.get("reasons", [])),
+                allowed_agent_mode=AgentMode(result.get("allowed_agent_mode", "human_only")),
+                required_approvals=[
+                    ApprovalRole(r) for r in result.get("required_approvals", [])
+                ],
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"OPA policy evaluation failed: {exc}") from exc
 
 
 def default_engine() -> PolicyEngine:

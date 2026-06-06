@@ -23,10 +23,11 @@ class TicketAnalyzer(Protocol):
     def analyse(self, ticket: RawTicket) -> TicketAnalysis: ...
 
 
-# Keyword → work type. First match wins, in priority order.
+# Keyword → work type. All keywords are matched; the type with the most hits wins.
+# Priority is used as a tiebreaker: earlier entries beat later ones.
 _WORK_TYPE_KEYWORDS: tuple[tuple[WorkType, tuple[str, ...]], ...] = (
     (WorkType.INCIDENT, ("incident", "outage", "sev1", "sev2", "production down")),
-    (WorkType.BUG, ("bug", "error", "broken", "crash", "regression", "fails", "exception")),
+    (WorkType.BUG, ("bug", "broken", "crash", "regression", "fails", "traceback", "not working")),
     (WorkType.TECH_DEBT, ("refactor", "tech debt", "cleanup", "deprecate", "migrate code")),
     (WorkType.QUESTION, ("question", "how do we", "should we", "what is the")),
 )
@@ -34,17 +35,30 @@ _WORK_TYPE_KEYWORDS: tuple[tuple[WorkType, tuple[str, ...]], ...] = (
 _REPRODUCTION_HINTS = ("steps to reproduce", "reproduce", "repro:", "stack trace", "logs")
 
 # Headings under which acceptance criteria are commonly listed.
+# Handles plain text, markdown bold (**...**), and ATX headings (## ...).
 _AC_HEADING = re.compile(
-    r"(acceptance criteria|acceptance:|ac:|definition of done|dod:)", re.IGNORECASE
+    r"(?:\*{1,2}|#{1,6}\s*)?"  # optional markdown bold or heading prefix
+    r"(acceptance criteria|acceptance:|ac:|definition of done|dod:)"
+    r"(?:\*{1,2})?",            # optional closing bold markers
+    re.IGNORECASE,
 )
-_BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)\s*$")
+_BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.):])\s+(.*\S)\s*$")
 
 
 def _detect_work_type(blob: str) -> WorkType:
+    """Pick the work type with the most keyword hits; priority breaks ties."""
+    scores: dict[WorkType, int] = {}
     for work_type, keywords in _WORK_TYPE_KEYWORDS:
-        if any(k in blob for k in keywords):
-            return work_type
-    return WorkType.FEATURE
+        count = sum(1 for k in keywords if k in blob)
+        if count:
+            scores[work_type] = count
+
+    if not scores:
+        return WorkType.FEATURE
+
+    # Highest score wins; earlier position in tuple breaks ties.
+    priority = {wt: i for i, (wt, _) in enumerate(_WORK_TYPE_KEYWORDS)}
+    return min(scores, key=lambda wt: (-scores[wt], priority[wt]))
 
 
 def _extract_acceptance_criteria(description: str) -> list[str]:
@@ -60,7 +74,7 @@ def _extract_acceptance_criteria(description: str) -> list[str]:
         if _AC_HEADING.search(line):
             in_section = True
             # Allow "Acceptance criteria: do the thing" on one line.
-            after = _AC_HEADING.sub("", line).strip(" :-")
+            after = _AC_HEADING.sub("", line).strip(" :-*#")
             if after:
                 criteria.append(after)
             continue
@@ -128,10 +142,11 @@ class HeuristicAnalyzer:
     ) -> int:
         score = 0
         if not acceptance_criteria:
-            score += 50
+            score += 40
         if len(ticket.description.strip()) < 40:
-            score += 30
-        score += 15 * len(missing)
+            score += 25
+        # Each missing field adds proportionally less weight to avoid saturation.
+        score += sum(min(20, 15 - i * 3) for i, _ in enumerate(missing))
         return min(score, 100)
 
     @staticmethod

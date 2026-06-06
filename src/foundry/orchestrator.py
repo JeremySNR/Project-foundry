@@ -19,6 +19,8 @@ Lifecycle:
 from __future__ import annotations
 
 import fnmatch
+import logging
+from datetime import datetime, timezone
 
 from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
@@ -32,6 +34,7 @@ from foundry.audit.events import (
     new_id,
 )
 from foundry.db.models import (
+    AgentJobStatus,
     ArtifactType,
     AuditEventType,
     FoundryAgentJob,
@@ -79,6 +82,9 @@ _ARTIFACT_MODELS: dict[ArtifactType, type] = {
     ArtifactType.RISK_ASSESSMENT: RiskAssessment,
     ArtifactType.DELIVERY_PLAN: DeliveryPlan,
 }
+
+
+_log = logging.getLogger(__name__)
 
 
 class OrchestratorError(RuntimeError):
@@ -200,16 +206,30 @@ class FoundryOrchestrator:
 
         # Mirror the outcome back to the tracker (Linear) if one is configured.
         if self._tracker is not None:
-            self._tracker.post_comment(
-                ticket.issue_id,
-                format_analysis_comment(analysis, risk, plan, status),
-            )
-            self._tracker.set_state(ticket.issue_id, state_for(status))
+            try:
+                self._tracker.post_comment(
+                    ticket.issue_id,
+                    format_analysis_comment(analysis, risk, plan, status),
+                )
+                self._tracker.set_state(ticket.issue_id, state_for(status))
+            except Exception:
+                _log.exception(
+                    "tracker write-back failed for issue %s; Foundry state is "
+                    "authoritative but Linear may be stale",
+                    ticket.issue_id,
+                )
         return run_id
 
     def _notify_state(self, issue_id: str, status: RunStatus) -> None:
         if self._tracker is not None:
-            self._tracker.set_state(issue_id, state_for(status))
+            try:
+                self._tracker.set_state(issue_id, state_for(status))
+            except Exception:
+                _log.exception(
+                    "tracker state update failed for issue %s (-> %s)",
+                    issue_id,
+                    status.value,
+                )
 
     @staticmethod
     def _post_plan_status(
@@ -255,8 +275,6 @@ class FoundryOrchestrator:
             )
             run.status = RunStatus.APPROVED
             run.approved_by = user
-            from datetime import datetime, timezone
-
             run.approved_at = datetime.now(timezone.utc)
             run.current_step = "approved"
             issue_id = run.linear_issue_id
@@ -384,15 +402,13 @@ class FoundryOrchestrator:
             job_input = self._build_job_input(run_id, ticket, plan, context)
             job = self._provider.create_job(job_input)
 
-            from datetime import datetime, timezone
-
             session.add(
                 FoundryAgentJob(
                     id=new_id("job"),
                     run_id=run_id,
                     provider=job.provider,
                     provider_job_id=job.job_id,
-                    status=job.status.value,
+                    status=AgentJobStatus.RUNNING,
                     repo=job_input.repo,
                     branch=job_input.branch_name,
                     started_at=datetime.now(timezone.utc),
@@ -415,6 +431,34 @@ class FoundryOrchestrator:
 
     # -- PR monitoring --------------------------------------------------------
 
+    def mark_agent_failed(self, run_id: str, *, reason: str = "agent error") -> None:
+        """Mark a run as failed when the agent crashes without creating a PR."""
+        with self._sf() as session:
+            run = self._require_run(session, run_id)
+            run.status = RunStatus.EXECUTION_FAILED
+            run.current_step = "failed"
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.AGENT_FAILED,
+                    actor_type="foundry",
+                    metadata={"reason": reason},
+                )
+            )
+            job = (
+                session.query(FoundryAgentJob)
+                .filter(FoundryAgentJob.run_id == run_id)
+                .order_by(FoundryAgentJob.started_at.desc())
+                .first()
+            )
+            if job is not None:
+                job.status = "failed"
+                job.error = reason
+                job.completed_at = datetime.now(timezone.utc)
+            issue_id = run.linear_issue_id
+            session.commit()
+        self._notify_state(issue_id, RunStatus.EXECUTION_FAILED)
+
     @traced("foundry.record_pr")
     def record_pr(self, run_id: str, pr_state: PullRequestState) -> RunStatus:
         """Record an observed PR and decide the resulting run status.
@@ -427,6 +471,11 @@ class FoundryOrchestrator:
 
         with self._sf() as session:
             run = self._require_run(session, run_id)
+            if run.status is not RunStatus.AGENT_RUNNING:
+                raise OrchestratorError(
+                    f"run {run_id} is '{run.status.value}', not agent_running; "
+                    "cannot record a PR for a run that hasn't dispatched an agent"
+                )
             self._add(session, run_id, ArtifactType.PR_STATE, pr_state)
             session.add(
                 build_audit_event(

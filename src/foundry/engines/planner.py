@@ -109,7 +109,7 @@ class TemplatePlanner:
             scope=list(analysis.acceptance_criteria),
             out_of_scope=["Anything not listed in the acceptance criteria."],
             affected_repositories=affected,
-            expected_files_or_areas=[f.path for f in context.candidate_files],
+            expected_files_or_areas=[],  # populated by richer context enrichers
             implementation_steps=steps,
             test_plan=test_plan,
             rollback_considerations=["Revert the PR; no data migration involved."],

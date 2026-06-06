@@ -15,15 +15,23 @@ from foundry.schemas.context import ContextBundle
 from foundry.schemas.risk import RiskAssessment, SensitiveAreas
 from foundry.schemas.ticket import RawTicket
 
-# Keyword signals for each sensitive area.
+# Keyword signals for each sensitive area. Prefer multi-word phrases over
+# single words to reduce false positives (e.g. "error" is not a payment signal,
+# "checkout" alone doesn't mean payments, "infra" alone is too broad).
 _SENSITIVE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "auth": ("auth", "login", "oauth", "sso", "session token", "permission"),
-    "payments": ("payment", "billing", "stripe", "invoice", "checkout"),
+    "auth": ("oauth", "sso", "session token", "login flow", "authentication", "authorisation",
+             "authorization", "access token", "jwt", "password reset"),
+    "payments": ("payment", "billing", "stripe", "invoice", "payment gateway",
+                 "credit card", "card number", "transaction"),
     "customer_data": ("customer data", "customer record", "personal data"),
-    "pii": ("pii", "gdpr", "email address", "phone number", "passport"),
-    "database_migration": ("migration", "schema change", "alter table", "drop column"),
-    "infrastructure": ("terraform", "kubernetes", "helm", "infra", "deployment config"),
-    "production_deploy": ("deploy to production", "prod deploy", "release to prod"),
+    "pii": ("pii", "gdpr", "email address", "phone number", "passport",
+            "date of birth", "national insurance", "social security"),
+    "database_migration": ("migration", "schema change", "alter table", "drop column",
+                            "drop table", "add column"),
+    "infrastructure": ("terraform", "kubernetes", "helm chart", "deployment config",
+                       "infrastructure as code", "k8s manifest"),
+    "production_deploy": ("deploy to production", "prod deploy", "release to prod",
+                          "production release"),
 }
 
 
@@ -39,7 +47,9 @@ class HeuristicRiskClassifier:
     def classify(
         self, ticket: RawTicket, analysis: TicketAnalysis, context: ContextBundle
     ) -> RiskAssessment:
-        blob = ticket.text_blob()
+        # Use risk_blob (title + description only) to avoid stale comments
+        # inflating risk scores.
+        blob = ticket.risk_blob()
         flags = {
             area: any(k in blob for k in keywords)
             for area, keywords in _SENSITIVE_KEYWORDS.items()
