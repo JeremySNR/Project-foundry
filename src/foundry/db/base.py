@@ -10,6 +10,7 @@ import os
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 
 class Base(DeclarativeBase):
@@ -18,8 +19,14 @@ class Base(DeclarativeBase):
 
 def make_engine(url: str | None = None):
     url = url or os.environ.get("FOUNDRY_DATABASE_URL", "sqlite+pysqlite:///:memory:")
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(url, future=True, connect_args=connect_args)
+    kwargs: dict = {"future": True}
+    if url.startswith("sqlite"):
+        kwargs["connect_args"] = {"check_same_thread": False}
+        if ":memory:" in url:
+            # Share one connection so every session sees the same in-memory DB
+            # (each new SQLite :memory: connection is otherwise a fresh database).
+            kwargs["poolclass"] = StaticPool
+    return create_engine(url, **kwargs)
 
 
 def make_session_factory(engine):

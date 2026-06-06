@@ -28,6 +28,7 @@ from .context import CandidateFile, CandidateRepository, ContextBundle
 from .plan import DeliveryPlan, ImplementationStep, TestPlan
 from .pr import PullRequestState
 from .risk import RiskAssessment, SensitiveAreas
+from .ticket import LinkedResource, RawTicket
 
 __all__ = [
     # enums / constants
@@ -57,6 +58,9 @@ __all__ = [
     "DeliveryPlan",
     "ImplementationStep",
     "TestPlan",
+    # ticket
+    "RawTicket",
+    "LinkedResource",
     # pr
     "PullRequestState",
     # agent

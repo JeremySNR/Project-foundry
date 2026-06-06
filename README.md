@@ -37,12 +37,41 @@ agents) plug into these contracts later.
 
 | Package | Responsibility |
 | --- | --- |
-| `foundry.schemas` | Pydantic contracts for every run artifact: `TicketAnalysis`, `ContextBundle`, `RiskAssessment`, `DeliveryPlan`, `PullRequestState`, coding-agent job I/O. |
+| `foundry.schemas` | Pydantic contracts for every run artifact: `RawTicket`, `TicketAnalysis`, `ContextBundle`, `RiskAssessment`, `DeliveryPlan`, `PullRequestState`, coding-agent job I/O. |
+| `foundry.engines` | The intelligence stages as `Protocol`s + deterministic reference implementations: `HeuristicAnalyzer`, `StaticContextEnricher`, `HeuristicRiskClassifier`, `TemplatePlanner`. Real LLM/LangGraph backends implement the same protocols. |
+| `foundry.orchestrator` | `FoundryOrchestrator` — drives a run through analyse → enrich → risk → plan → policy gate → human approval → agent dispatch → PR monitoring, persisting every artifact, audit event and policy decision. |
 | `foundry.policy`  | The policy gate — **hard rules, not prompts**. `LocalPolicyEngine` (pure-Python, default) mirrors `foundry.rego` for an OPA server. |
 | `foundry.agents`  | The `CodingAgentProvider` abstraction (`ManualProvider`, `InMemoryFakeProvider`) + registry. Foundry is never built around one coding tool. |
 | `foundry.db`      | SQLAlchemy data model: runs, versioned content-hashed artifacts, append-only audit events, policy decisions, agent jobs. |
 | `foundry.audit`   | Content hashing + helpers to persist the run's verifiable trail. |
 | `foundry.api`     | FastAPI skeleton: signed Linear webhook intake (idempotent), authorised approval commands, run-status endpoints. |
+
+### The run loop (today, no live calls)
+
+```python
+from foundry.db import create_all, make_engine, make_session_factory
+from foundry.orchestrator import FoundryOrchestrator
+from foundry.schemas.ticket import RawTicket
+
+engine = make_engine()                 # SQLite by default
+create_all(engine)
+orch = FoundryOrchestrator(make_session_factory(engine))
+
+ticket = RawTicket(
+    issue_id="i-1", issue_key="LIN-123", title="Add customer favourites",
+    description="Acceptance Criteria:\n- A favourites button exists",
+    known_repositories=["customer-web"],
+)
+run_id = orch.intake_and_plan(ticket, trigger_type="label")   # -> WAITING_APPROVAL
+orch.approve(run_id, user="lead@example.com")                  # -> APPROVED
+job = orch.dispatch_agent(run_id)                              # -> AGENT_RUNNING (policy re-checked)
+# ...later, when a PR is observed:
+# orch.record_pr(run_id, pr_state)                             # -> PR_OPEN | REVIEW_REQUIRED | BLOCKED
+```
+
+A Temporal workflow will later wrap these steps as durable activities; the
+deterministic engines are swapped for LLM/LangGraph and the connectors for the
+Linear/GitHub MCP servers — none of which changes the contracts above.
 
 ### Governance guarantees encoded here
 
@@ -121,11 +150,13 @@ mirrors `foundry_test.rego`).
 
 ```
 src/foundry/
-  schemas/   artifact contracts (+ shared enums in common.py)
-  policy/    engine.py (Local + OPA), foundry.rego, foundry_test.rego
-  agents/    provider.py, manual.py, registry.py
-  db/        base.py, models.py
-  audit/     events.py
-  api/       app.py, security.py, store.py
-tests/       one module per package
+  schemas/        artifact contracts (+ shared enums in common.py)
+  engines/        analyzer.py, enrichment.py, risk.py, planner.py
+  orchestrator.py the run state machine wiring it all together
+  policy/         engine.py (Local + OPA), foundry.rego, foundry_test.rego
+  agents/         provider.py, manual.py, registry.py
+  db/             base.py, models.py
+  audit/          events.py
+  api/            app.py, security.py, store.py
+tests/            one module per package
 ```
