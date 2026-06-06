@@ -19,9 +19,13 @@ from typing import Any, Callable
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 
+from foundry.config import Settings
 from foundry.connectors.github import GitHubConnector
+from foundry.connectors.linear import LinearConnector
+from foundry.connectors.transport import github_transport, linear_transport
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRun
+from foundry.engines import build_openai_analyzer
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.schemas.common import ApprovalRole
 from foundry.schemas.ticket import RawTicket
@@ -250,3 +254,46 @@ def _existing_run(orch: FoundryOrchestrator, issue_id: str) -> dict[str, Any] | 
         return None
     run_id = orch.find_run_id_for_issue(issue_id)
     return _run_to_dict(orch.get_run(run_id)) if run_id else None
+
+
+# -- deployment entrypoints ---------------------------------------------------
+
+
+def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrator:
+    """Assemble an orchestrator from settings: GPT-5.5 + Linear wired if configured."""
+    analyzer = (
+        build_openai_analyzer(model=settings.openai_model)
+        if settings.use_openai_analyzer
+        else None
+    )
+    tracker = None
+    if settings.linear_api_token:
+        tracker = LinearConnector(
+            transport=linear_transport(settings.linear_api_token)
+        )
+    return FoundryOrchestrator(
+        session_factory, analyzer=analyzer, issue_tracker=tracker
+    )
+
+
+def app_from_settings(settings: Settings) -> FastAPI:
+    engine = make_engine(settings.database_url)
+    create_all(engine)
+    session_factory = make_session_factory(engine)
+    github_connector = (
+        GitHubConnector(transport=github_transport(settings.github_api_token))
+        if settings.github_api_token
+        else None
+    )
+    return create_app(
+        webhook_secret=settings.linear_webhook_secret,
+        session_factory=session_factory,
+        orchestrator=build_orchestrator(settings, session_factory),
+        github_webhook_secret=settings.github_webhook_secret,
+        github_connector=github_connector,
+    )
+
+
+def app_from_env() -> FastAPI:
+    """Uvicorn factory entrypoint: ``uvicorn foundry.api.app:app_from_env --factory``."""
+    return app_from_settings(Settings.from_env())

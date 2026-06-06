@@ -24,6 +24,7 @@ from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_analysis_comment, state_for
+from foundry.observability import traced
 from foundry.audit.events import (
     build_artifact,
     build_audit_event,
@@ -111,6 +112,7 @@ class FoundryOrchestrator:
 
     # -- intake + planning ----------------------------------------------------
 
+    @traced("foundry.intake_and_plan")
     def intake_and_plan(
         self, ticket: RawTicket, *, trigger_type: str, created_by: str | None = None
     ) -> str:
@@ -332,6 +334,7 @@ class FoundryOrchestrator:
 
     # -- agent dispatch -------------------------------------------------------
 
+    @traced("foundry.dispatch_agent")
     def dispatch_agent(self, run_id: str) -> CodingAgentJob:
         """Re-check policy with the recorded approvals, then launch the provider."""
         with self._sf() as session:
@@ -408,6 +411,7 @@ class FoundryOrchestrator:
 
     # -- PR monitoring --------------------------------------------------------
 
+    @traced("foundry.record_pr")
     def record_pr(self, run_id: str, pr_state: PullRequestState) -> RunStatus:
         """Record an observed PR and decide the resulting run status.
 

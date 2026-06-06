@@ -236,6 +236,34 @@ def test_github_pr_for_unknown_branch_ignored(client) -> None:
     assert resp.json()["status"] == "ignored"
 
 
+def test_app_from_settings_boots_with_defaults() -> None:
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+
+    app = app_from_settings(Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"}))
+    c = TestClient(app)
+    assert c.get("/healthz").json() == {"status": "ok"}
+    assert c.get("/runs").json() == {"runs": []}
+
+
+def test_app_from_settings_wires_connectors_when_tokens_present() -> None:
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+
+    # Tokens present => Linear tracker + GitHub connector are constructed (lazily,
+    # no network at construction time). The app should still boot cleanly.
+    app = app_from_settings(
+        Settings.from_env(
+            {
+                "FOUNDRY_LINEAR_WEBHOOK_SECRET": "s",
+                "FOUNDRY_LINEAR_API_TOKEN": "lt",
+                "FOUNDRY_GITHUB_API_TOKEN": "gt",
+            }
+        )
+    )
+    assert TestClient(app).get("/healthz").status_code == 200
+
+
 def test_github_pr_closes_loop_to_pr_open(client) -> None:
     run_id = _approve_and_dispatch(client)
     run = client.get(f"/runs/{run_id}").json()

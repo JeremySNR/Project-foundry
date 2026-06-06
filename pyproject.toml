@@ -29,6 +29,15 @@ workflow = [
 llm = [
     "openai>=1.40",
 ]
+# Live HTTP transports for the Linear/GitHub connectors.
+http = [
+    "httpx>=0.27",
+]
+# OpenTelemetry tracing. Foundry runs fine (no-op spans) without it.
+otel = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+]
 server = [
     "uvicorn[standard]>=0.29",
 ]

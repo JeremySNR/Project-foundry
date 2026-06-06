@@ -171,10 +171,33 @@ pytest
 
 Optional extras:
 
-- `pip install -e ".[server]"` then `uvicorn foundry.api.app:create_app --factory`
-  (provide a webhook secret).
-- `pip install -e ".[workflow]"` for the Temporal / LangGraph adapters (added later).
+- `pip install -e ".[server]"` then `uvicorn foundry.api.app:app_from_env --factory`
+  (configured from the environment — see below).
+- `pip install -e ".[workflow]"` for the Temporal adapters.
 - `pip install -e ".[llm]"` for the OpenAI (GPT-5.5) analyzer.
+- `pip install -e ".[http]"` for the live Linear/GitHub HTTP transports.
+- `pip install -e ".[otel]"` for OpenTelemetry tracing.
+
+### Configuration & deployment
+
+`foundry.config.Settings.from_env()` reads everything from the environment, and
+`foundry.api.app_from_env()` builds a fully wired app from it — enabling the
+GPT-5.5 analyzer and the live Linear/GitHub connectors only when their tokens are
+present, so the same code runs locally on SQLite + heuristics and in production on
+Postgres + GPT-5.5 + live connectors.
+
+| Env var | Purpose |
+| --- | --- |
+| `FOUNDRY_DATABASE_URL` | SQLAlchemy URL (SQLite default; Postgres in prod). |
+| `FOUNDRY_LINEAR_WEBHOOK_SECRET` | Verifies inbound Linear webhooks. |
+| `FOUNDRY_GITHUB_WEBHOOK_SECRET` | Verifies inbound GitHub webhooks. |
+| `FOUNDRY_LINEAR_API_TOKEN` | Enables the live Linear connector (write-back). |
+| `FOUNDRY_GITHUB_API_TOKEN` | Enables the live GitHub connector (PR files). |
+| `FOUNDRY_USE_OPENAI_ANALYZER` / `FOUNDRY_OPENAI_MODEL` | Use GPT-5.5 at the gate. |
+| `TEMPORAL_ADDRESS` / `FOUNDRY_TASK_QUEUE` | Durable-execution worker. |
+
+Run paths are instrumented with OpenTelemetry spans (`foundry.observability`);
+without the `otel` extra the spans are zero-cost no-ops.
 
 ### Enabling the GPT-5.5 analyzer
 
@@ -209,6 +232,8 @@ mirrors `foundry_test.rego`).
 
 ```
 src/foundry/
+  config.py       env-driven Settings
+  observability.py OpenTelemetry spans (no-op without the extra)
   schemas/        artifact contracts (+ shared enums in common.py)
   engines/        analyzer.py, enrichment.py, risk.py, planner.py,
                   llm.py + openai_analyzer.py (GPT-5.5 gate intelligence)
@@ -216,7 +241,7 @@ src/foundry/
   workflows/      decisions.py (pure) + workflow.py/activities.py/worker.py (Temporal)
   policy/         engine.py (Local + OPA), foundry.rego, foundry_test.rego
   agents/         provider.py, manual.py, cursor.py, registry.py
-  connectors/     base.py (IssueTracker), linear.py, comments.py
+  connectors/     base.py (IssueTracker), linear.py, github.py, comments.py, transport.py
   db/             base.py, models.py
   audit/          events.py
   api/            app.py, security.py, mapping.py
