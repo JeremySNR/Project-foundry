@@ -48,7 +48,7 @@ agents) plug into these contracts later.
 | `foundry.agents`  | The `CodingAgentProvider` abstraction (`ManualProvider`, `InMemoryFakeProvider`) + registry. Foundry is never built around one coding tool. |
 | `foundry.db`      | SQLAlchemy data model: runs, versioned content-hashed artifacts, append-only audit events, policy decisions, agent jobs. |
 | `foundry.audit`   | Content hashing + helpers to persist the run's verifiable trail. |
-| `foundry.api`     | FastAPI skeleton: signed Linear webhook intake (idempotent), authorised approval commands, run-status endpoints. |
+| `foundry.api`     | FastAPI app **wired to the orchestrator**: signed + idempotent Linear webhook intake runs `intake_and_plan` and persists a real run; authorised `/foundry approve\|reject\|stop` commands drive approval + dispatch; run-status endpoints read from the DB. |
 
 ### The run loop (today, no live calls)
 
@@ -72,6 +72,12 @@ job = orch.dispatch_agent(run_id)                              # -> AGENT_RUNNIN
 # ...later, when a PR is observed:
 # orch.record_pr(run_id, pr_state)                             # -> PR_OPEN | REVIEW_REQUIRED | BLOCKED
 ```
+
+The same loop is exposed over HTTP: a signed `POST /webhooks/linear` runs
+`intake_and_plan`, and `POST /runs/{id}/approval` with `/foundry approve` drives
+approval and agent dispatch. Interim until the Linear connector (Track 2): signal
+the affected repo with a Linear label `repo:<name>` so a run can reach a confident
+repository without a live GitHub lookup.
 
 A Temporal workflow will later wrap these steps as durable activities; the
 deterministic engines are swapped for LLM/LangGraph and the connectors for the

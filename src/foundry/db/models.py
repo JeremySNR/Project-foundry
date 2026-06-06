@@ -57,6 +57,7 @@ class AuditEventType(str, enum.Enum):
     POLICY_EVALUATED = "policy.evaluated"
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_GRANTED = "approval.granted"
+    APPROVAL_REJECTED = "approval.rejected"
     AGENT_STARTED = "agent.started"
     AGENT_FAILED = "agent.failed"
     PR_OPENED = "pr.opened"

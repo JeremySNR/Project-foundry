@@ -238,6 +238,66 @@ class FoundryOrchestrator:
             run.current_step = "approved"
             session.commit()
 
+    def reject(self, run_id: str, *, user: str) -> None:
+        """Terminate a run a human declined (from ``/foundry reject``)."""
+        self._terminate(
+            run_id,
+            user=user,
+            status=RunStatus.REJECTED,
+            event_type=AuditEventType.APPROVAL_REJECTED,
+        )
+
+    def stop(self, run_id: str, *, user: str) -> None:
+        """Halt a run a human stopped (from ``/foundry stop``)."""
+        self._terminate(
+            run_id,
+            user=user,
+            status=RunStatus.BLOCKED,
+            event_type=AuditEventType.RUN_BLOCKED,
+        )
+
+    def _terminate(
+        self,
+        run_id: str,
+        *,
+        user: str,
+        status: RunStatus,
+        event_type: AuditEventType,
+    ) -> None:
+        with self._sf() as session:
+            run = self._require_run(session, run_id)
+            run.status = status
+            run.current_step = status.value
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=event_type,
+                    actor_type="human",
+                    actor_id=user,
+                )
+            )
+            session.commit()
+
+    # -- read helpers (used by the API) ---------------------------------------
+
+    def find_run_id_for_issue(self, linear_issue_id: str) -> str | None:
+        with self._sf() as session:
+            run = (
+                session.query(FoundryRun)
+                .filter(FoundryRun.linear_issue_id == linear_issue_id)
+                .order_by(FoundryRun.created_at.desc())
+                .first()
+            )
+            return run.id if run else None
+
+    def get_run(self, run_id: str) -> FoundryRun | None:
+        with self._sf() as session:
+            return session.get(FoundryRun, run_id)
+
+    def list_runs(self) -> list[FoundryRun]:
+        with self._sf() as session:
+            return list(session.query(FoundryRun).order_by(FoundryRun.created_at).all())
+
     # -- agent dispatch -------------------------------------------------------
 
     def dispatch_agent(self, run_id: str) -> CodingAgentJob:
