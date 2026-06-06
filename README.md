@@ -44,6 +44,7 @@ agents) plug into these contracts later.
 | `foundry.schemas` | Pydantic contracts for every run artifact: `RawTicket`, `TicketAnalysis`, `ContextBundle`, `RiskAssessment`, `DeliveryPlan`, `PullRequestState`, coding-agent job I/O. |
 | `foundry.engines` | The intelligence stages as `Protocol`s + implementations. Deterministic defaults: `HeuristicAnalyzer`, `StaticContextEnricher`, `HeuristicRiskClassifier`, `TemplatePlanner`. LLM-backed: `OpenAITicketAnalyzer` (GPT-5.5) behind a `StructuredLLM` abstraction — the *pre-approval gate* intelligence (readiness, missing requirements, acceptance-criteria normalisation), not implementation planning (that stays Cursor's job). |
 | `foundry.orchestrator` | `FoundryOrchestrator` — drives a run through analyse → enrich → risk → plan → policy gate → human approval → agent dispatch → PR monitoring, persisting every artifact, audit event and policy decision. |
+| `foundry.workflows` | Durable execution (Temporal). `TicketToPrWorkflow` wraps the orchestrator steps as retried activities and waits — for days if needed — on the approval and PR signals. Sequencing lives in pure, testable `decisions.py`; the Temporal pieces are the optional `workflow` extra. |
 | `foundry.policy`  | The policy gate — **hard rules, not prompts**. `LocalPolicyEngine` (pure-Python, default) mirrors `foundry.rego` for an OPA server. |
 | `foundry.agents`  | The `CodingAgentProvider` abstraction + registry. Backends: `ManualProvider`, `InMemoryFakeProvider`, and **Cursor** — `CursorViaLinearProvider` (delegates approved work to Cursor by `@Cursor`-commenting the Linear issue) and `CursorCloudAgentProvider` (direct `POST /v0/agents`). Foundry is never built around one coding tool. |
 | `foundry.connectors` | Adapters for the tools Foundry coordinates. `IssueTracker` protocol; `LinearConnector` (GraphQL via an injected transport); comment/state rendering that writes Foundry's analysis and `Foundry: …` states back to the issue; `GitHubConnector` that maps PR / review / check-suite webhooks to `PullRequestState` (no network in tests). |
@@ -103,9 +104,16 @@ review, and syncs the `Foundry: …` state in Linear. That closes the loop:
 > connection + GitHub), a Linear API token for the connector transport, and the
 > webhook signing secret — none of which are required for the test suite.
 
-A Temporal workflow will later wrap these steps as durable activities; the
-deterministic engines are swapped for LLM/LangGraph and the connectors for the
-Linear/GitHub MCP servers — none of which changes the contracts above.
+### Durable execution (Temporal)
+
+`foundry.workflows.TicketToPrWorkflow` makes a run crash-proof: each orchestrator
+step is a retried Temporal activity, and the workflow can wait days on a
+`submit_decision` (approve/reject/stop) or `pr_observed` signal without holding
+resources. The sequencing is pure (`decisions.py`) and unit-tested; the activities
+are tested against a real orchestrator with no server. Run a worker with
+`foundry.workflows.run_worker(orchestrator)` against `TEMPORAL_ADDRESS`. The
+deterministic engines still swap for GPT-5.5 and the connectors for live
+Linear/GitHub — none of which changes the contracts above.
 
 ### Governance guarantees encoded here
 
@@ -205,6 +213,7 @@ src/foundry/
   engines/        analyzer.py, enrichment.py, risk.py, planner.py,
                   llm.py + openai_analyzer.py (GPT-5.5 gate intelligence)
   orchestrator.py the run state machine wiring it all together
+  workflows/      decisions.py (pure) + workflow.py/activities.py/worker.py (Temporal)
   policy/         engine.py (Local + OPA), foundry.rego, foundry_test.rego
   agents/         provider.py, manual.py, cursor.py, registry.py
   connectors/     base.py (IssueTracker), linear.py, comments.py
