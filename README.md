@@ -1,10 +1,14 @@
 # Project Foundry
 
-Project Foundry is an **engineering control plane**. It is not the AI that writes
-code — it is the system that decides what work is requested, whether there is
-enough information, what context is needed, which system is affected, whether the
-work is safe for an agent, which agent to use, what approvals are required, and
-what happened afterwards.
+Project Foundry is an **AI-native engineering control plane** that turns product
+intent into governed software delivery. It is not the AI that writes code — it is
+the system that decides what work is requested, whether there is enough
+information, what context is needed, which system is affected, whether the work is
+safe for an agent, which agent to use, what approvals are required, and what
+happened afterwards.
+
+> **Read [`VISION.md`](./VISION.md) first** — it is the canonical product
+> description and the north star that keeps this build honest.
 
 ## Module 1 — Ticket-to-PR
 
