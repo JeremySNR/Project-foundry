@@ -35,3 +35,12 @@ class RawTicket(BaseModel):
         """All free-text on the ticket, lower-cased, for keyword heuristics."""
         parts = [self.title, self.description, *self.comments]
         return "\n".join(parts).lower()
+
+    def risk_blob(self) -> str:
+        """Title and description only, excluding comments.
+
+        Used for risk classification so that stale or speculative comments
+        (e.g. 'maybe this touches payments') don't permanently flag a ticket
+        as high-risk based on historical discussion rather than stated intent.
+        """
+        return "\n".join([self.title, self.description]).lower()

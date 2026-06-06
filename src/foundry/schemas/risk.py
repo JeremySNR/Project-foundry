@@ -26,8 +26,8 @@ class SensitiveAreas(BaseModel):
         return any(self.model_dump().values())
 
     def names(self) -> list[str]:
-        """Names of sensitive areas that are flagged true."""
-        return [name for name, flagged in self.model_dump().items() if flagged]
+        """Names of sensitive areas that are flagged true, in deterministic order."""
+        return sorted(name for name, flagged in self.model_dump().items() if flagged)
 
 
 class RiskAssessment(BaseModel):

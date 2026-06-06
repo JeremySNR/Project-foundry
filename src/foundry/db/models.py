@@ -22,9 +22,11 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -49,6 +51,14 @@ class ArtifactType(str, enum.Enum):
     FINAL_SUMMARY = "final_summary"
 
 
+class AgentJobStatus(str, enum.Enum):
+    CREATED = "created"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class AuditEventType(str, enum.Enum):
     RUN_STARTED = "run.started"
     TICKET_FETCHED = "ticket.fetched"
@@ -69,6 +79,7 @@ class AuditEventType(str, enum.Enum):
 
 class FoundryRun(Base):
     __tablename__ = "foundry_runs"
+    __table_args__ = (UniqueConstraint("linear_issue_id", name="uq_run_issue_id"),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     linear_issue_id: Mapped[str] = mapped_column(String(128))
@@ -112,6 +123,7 @@ class FoundryRun(Base):
 
 class FoundryArtifact(Base):
     __tablename__ = "foundry_artifacts"
+    __table_args__ = (Index("idx_artifact_run_type", "run_id", "artifact_type"),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("foundry_runs.id"), index=True)
@@ -132,6 +144,9 @@ class FoundryAuditEvent(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("foundry_runs.id"), index=True)
+    # Monotonic per-run sequence number so audit events have a guaranteed order
+    # independent of sub-millisecond timestamp ties.
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
     event_type: Mapped[AuditEventType] = mapped_column(Enum(AuditEventType))
     actor_type: Mapped[str] = mapped_column(String(32))
     actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -169,7 +184,9 @@ class FoundryAgentJob(Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("foundry_runs.id"), index=True)
     provider: Mapped[str] = mapped_column(String(64))
     provider_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    status: Mapped[str] = mapped_column(String(32))
+    status: Mapped[AgentJobStatus] = mapped_column(
+        Enum(AgentJobStatus), default=AgentJobStatus.CREATED
+    )
     repo: Mapped[str | None] = mapped_column(String(128), nullable=True)
     branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(512), nullable=True)

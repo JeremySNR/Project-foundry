@@ -51,7 +51,7 @@ class Settings:
 
     # --- intelligence (behaviour: yaml) ---
     use_openai_analyzer: bool = False
-    openai_model: str = "gpt-5.5"
+    openai_model: str = "gpt-4o"
 
     # --- policy / safety knobs (behaviour: yaml) ---
     repo_confidence_threshold: int = 70
@@ -82,7 +82,18 @@ class Settings:
         if path is not None and Path(path).exists():
             settings = settings._with(_from_yaml(Path(path)))
         settings = settings._with(_from_env(env or os.environ))
+        settings._validate()
         return settings
+
+    def _validate(self) -> None:
+        if not (0 <= self.repo_confidence_threshold <= 100):
+            raise ValueError(
+                f"repo_confidence_threshold must be 0-100, got {self.repo_confidence_threshold}"
+            )
+        if self.max_files_changed < 1:
+            raise ValueError(
+                f"max_files_changed must be >= 1, got {self.max_files_changed}"
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":

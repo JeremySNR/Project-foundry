@@ -62,8 +62,11 @@ class StaticContextEnricher:
         for repo, keywords in self._catalog.items():
             hits = [k for k in keywords if k.lower() in blob]
             if hits:
-                # Confidence scales with the number of distinct keyword hits.
-                confidence = min(60 + 10 * len(hits), 95)
+                # Confidence scales with keyword hits. A single hit reaches 60%
+                # (below the 70% dispatch threshold) so one coincidental keyword
+                # cannot trigger autonomous work. Two independent hits are needed
+                # to cross the threshold.
+                confidence = min(50 + 10 * len(hits), 95)
                 consider(
                     repo,
                     confidence,

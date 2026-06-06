@@ -85,9 +85,26 @@ allowed_agent_mode := "draft_pr" if {
 	input.risk.overall_risk in {"low", "medium"}
 } else := "human_only"
 
+# Positive reasons mirror LocalPolicyEngine.evaluate() so audit trails are
+# consistent regardless of which backend evaluated the policy.
+allow_reasons contains msg if {
+	not is_autonomous
+	msg := sprintf("action '%s' is read-only / advisory", [input.action])
+}
+
+allow_reasons contains "all minimum policy checks passed" if {
+	is_autonomous
+	count(deny_reasons) == 0
+}
+
+# The reasons field surfaces deny reasons for blocked actions and allow reasons
+# for permitted ones, matching the Python engine's behaviour.
+reasons := [r | some r in deny_reasons] if count(deny_reasons) > 0
+else := [r | some r in allow_reasons]
+
 decision := {
 	"allow": allow,
-	"reasons": [r | some r in deny_reasons],
+	"reasons": reasons,
 	"allowed_agent_mode": allowed_agent_mode,
 	"required_approvals": [a | some a in required_approvals],
 }

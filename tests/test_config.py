@@ -8,7 +8,7 @@ from foundry.config import Settings
 def test_defaults_when_env_empty() -> None:
     s = Settings.from_env({})
     assert s.database_url.startswith("sqlite")
-    assert s.openai_model == "gpt-5.5"
+    assert s.openai_model == "gpt-4o"
     assert s.use_openai_analyzer is False
     assert s.github_webhook_secret is None
     assert s.task_queue == "foundry-ticket-to-pr"
@@ -23,7 +23,7 @@ def test_reads_env() -> None:
             "FOUNDRY_LINEAR_API_TOKEN": "lt",
             "FOUNDRY_GITHUB_API_TOKEN": "gt",
             "FOUNDRY_USE_OPENAI_ANALYZER": "true",
-            "FOUNDRY_OPENAI_MODEL": "gpt-5.5-2026-04-23",
+            "FOUNDRY_OPENAI_MODEL": "gpt-4o-2026-04-23",
             "TEMPORAL_ADDRESS": "temporal:7233",
         }
     )
@@ -33,7 +33,7 @@ def test_reads_env() -> None:
     assert s.linear_api_token == "lt"
     assert s.github_api_token == "gt"
     assert s.use_openai_analyzer is True
-    assert s.openai_model == "gpt-5.5-2026-04-23"
+    assert s.openai_model == "gpt-4o-2026-04-23"
     assert s.temporal_address == "temporal:7233"
 
 
@@ -49,7 +49,7 @@ database:
   url: "postgresql+psycopg://u@h/db"
 analyzer:
   provider: openai
-  model: gpt-5.5-2026-04-23
+  model: gpt-4o-2026-04-23
 policy:
   repo_confidence_threshold: 85
   max_files_changed: 5
@@ -75,7 +75,7 @@ def test_load_from_yaml(tmp_path) -> None:
     s = Settings.load(path, env={})
     assert s.database_url.startswith("postgresql")
     assert s.use_openai_analyzer is True
-    assert s.openai_model == "gpt-5.5-2026-04-23"
+    assert s.openai_model == "gpt-4o-2026-04-23"
     assert s.repo_confidence_threshold == 85
     assert s.max_files_changed == 5
     assert s.forbidden_globs == ("infra/**", "secrets/**")
@@ -93,11 +93,11 @@ def test_env_overrides_yaml(tmp_path) -> None:
         path,
         env={
             "FOUNDRY_DATABASE_URL": "sqlite+pysqlite:///:memory:",
-            "FOUNDRY_OPENAI_MODEL": "gpt-5.5",
+            "FOUNDRY_OPENAI_MODEL": "gpt-4o",
         },
     )
     assert s.database_url.startswith("sqlite")
-    assert s.openai_model == "gpt-5.5"
+    assert s.openai_model == "gpt-4o"
     # YAML-only knobs are untouched by env.
     assert s.repo_confidence_threshold == 85
     assert s.trigger_label == "ai:go"

@@ -243,7 +243,7 @@ def test_app_from_settings_boots_with_defaults() -> None:
     app = app_from_settings(Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"}))
     c = TestClient(app)
     assert c.get("/healthz").json() == {"status": "ok"}
-    assert c.get("/runs").json() == {"runs": []}
+    assert c.get("/runs").json()["runs"] == []
 
 
 def test_app_from_settings_wires_connectors_when_tokens_present() -> None:

@@ -133,6 +133,9 @@ def create_app(
         linear_signature: str | None = Header(default=None, alias="Linear-Signature"),
         delivery_id: str | None = Header(default=None, alias="Linear-Delivery"),
     ) -> dict[str, Any]:
+        content_type = request.headers.get("content-type", "application/json")
+        if content_type and "application/json" not in content_type:
+            raise HTTPException(status_code=400, detail="content-type must be application/json")
         raw = await request.body()
         if not verify_signature(app.state.webhook_secret, raw, linear_signature):
             # Reject unauthorised webhooks; no workflow starts.
@@ -180,6 +183,9 @@ def create_app(
         signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
         event: str | None = Header(default=None, alias="X-GitHub-Event"),
     ) -> dict[str, Any]:
+        content_type = request.headers.get("content-type", "application/json")
+        if content_type and "application/json" not in content_type:
+            raise HTTPException(status_code=400, detail="content-type must be application/json")
         raw = await request.body()
         if not verify_signature(app.state.github_webhook_secret, raw, signature):
             raise HTTPException(status_code=401, detail="invalid webhook signature")
@@ -201,9 +207,15 @@ def create_app(
         return {"status": "recorded", "run_status": run.status.value, "run_id": run_id}
 
     @app.get("/runs")
-    def list_runs() -> dict[str, Any]:
+    def list_runs(skip: int = 0, limit: int = 100) -> dict[str, Any]:
         orch: FoundryOrchestrator = app.state.orchestrator
-        return {"runs": [_run_to_dict(r) for r in orch.list_runs()]}
+        all_runs = orch.list_runs()
+        return {
+            "runs": [_run_to_dict(r) for r in all_runs[skip : skip + limit]],
+            "total": len(all_runs),
+            "skip": skip,
+            "limit": limit,
+        }
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
@@ -237,14 +249,23 @@ def create_app(
         if orch.get_run(run_id) is None:
             raise HTTPException(status_code=404, detail="run not found")
 
-        roles = {ApprovalRole(r) for r in body.get("roles", [])}
+        raw_roles = body.get("roles", [])
+        try:
+            roles = {ApprovalRole(r) for r in raw_roles}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid role: {exc}") from exc
+
         try:
             app.state.driver.submit_decision(
                 run_id, decision=command.command, user=user, roles=roles
             )
         except OrchestratorError as exc:
-            # e.g. approving a run that is not awaiting approval.
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            msg = str(exc)
+            # Policy gate blocked dispatch (security/risk rejection) → 403.
+            # Wrong state for the operation (e.g. already approved) → 409.
+            if "policy gate blocked" in msg:
+                raise HTTPException(status_code=403, detail=msg) from exc
+            raise HTTPException(status_code=409, detail=msg) from exc
 
         run = orch.get_run(run_id)
         # On approve, the driver also attempts dispatch; the run reaching
