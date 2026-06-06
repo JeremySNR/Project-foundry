@@ -45,7 +45,8 @@ agents) plug into these contracts later.
 | `foundry.engines` | The intelligence stages as `Protocol`s + deterministic reference implementations: `HeuristicAnalyzer`, `StaticContextEnricher`, `HeuristicRiskClassifier`, `TemplatePlanner`. Real LLM/LangGraph backends implement the same protocols. |
 | `foundry.orchestrator` | `FoundryOrchestrator` — drives a run through analyse → enrich → risk → plan → policy gate → human approval → agent dispatch → PR monitoring, persisting every artifact, audit event and policy decision. |
 | `foundry.policy`  | The policy gate — **hard rules, not prompts**. `LocalPolicyEngine` (pure-Python, default) mirrors `foundry.rego` for an OPA server. |
-| `foundry.agents`  | The `CodingAgentProvider` abstraction (`ManualProvider`, `InMemoryFakeProvider`) + registry. Foundry is never built around one coding tool. |
+| `foundry.agents`  | The `CodingAgentProvider` abstraction + registry. Backends: `ManualProvider`, `InMemoryFakeProvider`, and **Cursor** — `CursorViaLinearProvider` (delegates approved work to Cursor by `@Cursor`-commenting the Linear issue) and `CursorCloudAgentProvider` (direct `POST /v0/agents`). Foundry is never built around one coding tool. |
+| `foundry.connectors` | Adapters for the tools Foundry coordinates. `IssueTracker` protocol; `LinearConnector` (GraphQL via an injected transport — no network in tests); comment/state rendering that writes Foundry's analysis and `Foundry: …` workflow states back to the issue. |
 | `foundry.db`      | SQLAlchemy data model: runs, versioned content-hashed artifacts, append-only audit events, policy decisions, agent jobs. |
 | `foundry.audit`   | Content hashing + helpers to persist the run's verifiable trail. |
 | `foundry.api`     | FastAPI app **wired to the orchestrator**: signed + idempotent Linear webhook intake runs `intake_and_plan` and persists a real run; authorised `/foundry approve\|reject\|stop` commands drive approval + dispatch; run-status endpoints read from the DB. |
@@ -75,9 +76,25 @@ job = orch.dispatch_agent(run_id)                              # -> AGENT_RUNNIN
 
 The same loop is exposed over HTTP: a signed `POST /webhooks/linear` runs
 `intake_and_plan`, and `POST /runs/{id}/approval` with `/foundry approve` drives
-approval and agent dispatch. Interim until the Linear connector (Track 2): signal
-the affected repo with a Linear label `repo:<name>` so a run can reach a confident
-repository without a live GitHub lookup.
+approval and agent dispatch. Signal the affected repo with a Linear label
+`repo:<name>` so a run can reach a confident repository without a live GitHub
+lookup.
+
+### The Cursor handoff (preferred dispatch)
+
+Foundry's job is to *govern* the work, then delegate the actual coding. The
+recommended path uses Cursor's [Linear integration](https://cursor.com/blog/linear):
+once a plan is approved, `CursorViaLinearProvider` posts an `@Cursor` comment with
+the **governed, approved** instructions onto the Linear issue. Cursor's cloud agent
+then runs, reports status back in Linear, and auto-opens the PR — Foundry observes
+that PR (`record_pr`) and keeps the `Foundry: …` state in sync. This keeps Foundry
+the control plane above the tools rather than re-implementing agent plumbing.
+`CursorCloudAgentProvider` is the alternative for non-Linear triggers, launching an
+agent directly via `POST https://api.cursor.com/v0/agents`.
+
+> Going live needs the Cursor⨉Linear integration enabled (a Cursor admin
+> connection + GitHub), a Linear API token for the connector transport, and the
+> webhook signing secret — none of which are required for the test suite.
 
 A Temporal workflow will later wrap these steps as durable activities; the
 deterministic engines are swapped for LLM/LangGraph and the connectors for the
@@ -164,9 +181,10 @@ src/foundry/
   engines/        analyzer.py, enrichment.py, risk.py, planner.py
   orchestrator.py the run state machine wiring it all together
   policy/         engine.py (Local + OPA), foundry.rego, foundry_test.rego
-  agents/         provider.py, manual.py, registry.py
+  agents/         provider.py, manual.py, cursor.py, registry.py
+  connectors/     base.py (IssueTracker), linear.py, comments.py
   db/             base.py, models.py
   audit/          events.py
-  api/            app.py, security.py, store.py
+  api/            app.py, security.py, mapping.py
 tests/            one module per package
 ```

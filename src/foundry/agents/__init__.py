@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .cursor import CursorCloudAgentProvider, CursorViaLinearProvider
 from .manual import InMemoryFakeProvider, ManualProvider
 from .provider import (
     CodingAgentProvider,
@@ -16,6 +17,8 @@ __all__ = [
     "assert_no_secrets",
     "ManualProvider",
     "InMemoryFakeProvider",
+    "CursorViaLinearProvider",
+    "CursorCloudAgentProvider",
     "register",
     "get_provider",
     "available_providers",

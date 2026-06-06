@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from foundry.agents.manual import InMemoryFakeProvider
+from foundry.connectors import InMemoryIssueTracker
 from foundry.db import (
     FoundryAgentJob,
     FoundryArtifact,
@@ -179,3 +180,54 @@ def test_dispatch_requires_approval_first(session_factory) -> None:
     run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
     with pytest.raises(OrchestratorError):
         orch.dispatch_agent(run_id)
+
+
+def test_tracker_receives_comment_and_state_on_intake(session_factory) -> None:
+    tracker = InMemoryIssueTracker()
+    orch = _orch(session_factory, issue_tracker=tracker)
+    orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert len(tracker.comments["i-1"]) == 1
+    assert "Foundry analysis complete" in tracker.comments["i-1"][0]
+    assert tracker.states["i-1"] == "Foundry: Waiting Approval"
+
+
+def test_tracker_state_follows_run_through_to_pr(session_factory) -> None:
+    tracker = InMemoryIssueTracker()
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider, issue_tracker=tracker)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    assert tracker.states["i-1"] == "Foundry: Approved"
+    job = orch.dispatch_agent(run_id)
+    assert tracker.states["i-1"] == "Foundry: Agent Running"
+    provider.run(job.job_id)
+    orch.record_pr(
+        run_id,
+        PullRequestState(
+            repo="customer-web",
+            pr_number=1,
+            url="https://github.com/example/customer-web/pull/1",
+            branch="foundry/lin-123",
+            status=PRStatus.OPEN,
+            files_changed=["src/x.ts"],
+        ),
+    )
+    assert tracker.states["i-1"] == "Foundry: PR Open"
+
+
+def test_cursor_via_linear_delegation_end_to_end(session_factory) -> None:
+    # Foundry governs, then hands the approved work to Cursor via a Linear comment.
+    from foundry.agents import CursorViaLinearProvider
+
+    tracker = InMemoryIssueTracker()
+    orch = _orch(
+        session_factory,
+        provider=CursorViaLinearProvider(tracker),
+        issue_tracker=tracker,
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    orch.dispatch_agent(run_id)
+    # An @Cursor delegation comment was posted in addition to the analysis comment.
+    assert any(c.startswith("@Cursor") for c in tracker.comments["i-1"])
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING

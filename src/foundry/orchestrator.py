@@ -22,6 +22,8 @@ import fnmatch
 
 from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
+from foundry.connectors.base import IssueTracker
+from foundry.connectors.comments import format_analysis_comment, state_for
 from foundry.audit.events import (
     build_artifact,
     build_audit_event,
@@ -93,6 +95,7 @@ class FoundryOrchestrator:
         planner: DeliveryPlanner | None = None,
         policy_engine: PolicyEngine | None = None,
         provider: CodingAgentProvider | None = None,
+        issue_tracker: IssueTracker | None = None,
         max_files_changed: int = 12,
     ) -> None:
         self._sf = session_factory
@@ -102,6 +105,8 @@ class FoundryOrchestrator:
         self._planner = planner or TemplatePlanner()
         self._policy = policy_engine or LocalPolicyEngine()
         self._provider = provider or ManualProvider()
+        # Optional: when set, Foundry writes progress/state back to the tracker.
+        self._tracker = issue_tracker
         self._max_files_changed = max_files_changed
 
     # -- intake + planning ----------------------------------------------------
@@ -186,7 +191,19 @@ class FoundryOrchestrator:
                     )
                 )
             session.commit()
+
+        # Mirror the outcome back to the tracker (Linear) if one is configured.
+        if self._tracker is not None:
+            self._tracker.post_comment(
+                ticket.issue_id,
+                format_analysis_comment(analysis, risk, plan, status),
+            )
+            self._tracker.set_state(ticket.issue_id, state_for(status))
         return run_id
+
+    def _notify_state(self, issue_id: str, status: RunStatus) -> None:
+        if self._tracker is not None:
+            self._tracker.set_state(issue_id, state_for(status))
 
     @staticmethod
     def _post_plan_status(
@@ -236,7 +253,9 @@ class FoundryOrchestrator:
 
             run.approved_at = datetime.now(timezone.utc)
             run.current_step = "approved"
+            issue_id = run.linear_issue_id
             session.commit()
+        self._notify_state(issue_id, RunStatus.APPROVED)
 
     def reject(self, run_id: str, *, user: str) -> None:
         """Terminate a run a human declined (from ``/foundry reject``)."""
@@ -276,7 +295,9 @@ class FoundryOrchestrator:
                     actor_id=user,
                 )
             )
+            issue_id = run.linear_issue_id
             session.commit()
+        self._notify_state(issue_id, status)
 
     # -- read helpers (used by the API) ---------------------------------------
 
@@ -335,7 +356,9 @@ class FoundryOrchestrator:
                         output_content=decision,
                     )
                 )
+                blocked_issue = run.linear_issue_id
                 session.commit()
+                self._notify_state(blocked_issue, RunStatus.BLOCKED)
                 raise OrchestratorError(
                     "policy gate blocked agent dispatch: " + "; ".join(decision.reasons)
                 )
@@ -367,7 +390,9 @@ class FoundryOrchestrator:
             )
             run.status = RunStatus.AGENT_RUNNING
             run.current_step = "agent_running"
+            issue_id = run.linear_issue_id
             session.commit()
+        self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
         return job
 
     # -- PR monitoring --------------------------------------------------------
@@ -416,8 +441,11 @@ class FoundryOrchestrator:
             else:
                 run.status = RunStatus.PR_OPEN
             run.current_step = "pr_open"
+            issue_id = run.linear_issue_id
+            result_status = run.status
             session.commit()
-            return run.status
+        self._notify_state(issue_id, result_status)
+        return result_status
 
     # -- helpers --------------------------------------------------------------
 
@@ -442,6 +470,7 @@ class FoundryOrchestrator:
                 required_tests=list(context.test_commands),
                 max_files_changed=self._max_files_changed,
             ),
+            tracker_issue_id=ticket.issue_id,
         )
 
     @staticmethod

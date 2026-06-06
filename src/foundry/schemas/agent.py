@@ -33,6 +33,9 @@ class CodingAgentJobInput(BaseModel):
     delivery_plan: DeliveryPlan
     agent_instructions: str
     constraints: JobConstraints = Field(default_factory=JobConstraints)
+    # Identifier of the source issue in the tracker (e.g. Linear), so a provider
+    # that delegates via the tracker (Cursor-via-Linear) can address it.
+    tracker_issue_id: str | None = None
 
 
 class CodingAgentJob(BaseModel):
