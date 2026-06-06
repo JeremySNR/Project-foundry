@@ -21,13 +21,14 @@ from fastapi import Body, FastAPI, Header, HTTPException, Request
 
 from foundry.config import Settings
 from foundry.connectors.github import GitHubConnector
+from foundry.drivers import InlineDriver, RunDriver
 from foundry.connectors.linear import LinearConnector
 from foundry.connectors.transport import github_transport, linear_transport
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRun
 from foundry.engines import build_openai_analyzer
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
-from foundry.schemas.common import ApprovalRole
+from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
 from .mapping import linear_payload_to_ticket
@@ -95,6 +96,7 @@ def create_app(
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
+    driver: RunDriver | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -102,7 +104,11 @@ def create_app(
         session_factory = make_session_factory(engine)
 
     app = FastAPI(title="Project Foundry", version="0.1.0")
-    app.state.orchestrator = orchestrator or FoundryOrchestrator(session_factory)
+    orch = orchestrator or FoundryOrchestrator(session_factory)
+    # Reads use the orchestrator/DB directly; mutations go through the driver
+    # seam (inline today, durable Temporal later) so there is one execution path.
+    app.state.orchestrator = orch
+    app.state.driver = driver or InlineDriver(orch)
     app.state.webhook_secret = webhook_secret
     app.state.authorised_approvers = authorised_approvers or set()
     app.state.ticket_mapper = ticket_mapper or linear_payload_to_ticket
@@ -152,7 +158,7 @@ def create_app(
             return {"status": "exists", "run": _run_to_dict(orch.get_run(existing_id))}
 
         data = payload.get("data", {}) or {}
-        run_id = orch.intake_and_plan(
+        run_id = app.state.driver.start(
             ticket,
             trigger_type=_trigger_type(payload),
             created_by=(data.get("actor") or {}).get("name"),
@@ -183,8 +189,9 @@ def create_app(
             # A PR Foundry did not initiate (no agent job for this branch).
             return {"status": "ignored", "reason": "no run for branch"}
 
-        result = orch.record_pr(run_id, pr_state)
-        return {"status": "recorded", "run_status": result.value, "run_id": run_id}
+        app.state.driver.observe_pr(run_id, pr_state)
+        run = orch.get_run(run_id)
+        return {"status": "recorded", "run_status": run.status.value, "run_id": run_id}
 
     @app.get("/runs")
     def list_runs() -> dict[str, Any]:
@@ -214,36 +221,34 @@ def create_app(
         if not is_authorised_approver(user, app.state.authorised_approvers):
             raise HTTPException(status_code=403, detail="user not authorised to approve")
 
+        if command.command not in {"approve", "reject", "stop"}:
+            raise HTTPException(
+                status_code=422,
+                detail=f"command '{command.command}' is not supported yet",
+            )
+
         if orch.get_run(run_id) is None:
             raise HTTPException(status_code=404, detail="run not found")
 
-        result: dict[str, Any] = {"command": command.command}
+        roles = {ApprovalRole(r) for r in body.get("roles", [])}
         try:
-            if command.command == "approve":
-                roles = {ApprovalRole(r) for r in body.get("roles", [])}
-                orch.approve(run_id, user=user, granted_roles=roles)
-                # Approval immediately attempts dispatch; the policy gate may still
-                # keep the work human-only (e.g. auth changes) -> run is blocked.
-                try:
-                    orch.dispatch_agent(run_id)
-                    result["dispatched"] = True
-                except OrchestratorError as exc:
-                    result["dispatched"] = False
-                    result["dispatch_detail"] = str(exc)
-            elif command.command == "reject":
-                orch.reject(run_id, user=user)
-            elif command.command == "stop":
-                orch.stop(run_id, user=user)
-            else:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"command '{command.command}' is not supported yet",
-                )
+            app.state.driver.submit_decision(
+                run_id, decision=command.command, user=user, roles=roles
+            )
         except OrchestratorError as exc:
+            # e.g. approving a run that is not awaiting approval.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        result["status"] = "applied"
-        result["run"] = _run_to_dict(orch.get_run(run_id))
+        run = orch.get_run(run_id)
+        # On approve, the driver also attempts dispatch; the run reaching
+        # agent_running tells us the policy gate allowed autonomous work.
+        result: dict[str, Any] = {
+            "command": command.command,
+            "status": "applied",
+            "run": _run_to_dict(run),
+        }
+        if command.command == "approve":
+            result["dispatched"] = run.status is RunStatus.AGENT_RUNNING
         return result
 
     return app

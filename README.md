@@ -44,6 +44,7 @@ agents) plug into these contracts later.
 | `foundry.schemas` | Pydantic contracts for every run artifact: `RawTicket`, `TicketAnalysis`, `ContextBundle`, `RiskAssessment`, `DeliveryPlan`, `PullRequestState`, coding-agent job I/O. |
 | `foundry.engines` | The intelligence stages as `Protocol`s + implementations. Deterministic defaults: `HeuristicAnalyzer`, `StaticContextEnricher`, `HeuristicRiskClassifier`, `TemplatePlanner`. LLM-backed: `OpenAITicketAnalyzer` (GPT-5.5) behind a `StructuredLLM` abstraction — the *pre-approval gate* intelligence (readiness, missing requirements, acceptance-criteria normalisation), not implementation planning (that stays Cursor's job). |
 | `foundry.orchestrator` | `FoundryOrchestrator` — drives a run through analyse → enrich → risk → plan → policy gate → human approval → agent dispatch → PR monitoring, persisting every artifact, audit event and policy decision. |
+| `foundry.drivers` | The single seam for *how* a run executes. The API drives runs through a `RunDriver` rather than calling the orchestrator directly. `InlineDriver` runs steps in-process (default, tested); a Temporal-backed driver implementing the same interface is the documented swap point. |
 | `foundry.workflows` | Durable execution (Temporal). `TicketToPrWorkflow` wraps the orchestrator steps as retried activities and waits — for days if needed — on the approval and PR signals. Sequencing lives in pure, testable `decisions.py`; the Temporal pieces are the optional `workflow` extra. |
 | `foundry.policy`  | The policy gate — **hard rules, not prompts**. `LocalPolicyEngine` (pure-Python, default) mirrors `foundry.rego` for an OPA server. |
 | `foundry.agents`  | The `CodingAgentProvider` abstraction + registry. Backends: `ManualProvider`, `InMemoryFakeProvider`, and **Cursor** — `CursorViaLinearProvider` (delegates approved work to Cursor by `@Cursor`-commenting the Linear issue) and `CursorCloudAgentProvider` (direct `POST /v0/agents`). Foundry is never built around one coding tool. |
@@ -238,6 +239,7 @@ src/foundry/
   engines/        analyzer.py, enrichment.py, risk.py, planner.py,
                   llm.py + openai_analyzer.py (GPT-5.5 gate intelligence)
   orchestrator.py the run state machine wiring it all together
+  drivers.py      RunDriver seam (InlineDriver; Temporal driver attaches here)
   workflows/      decisions.py (pure) + workflow.py/activities.py/worker.py (Temporal)
   policy/         engine.py (Local + OPA), foundry.rego, foundry_test.rego
   agents/         provider.py, manual.py, cursor.py, registry.py
