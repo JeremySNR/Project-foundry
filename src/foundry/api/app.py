@@ -121,6 +121,8 @@ def create_app(
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
+    jira_webhook_secret: str | None = None,
+    gitlab_webhook_secret: str | None = None,
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
@@ -149,6 +151,9 @@ def create_app(
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
     app.state.github_connector = github_connector or GitHubConnector()
+    # Jira/GitLab endpoints are fail-closed: no secret => endpoint disabled.
+    app.state.jira_webhook_secret = jira_webhook_secret
+    app.state.gitlab_webhook_secret = gitlab_webhook_secret
     app.state.trigger_label = trigger_label
     app.state.trigger_status = trigger_status
     # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
@@ -249,6 +254,7 @@ def create_app(
         request: Request,
         signature: str | None = Header(default=None, alias="X-Hub-Signature-256"),
         event: str | None = Header(default=None, alias="X-GitHub-Event"),
+        delivery_id: str | None = Header(default=None, alias="X-GitHub-Delivery"),
     ) -> dict[str, Any]:
         content_type = request.headers.get("content-type", "application/json")
         if content_type and "application/json" not in content_type:
@@ -258,11 +264,29 @@ def create_app(
             raise HTTPException(status_code=401, detail="invalid webhook signature")
 
         payload = await request.json()
+
+        # GitHub Issues as the tracker: the issue is the ticket, the label is
+        # the trigger, and /foundry commands work in issue comments.
+        if event in {"issues", "issue_comment"}:
+            if delivery_id and delivery_id in app.state.processed_events:
+                return {"status": "duplicate"}
+            result = _handle_github_issue_event(app, event, payload)
+            if delivery_id:
+                app.state.processed_events.add(delivery_id)
+            return result
+
         connector: GitHubConnector = app.state.github_connector
         pr_state = connector.pr_state_from_event(event or "", payload)
         if pr_state is None:
             return {"status": "ignored", "reason": f"event '{event}' not handled"}
+        return _observe_pr(pr_state)
 
+    def _observe_pr(pr_state) -> dict[str, Any]:
+        """Correlate an observed PR/MR state to a run and record it.
+
+        Shared by the GitHub and GitLab webhook paths - the orchestrator does
+        not care which SCM produced the observation.
+        """
         orch: FoundryOrchestrator = app.state.orchestrator
         # Branch match first; falls back to the issue key embedded in the
         # branch or PR title (delegated agents choose their own branch names).
@@ -275,10 +299,54 @@ def create_app(
             app.state.driver.observe_pr(run_id, pr_state)
         except OrchestratorError as exc:
             # E.g. an event for a run already blocked/complete. Not an error
-            # worth a retry storm from GitHub - acknowledge and move on.
+            # worth a retry storm from the SCM - acknowledge and move on.
             return {"status": "ignored", "reason": str(exc), "run_id": run_id}
         run = orch.get_run(run_id)
         return {"status": "recorded", "run_status": run.status.value, "run_id": run_id}
+
+    @app.post("/webhooks/gitlab", status_code=202)
+    async def gitlab_webhook(
+        request: Request,
+        token: str | None = Header(default=None, alias="X-Gitlab-Token"),
+        event: str | None = Header(default=None, alias="X-Gitlab-Event"),
+    ) -> dict[str, Any]:
+        """GitLab MR/pipeline events. GitLab sends the shared secret verbatim
+        in X-Gitlab-Token (no HMAC); compared in constant time, fail-closed
+        when unconfigured."""
+        if not app.state.gitlab_webhook_secret:
+            raise HTTPException(
+                status_code=403,
+                detail="gitlab webhook disabled: configure FOUNDRY_GITLAB_WEBHOOK_SECRET",
+            )
+        if not hmac.compare_digest(app.state.gitlab_webhook_secret, token or ""):
+            raise HTTPException(status_code=401, detail="invalid webhook token")
+
+        from foundry.connectors.gitlab import GitLabConnector
+
+        payload = await request.json()
+        pr_state = GitLabConnector().pr_state_from_event(event or "", payload)
+        if pr_state is None:
+            return {"status": "ignored", "reason": f"event '{event}' not handled"}
+        return _observe_pr(pr_state)
+
+    @app.post("/webhooks/jira", status_code=202)
+    async def jira_webhook(
+        request: Request,
+        token: str | None = Header(default=None, alias="X-Foundry-Webhook-Token"),
+    ) -> dict[str, Any]:
+        """Jira issue/comment events. Jira webhooks carry no HMAC signature;
+        the shared secret travels as a token (header, or ?token= query for
+        webhook UIs that cannot set headers). Fail-closed when unconfigured."""
+        if not app.state.jira_webhook_secret:
+            raise HTTPException(
+                status_code=403,
+                detail="jira webhook disabled: configure FOUNDRY_JIRA_WEBHOOK_SECRET",
+            )
+        supplied = token or request.query_params.get("token") or ""
+        if not hmac.compare_digest(app.state.jira_webhook_secret, supplied):
+            raise HTTPException(status_code=401, detail="invalid webhook token")
+        payload = await request.json()
+        return _handle_jira_event(app, payload)
 
     @app.get("/runs")
     def list_runs(skip: int = 0, limit: int = 100) -> dict[str, Any]:
@@ -504,14 +572,119 @@ def _handle_linear_decision(
     command: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Apply an approve/reject/stop comment from a signed Linear webhook.
+    """Apply an approve/reject/stop comment from a signed Linear webhook."""
+    return _apply_decision(app, orch, issue_id, command, _actor_identity(payload))
 
-    Always returns 2xx payloads (never raises): a 4xx/5xx here would make
-    Linear retry-deliver a comment that was processed and refused.
+
+def _handle_github_issue_event(
+    app: FastAPI, event: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Intake + approvals when the tracker is GitHub Issues.
+
+    Mirrors the Linear webhook semantics: the webhook signature authenticates
+    the payload, the actor identity comes from GitHub itself (the sender's
+    login - configure approvers by login when using GitHub Issues), the
+    trigger label starts runs, and ``/foundry`` comments drive decisions.
+    """
+    from .mapping import github_issue_payload_to_ticket
+
+    orch: FoundryOrchestrator = app.state.orchestrator
+    ticket = github_issue_payload_to_ticket(payload)
+    if not ticket.issue_id:
+        return {"status": "ignored", "reason": "missing issue in payload"}
+
+    comment_body = (payload.get("comment") or {}).get("body") or ""
+    sender = (
+        ((payload.get("comment") or {}).get("user") or {}).get("login")
+        or (payload.get("sender") or {}).get("login")
+        or ""
+    )
+    command = parse_command(comment_body)
+    if command and command.command in {"approve", "reject", "stop"}:
+        return _apply_decision(app, orch, ticket.issue_id, command.command, sender)
+
+    # Label triggers only apply to issue events; a stray comment on a labelled
+    # issue must not restart a finished run. Comment triggers are explicit.
+    label_trigger = event == "issues" and app.state.trigger_label in ticket.labels
+    comment_trigger = bool(command and command.command == "start") or (
+        comment_body.strip().startswith("/foundry analyse")
+    )
+    if not (label_trigger or comment_trigger):
+        return {"status": "ignored", "reason": "no trigger condition matched"}
+
+    active_id = orch.find_active_run_id_for_issue(ticket.issue_id)
+    if active_id is not None:
+        return {"status": "exists", "run": _run_to_dict(orch.get_run(active_id))}
+
+    run_id = app.state.driver.start(
+        ticket,
+        trigger_type="comment_command" if comment_trigger else "label",
+        created_by=sender or None,
+    )
+    return {"status": "started", "run": _run_to_dict(orch.get_run(run_id))}
+
+
+def _handle_jira_event(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
+    """Intake + approvals when the tracker is Jira.
+
+    Same semantics as the Linear webhook: the trigger label starts runs,
+    ``/foundry`` comments drive decisions, and the actor identity is the
+    comment author's email as reported by Jira (configure approvers by email).
+    """
+    from .mapping import jira_payload_to_ticket
+
+    orch: FoundryOrchestrator = app.state.orchestrator
+    ticket = jira_payload_to_ticket(payload)
+    if not ticket.issue_id:
+        return {"status": "ignored", "reason": "missing issue in payload"}
+
+    comment = payload.get("comment") or {}
+    body = comment.get("body") or ""
+    author = (comment.get("author") or {}).get("emailAddress") or ""
+    command = parse_command(body)
+    if command and command.command in {"approve", "reject", "stop"}:
+        return _apply_decision(app, orch, ticket.issue_id, command.command, author)
+
+    # Label triggers only apply to issue events; chatter on a labelled issue
+    # must not restart a finished run.
+    event_name = str(payload.get("webhookEvent") or "")
+    label_trigger = (
+        event_name.startswith("jira:issue")
+        and app.state.trigger_label in ticket.labels
+    )
+    comment_trigger = bool(command and command.command == "start") or (
+        body.strip().startswith("/foundry analyse")
+    )
+    if not (label_trigger or comment_trigger):
+        return {"status": "ignored", "reason": "no trigger condition matched"}
+
+    active_id = orch.find_active_run_id_for_issue(ticket.issue_id)
+    if active_id is not None:
+        return {"status": "exists", "run": _run_to_dict(orch.get_run(active_id))}
+
+    creator = (payload.get("user") or {}).get("emailAddress") or author or None
+    run_id = app.state.driver.start(
+        ticket,
+        trigger_type="comment_command" if comment_trigger else "label",
+        created_by=creator,
+    )
+    return {"status": "started", "run": _run_to_dict(orch.get_run(run_id))}
+
+
+def _apply_decision(
+    app: FastAPI,
+    orch: FoundryOrchestrator,
+    issue_id: str,
+    command: str,
+    user: str | None,
+) -> dict[str, Any]:
+    """Apply an approve/reject/stop decision from a signed tracker webhook.
+
+    Always returns 2xx payloads (never raises): a 4xx/5xx here would make the
+    tracker retry-deliver a comment that was processed and refused.
     """
     if not issue_id:
         return {"status": "ignored", "reason": "missing issue id in payload"}
-    user = _actor_identity(payload)
     if not user:
         return {"status": "ignored", "reason": "no actor identity in payload"}
     if not is_authorised_approver(user, set(app.state.approvers)):
@@ -620,10 +793,37 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         else None
     )
     tracker = None
-    if settings.linear_api_token:
-        tracker = LinearConnector(
-            transport=linear_transport(settings.linear_api_token)
+    if settings.tracker_provider == "github_issues":
+        if not settings.github_api_token:
+            raise ValueError(
+                "tracker.provider=github_issues requires FOUNDRY_GITHUB_API_TOKEN"
+            )
+        from foundry.connectors.github_issues import GitHubIssuesConnector
+
+        tracker = GitHubIssuesConnector(
+            transport=github_transport(settings.github_api_token)
         )
+    elif settings.tracker_provider == "jira":
+        if not (settings.jira_base_url and settings.jira_email and settings.jira_api_token):
+            raise ValueError(
+                "tracker.provider=jira requires FOUNDRY_JIRA_BASE_URL, "
+                "FOUNDRY_JIRA_EMAIL and FOUNDRY_JIRA_API_TOKEN"
+            )
+        from foundry.connectors.jira import JiraConnector
+        from foundry.connectors.transport import jira_transport
+
+        tracker = JiraConnector(
+            transport=jira_transport(
+                settings.jira_base_url, settings.jira_email, settings.jira_api_token
+            )
+        )
+    elif settings.tracker_provider == "linear":
+        if settings.linear_api_token:
+            tracker = LinearConnector(
+                transport=linear_transport(settings.linear_api_token)
+            )
+    else:
+        raise ValueError(f"unknown tracker.provider: {settings.tracker_provider!r}")
     return FoundryOrchestrator(
         session_factory,
         analyzer=analyzer,
@@ -658,6 +858,8 @@ def app_from_settings(settings: Settings) -> FastAPI:
         api_token=settings.api_token,
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
+        jira_webhook_secret=settings.jira_webhook_secret,
+        gitlab_webhook_secret=settings.gitlab_webhook_secret,
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
     )

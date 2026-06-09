@@ -57,6 +57,16 @@ agent:
   #   webhook          - POST the job to your own endpoint (set FOUNDRY_AGENT_WEBHOOK_*)
   provider: manual
 
+tracker:
+  # Where tickets live:
+  #   linear        - the default (set FOUNDRY_LINEAR_API_TOKEN for write-back)
+  #   github_issues - the issue is the ticket (set FOUNDRY_GITHUB_API_TOKEN;
+  #                   approvers are keyed by GitHub login, not email)
+  #   jira          - Jira Cloud (set FOUNDRY_JIRA_BASE_URL / _EMAIL / _API_TOKEN
+  #                   and FOUNDRY_JIRA_WEBHOOK_SECRET; or set jira_base_url here)
+  provider: linear
+  # jira_base_url: "https://yourcompany.atlassian.net"
+
 triggers:
   # A run starts only on an explicit opt-in, never for every new issue.
   label: "foundry:candidate"

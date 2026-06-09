@@ -10,6 +10,16 @@ The quick version: it's a bit like Terraform, but for shipping code with AI agen
 
 The formal product statement lives in [`VISION.md`](./VISION.md). This README is the practical, slightly more caffeinated version.
 
+## See it run (60 seconds, zero setup)
+
+```bash
+git clone https://github.com/JeremySNR/Project-foundry && cd Project-foundry
+python -m venv .venv && source .venv/bin/activate && pip install -e .
+python scripts/demo.py
+```
+
+No credentials, no network, no Docker. The demo drives the real production code path - orchestrator, policy engine, audit trail - through the whole story: a vague ticket gets bounced with drafted acceptance criteria, the improved ticket gets planned and gated, a human approves, the agent's PR fails CI and gets fixed by a governed retry, the PR merges, and a second run gets hard-blocked for touching `migrations/`. It ends with the receipts: the full audit trail and every policy decision. (`--slow` paces it for screen recording.)
+
 ## So what is it, really?
 
 Picture the journey of a ticket today: someone writes "add customer favourites", an engineer reads it, fills in the gaps in their head, maybe asks an AI to write it, eyeballs the result, opens a PR. Foundry makes every one of those invisible steps explicit and governed:
@@ -46,8 +56,8 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.drivers` | One seam for *how* a run executes: inline in-process today, durable Temporal later, same interface. |
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
 | `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, **Cursor** two ways, **Claude Code** via GitHub Actions, or *any* agent behind a signed webhook (see below). |
-| `foundry.connectors` | Adapters for the tools Foundry talks to: Linear (read the issue, write back status and comments) and GitHub (watch the PR, pull failing check summaries). |
-| `foundry.api` | FastAPI app: signed Linear and GitHub webhooks, approval commands, run status, the per-run decision timeline, and the dashboard. |
+| `foundry.connectors` | Adapters for the tools Foundry talks to. Trackers: **Linear**, **GitHub Issues**, **Jira**. SCMs: **GitHub** and **GitLab** (watch the PR/MR, pull failing check summaries). |
+| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, approval commands, run status, the per-run decision timeline, and the dashboard. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
 ### The Cursor handoff (the nice bit)
@@ -63,6 +73,17 @@ Set `agent.provider` in the YAML and Foundry dispatches approved work elsewhere,
 - **`cursor_cloud` / `cursor_via_linear` / `manual`** - as above, or record the job for a human.
 
 Every provider goes through the same `create_job` path, so the secret-leak guard and the policy gate apply no matter whose agent does the typing.
+
+### Bring your own tracker and SCM
+
+The tracker and the SCM are seams too, not assumptions:
+
+- **Linear** (default) - the original flow: signed webhook in, comments and state back.
+- **GitHub Issues** (`tracker.provider: github_issues`) - the issue *is* the ticket. Trigger with the `foundry:candidate` label, approve with a `/foundry approve` comment, and Foundry writes its analysis back as comments and tracks pipeline position with `foundry:status:` labels. Approvers are keyed by GitHub login (the webhook signature plus GitHub's own identity authenticates the actor). Issue keys are synthesised (`CUSTOMERWE-42`) so PR correlation works unchanged.
+- **Jira** (`tracker.provider: jira`) - same trigger/command semantics over Jira Cloud webhooks (`/webhooks/jira`). Jira keys (`ACME-42`) already match the correlation pattern. `set_state` fires the matching workflow transition when one exists and otherwise leaves your workflow alone.
+- **GitLab** - point a project webhook at `/webhooks/gitlab` (merge request + pipeline events, `X-Gitlab-Token` auth) and merge requests close the loop exactly like GitHub PRs, including CI-failure remediation.
+
+The webhook payload shapes are pinned by recorded fixtures in `tests/fixtures/` - if a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
 
 ### The feedback loop
 
@@ -99,6 +120,8 @@ budget:
   max_cost_per_run: 25.0          # deny retries once provider-reported spend hits this
 agent:
   provider: cursor_via_linear     # or cursor_cloud / claude_code / webhook / manual
+tracker:
+  provider: linear                # or github_issues / jira
 triggers:
   label: "foundry:candidate"      # runs only start on an explicit opt-in
 approval:
@@ -118,7 +141,10 @@ Secrets via env:
 | `FOUNDRY_LINEAR_WEBHOOK_SECRET` | Verifies inbound Linear webhooks. |
 | `FOUNDRY_GITHUB_WEBHOOK_SECRET` | Verifies inbound GitHub webhooks. |
 | `FOUNDRY_LINEAR_API_TOKEN` | Turns on the live Linear connector (write-back). |
-| `FOUNDRY_GITHUB_API_TOKEN` | Turns on the live GitHub connector (PR files). |
+| `FOUNDRY_GITHUB_API_TOKEN` | Turns on the live GitHub connector (PR files; also the GitHub Issues tracker). |
+| `FOUNDRY_JIRA_WEBHOOK_SECRET` | Enables `/webhooks/jira` (token-compared; endpoint disabled without it). |
+| `FOUNDRY_JIRA_BASE_URL` / `..._EMAIL` / `..._API_TOKEN` | Jira Cloud credentials when the tracker is `jira`. |
+| `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
 | `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
@@ -131,6 +157,8 @@ The same code runs on a laptop (SQLite, heuristics, no keys) and in production (
 ## Running it
 
 The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quickstart.md)** - zero to governed PR in ~30 minutes with `docker compose up` (API + Postgres, optional Temporal profile, dashboard included).
+
+Tagged releases (`vX.Y.Z`) publish automatically: the `project-foundry` package to PyPI and a container image to GHCR (`ghcr.io/jeremysnr/project-foundry`), both gated on the full test suite.
 
 For development:
 
@@ -183,7 +211,7 @@ These aren't suggestions, they're the creed. This is the Way.
 ## How it's wired
 
 ```
-Linear --webhook--> Foundry API
+Tracker --webhook--> Foundry API     (Linear, GitHub Issues, Jira)
                        |
                        v
                   RunDriver  (inline now, Temporal-backed later)
@@ -195,13 +223,14 @@ Linear --webhook--> Foundry API
                        |
                   Policy gate (OPA-style hard rules)
                        |
-                  Human approval (in Linear)
+                  Human approval (in the tracker)
                        |
               CodingAgentProvider  (Cursor x2, Claude Code, webhook, manual)
                        |
-                  GitHub PR opens
+                  PR / MR opens
                        |
-   GitHub --webhook--> Foundry watches the PR, updates Linear
+   SCM --webhook--> Foundry watches the PR, updates the tracker
+                                     (GitHub, GitLab)
 ```
 
 ## Project layout
@@ -217,14 +246,15 @@ src/foundry/
   workflows/       decisions.py (pure) + the Temporal workflow, activities, worker
   policy/          the Python engine + foundry.rego (kept in sync)
   agents/          provider abstraction: manual, fake, Cursor (two ways), Claude Code, webhook
-  connectors/      Linear, GitHub, comment/state rendering, live HTTP transports
+  connectors/      Linear, GitHub, GitHub Issues, Jira, GitLab, live HTTP transports
   db/              SQLAlchemy models (runs, artifacts, audit, policy, jobs)
   audit/           content hashing + the verifiable trail
   api/             the FastAPI app, webhook security, payload mapping, dashboard
 tests/             one module per package, plus the gated Temporal/Postgres/E2E tests
+tests/fixtures/    recorded webhook payloads pinning every payload mapping
 migrations/        Alembic migrations (Postgres prod; SQLite dev uses create_all)
 examples/          reference Claude Code runner workflow
-scripts/           the live E2E smoke test
+scripts/           demo.py (offline narrated demo) + the live E2E smoke test
 docs/              quickstart
 ```
 
@@ -238,7 +268,7 @@ Foundry takes its name from the Mandalorian forge, where the Armorer works raw b
 
 ## Where it's going
 
-The loop is complete, closed (the agent now fixes its own failing CI under governance), multi-vendor, visible (the dashboard), and deployable (`docker compose up`, Alembic migrations, Postgres in CI). What's left is hardening against live traffic: finishing the Temporal driver against a real server and battle-testing the webhook payload mappings with the E2E smoke script. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
+The loop is complete, closed (the agent now fixes its own failing CI under governance), multi-vendor on every side (three trackers, two SCMs, five agent providers), visible (the dashboard), deployable (`docker compose up`, Alembic migrations, Postgres in CI) and released (PyPI + GHCR on tags). What's left is hardening against live traffic: finishing the Temporal driver against a real server and battle-testing the webhook payload mappings with the E2E smoke script. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
 
 ---
 

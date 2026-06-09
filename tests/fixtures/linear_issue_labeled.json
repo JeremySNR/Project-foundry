@@ -1,0 +1,47 @@
+{
+  "action": "update",
+  "type": "Issue",
+  "createdAt": "2026-06-09T14:21:08.000Z",
+  "organizationId": "8a8f3b53-0000-4000-9000-3f1c0e8d2a11",
+  "webhookTimestamp": 1780000868000,
+  "webhookId": "f3a9c2e1-0000-4000-9000-aa10b7d44c02",
+  "url": "https://linear.app/acme/issue/ACME-42/add-customer-favourites",
+  "data": {
+    "id": "a1b2c3d4-0000-4000-9000-1234567890ab",
+    "createdAt": "2026-06-09T13:58:01.000Z",
+    "updatedAt": "2026-06-09T14:21:08.000Z",
+    "number": 42,
+    "identifier": "ACME-42",
+    "title": "Add customer favourites",
+    "description": "Customers want to favourite items so they can find them again.\n\nAcceptance Criteria:\n- A favourites button exists on every item card\n- Favourites persist across sessions\n- The favourites list is reachable from the account menu",
+    "priority": 2,
+    "priorityLabel": "High",
+    "boardOrder": 0,
+    "sortOrder": -1024.5,
+    "teamId": "11aa22bb-0000-4000-9000-ccddeeff0011",
+    "stateId": "33cc44dd-0000-4000-9000-eeff00112233",
+    "state": {
+      "id": "33cc44dd-0000-4000-9000-eeff00112233",
+      "name": "Todo",
+      "color": "#e2e2e2",
+      "type": "unstarted"
+    },
+    "assignee": {
+      "id": "55ee66ff-0000-4000-9000-001122334455",
+      "name": "Priya Patel"
+    },
+    "labels": [
+      { "id": "77aa88bb-0000-4000-9000-223344556677", "name": "foundry:candidate", "color": "#bec2c8" },
+      { "id": "99cc00dd-0000-4000-9000-445566778899", "name": "repo:customer-web", "color": "#26b5ce" }
+    ],
+    "labelIds": [
+      "77aa88bb-0000-4000-9000-223344556677",
+      "99cc00dd-0000-4000-9000-445566778899"
+    ],
+    "actor": {
+      "id": "55ee66ff-0000-4000-9000-001122334455",
+      "name": "Priya Patel",
+      "email": "priya@example.com"
+    }
+  }
+}

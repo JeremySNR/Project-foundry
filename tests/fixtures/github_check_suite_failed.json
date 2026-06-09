@@ -1,0 +1,35 @@
+{
+  "action": "completed",
+  "check_suite": {
+    "id": 31415926535,
+    "head_branch": "cursor/acme-42-add-customer-favourites",
+    "head_sha": "f6e5d4c3b2a190877665544332211000ffeeddcc",
+    "status": "completed",
+    "conclusion": "failure",
+    "pull_requests": [
+      {
+        "id": 1923847560,
+        "number": 87,
+        "url": "https://api.github.com/repos/acme/customer-web/pulls/87",
+        "head": {
+          "ref": "cursor/acme-42-add-customer-favourites",
+          "sha": "f6e5d4c3b2a190877665544332211000ffeeddcc"
+        },
+        "base": {
+          "ref": "main",
+          "sha": "0011223344556677889900aabbccddeeff001122"
+        }
+      }
+    ]
+  },
+  "repository": {
+    "id": 778899001,
+    "full_name": "acme/customer-web",
+    "private": true,
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "github-actions[bot]",
+    "type": "Bot"
+  }
+}

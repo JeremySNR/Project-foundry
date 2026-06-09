@@ -9,6 +9,9 @@ from .comments import (
     state_for,
 )
 from .github import GitHubConnector
+from .github_issues import GitHubIssuesConnector
+from .gitlab import GitLabConnector
+from .jira import JiraConnector
 from .linear import LinearConnector
 
 __all__ = [
@@ -16,6 +19,9 @@ __all__ = [
     "InMemoryIssueTracker",
     "LinearConnector",
     "GitHubConnector",
+    "GitHubIssuesConnector",
+    "GitLabConnector",
+    "JiraConnector",
     "format_analysis_comment",
     "format_cursor_delegation",
     "state_for",

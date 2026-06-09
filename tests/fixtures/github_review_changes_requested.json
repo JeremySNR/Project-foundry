@@ -1,0 +1,36 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 271828182,
+    "state": "changes_requested",
+    "body": "The favourites button double-fires on item cards; see inline comments.",
+    "user": {
+      "login": "lee-cardall",
+      "type": "User"
+    },
+    "submitted_at": "2026-06-09T16:40:12Z"
+  },
+  "pull_request": {
+    "id": 1923847560,
+    "number": 87,
+    "html_url": "https://github.com/acme/customer-web/pull/87",
+    "state": "open",
+    "title": "ACME-42: Add customer favourites",
+    "merged": false,
+    "head": {
+      "ref": "cursor/acme-42-add-customer-favourites",
+      "sha": "f6e5d4c3b2a190877665544332211000ffeeddcc"
+    },
+    "base": { "ref": "main" }
+  },
+  "repository": {
+    "id": 778899001,
+    "full_name": "acme/customer-web",
+    "private": true,
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "lee-cardall",
+    "type": "User"
+  }
+}

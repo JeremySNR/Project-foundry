@@ -20,6 +20,11 @@ explicit, tested, auditable.
 4. **Artifacts are contracts.** Changes to `foundry.schemas` are API changes.
    Keep them strict (`extra="forbid"`), additive where possible, and update the
    consumers in the same PR.
+5. **Webhook mappings are pinned by fixtures.** If a live Linear / GitHub /
+   Jira / GitLab payload exposes a mapping bug, the fix starts with a redacted
+   captured payload in `tests/fixtures/` and an assertion in the corresponding
+   test module. This keeps mapping fixes contributor-friendly: no credentials
+   needed to reproduce or verify.
 
 ## Getting started
 

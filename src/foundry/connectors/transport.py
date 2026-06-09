@@ -82,10 +82,14 @@ def github_transport(
     *,
     client: Any | None = None,
     base: str = GITHUB_API_BASE,
-) -> Callable[[str, str], Any]:
-    """Build the ``transport(method, path) -> json`` GitHub connector expects."""
+) -> Callable[..., Any]:
+    """Build the ``transport(method, path, body=None) -> json`` for GitHub.
 
-    def transport(method: str, path: str) -> Any:
+    ``body`` (sent as JSON) supports the write paths: issue comments, labels,
+    workflow dispatches.
+    """
+
+    def transport(method: str, path: str, body: Any | None = None) -> Any:
         http = client or _new_client()
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
@@ -93,6 +97,7 @@ def github_transport(
                 response = http.request(
                     method,
                     f"{base}{path}",
+                    json=body,
                     headers={
                         "Authorization": f"Bearer {token}",
                         "Accept": "application/vnd.github+json",
@@ -104,6 +109,8 @@ def github_transport(
                     _retry_sleep(attempt, retry_after)
                     continue
                 response.raise_for_status()
+                if response.status_code == 204 or not response.content:
+                    return None
                 return response.json()
             except Exception as exc:
                 # Non-retryable HTTP errors (4xx) propagate immediately.
@@ -115,6 +122,58 @@ def github_transport(
                     continue
                 raise TransportError(f"GitHub request failed after {_MAX_RETRIES} retries") from exc
         raise TransportError("GitHub request failed") from last_exc  # pragma: no cover
+
+    return transport
+
+
+def jira_transport(
+    base_url: str,
+    email: str,
+    api_token: str,
+    *,
+    client: Any | None = None,
+) -> Callable[..., Any]:
+    """Build the ``transport(method, path, body=None) -> json`` for Jira Cloud.
+
+    Jira Cloud uses basic auth (account email + API token). ``base_url`` is the
+    site root, e.g. ``https://yourcompany.atlassian.net``.
+    """
+    import base64
+
+    auth = base64.b64encode(f"{email}:{api_token}".encode()).decode()
+    root = base_url.rstrip("/")
+
+    def transport(method: str, path: str, body: Any | None = None) -> Any:
+        http = client or _new_client()
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = http.request(
+                    method,
+                    f"{root}{path}",
+                    json=body,
+                    headers={
+                        "Authorization": f"Basic {auth}",
+                        "Accept": "application/json",
+                    },
+                )
+                if response.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+                    retry_after = _parse_retry_after(response)
+                    _retry_sleep(attempt, retry_after)
+                    continue
+                response.raise_for_status()
+                if response.status_code == 204 or not response.content:
+                    return None
+                return response.json()
+            except Exception as exc:
+                if _is_client_error(exc):
+                    raise
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    _retry_sleep(attempt, None)
+                    continue
+                raise TransportError(f"Jira request failed after {_MAX_RETRIES} retries") from exc
+        raise TransportError("Jira request failed") from last_exc  # pragma: no cover
 
     return transport
 

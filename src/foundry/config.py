@@ -63,8 +63,25 @@ class Settings:
     linear_api_token: str | None = None
     github_api_token: str | None = None
 
+    # --- Jira tracker (base url: yaml or env; credentials + secret: env) ---
+    # Jira webhooks carry no HMAC signature; the shared secret is checked as a
+    # constant-time token comparison instead. None => endpoint disabled.
+    jira_webhook_secret: str | None = None
+    jira_base_url: str | None = None
+    jira_email: str | None = None
+    jira_api_token: str | None = None
+
+    # --- GitLab SCM (secret: env); None => endpoint disabled ---
+    # GitLab webhooks send the shared secret verbatim in X-Gitlab-Token.
+    gitlab_webhook_secret: str | None = None
+
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
+
+    # --- issue tracker (behaviour: yaml) ---
+    # "linear" (default), "github_issues" (the issue is the ticket; approvers
+    # are then keyed by GitHub login instead of email), or "jira".
+    tracker_provider: str = "linear"
 
     # --- coding agent (behaviour: yaml; tokens: env) ---
     # Which CodingAgentProvider receives approved work. See foundry.agents.
@@ -202,6 +219,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "claude_workflow_file" in agent:
         out["claude_workflow_file"] = agent["claude_workflow_file"]
 
+    tracker = data.get("tracker", {}) or {}
+    if "provider" in tracker:
+        out["tracker_provider"] = tracker["provider"]
+    if "jira_base_url" in tracker:
+        out["jira_base_url"] = tracker["jira_base_url"]
+
     policy = data.get("policy", {}) or {}
     if "repo_confidence_threshold" in policy:
         out["repo_confidence_threshold"] = int(policy["repo_confidence_threshold"])
@@ -262,8 +285,14 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_GITHUB_WEBHOOK_SECRET": "github_webhook_secret",
         "FOUNDRY_LINEAR_API_TOKEN": "linear_api_token",
         "FOUNDRY_GITHUB_API_TOKEN": "github_api_token",
+        "FOUNDRY_JIRA_WEBHOOK_SECRET": "jira_webhook_secret",
+        "FOUNDRY_JIRA_BASE_URL": "jira_base_url",
+        "FOUNDRY_JIRA_EMAIL": "jira_email",
+        "FOUNDRY_JIRA_API_TOKEN": "jira_api_token",
+        "FOUNDRY_GITLAB_WEBHOOK_SECRET": "gitlab_webhook_secret",
         "FOUNDRY_API_TOKEN": "api_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
+        "FOUNDRY_TRACKER_PROVIDER": "tracker_provider",
         "FOUNDRY_CURSOR_API_TOKEN": "cursor_api_token",
         "FOUNDRY_AGENT_WEBHOOK_URL": "agent_webhook_url",
         "FOUNDRY_AGENT_WEBHOOK_SECRET": "agent_webhook_secret",

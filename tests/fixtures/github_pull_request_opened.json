@@ -1,0 +1,41 @@
+{
+  "action": "opened",
+  "number": 87,
+  "pull_request": {
+    "id": 1923847560,
+    "number": 87,
+    "html_url": "https://github.com/acme/customer-web/pull/87",
+    "state": "open",
+    "title": "ACME-42: Add customer favourites",
+    "draft": true,
+    "merged": false,
+    "user": {
+      "login": "cursor[bot]",
+      "type": "Bot"
+    },
+    "body": "Implements customer favourites per the approved Foundry plan.\n\nFixes ACME-42.",
+    "head": {
+      "ref": "cursor/acme-42-add-customer-favourites",
+      "sha": "f6e5d4c3b2a190877665544332211000ffeeddcc",
+      "repo": { "full_name": "acme/customer-web" }
+    },
+    "base": {
+      "ref": "main",
+      "sha": "0011223344556677889900aabbccddeeff001122",
+      "repo": { "full_name": "acme/customer-web" }
+    },
+    "additions": 184,
+    "deletions": 9,
+    "changed_files": 5
+  },
+  "repository": {
+    "id": 778899001,
+    "full_name": "acme/customer-web",
+    "private": true,
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "cursor[bot]",
+    "type": "Bot"
+  }
+}

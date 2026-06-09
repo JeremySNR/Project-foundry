@@ -1,0 +1,32 @@
+{
+  "object_kind": "merge_request",
+  "event_type": "merge_request",
+  "user": {
+    "name": "Cursor Agent",
+    "username": "cursor-agent"
+  },
+  "project": {
+    "id": 314,
+    "name": "customer-web",
+    "path_with_namespace": "acme/customer-web",
+    "default_branch": "main",
+    "web_url": "https://gitlab.com/acme/customer-web"
+  },
+  "object_attributes": {
+    "id": 99001,
+    "iid": 87,
+    "title": "ACME-42: Add customer favourites",
+    "state": "opened",
+    "action": "open",
+    "draft": false,
+    "work_in_progress": false,
+    "source_branch": "agent/acme-42-add-customer-favourites",
+    "target_branch": "main",
+    "url": "https://gitlab.com/acme/customer-web/-/merge_requests/87",
+    "last_commit": {
+      "id": "f6e5d4c3b2a190877665544332211000ffeeddcc",
+      "message": "Add favourites button and persistence"
+    }
+  },
+  "labels": []
+}

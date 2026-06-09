@@ -1,0 +1,32 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "createdAt": "2026-06-09T15:02:44.000Z",
+  "organizationId": "8a8f3b53-0000-4000-9000-3f1c0e8d2a11",
+  "webhookTimestamp": 1780003364000,
+  "webhookId": "f3a9c2e1-0000-4000-9000-aa10b7d44c02",
+  "url": "https://linear.app/acme/issue/ACME-42/add-customer-favourites#comment-9f8e7d6c",
+  "data": {
+    "id": "9f8e7d6c-0000-4000-9000-5b4a39281706",
+    "createdAt": "2026-06-09T15:02:44.000Z",
+    "updatedAt": "2026-06-09T15:02:44.000Z",
+    "body": "/foundry approve",
+    "issueId": "a1b2c3d4-0000-4000-9000-1234567890ab",
+    "userId": "ab12cd34-0000-4000-9000-667788990011",
+    "issue": {
+      "id": "a1b2c3d4-0000-4000-9000-1234567890ab",
+      "identifier": "ACME-42",
+      "title": "Add customer favourites"
+    },
+    "user": {
+      "id": "ab12cd34-0000-4000-9000-667788990011",
+      "name": "Lee Cardall",
+      "email": "lead@example.com"
+    },
+    "actor": {
+      "id": "ab12cd34-0000-4000-9000-667788990011",
+      "name": "Lee Cardall",
+      "email": "lead@example.com"
+    }
+  }
+}

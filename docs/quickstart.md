@@ -4,6 +4,13 @@ This walks you from nothing to a real run: a Linear ticket analysed, a plan
 approved by a human, a coding agent dispatched, and the resulting PR tracked
 with guardrails re-checked on every push.
 
+Want to see the loop before wiring anything? `python scripts/demo.py` runs the
+whole governed story offline in under a minute, no credentials needed.
+
+This guide uses Linear + GitHub (the default pairing). GitHub Issues and Jira
+work as trackers too (`tracker.provider` in the YAML), and GitLab as the SCM
+(`/webhooks/gitlab`) - see the README's "Bring your own tracker and SCM".
+
 ## 0. What you need
 
 - Docker (with compose)

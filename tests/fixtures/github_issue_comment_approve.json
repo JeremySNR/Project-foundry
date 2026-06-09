@@ -1,0 +1,28 @@
+{
+  "action": "created",
+  "issue": {
+    "id": 2468013579,
+    "number": 42,
+    "title": "Add customer favourites",
+    "body": "Customers want to favourite items so they can find them again.\n\nAcceptance Criteria:\n- A favourites button exists on every item card\n- Favourites persist across sessions",
+    "state": "open",
+    "user": { "login": "priya-patel", "type": "User" },
+    "labels": [
+      { "id": 111, "name": "foundry:candidate", "color": "bec2c8" },
+      { "id": 222, "name": "repo:customer-web", "color": "26b5ce" }
+    ]
+  },
+  "comment": {
+    "id": 1357924680,
+    "body": "/foundry approve",
+    "user": { "login": "lee-cardall", "type": "User" },
+    "created_at": "2026-06-09T15:02:44Z"
+  },
+  "repository": {
+    "id": 778899001,
+    "full_name": "acme/customer-web",
+    "private": true,
+    "default_branch": "main"
+  },
+  "sender": { "login": "lee-cardall", "type": "User" }
+}

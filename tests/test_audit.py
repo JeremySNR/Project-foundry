@@ -49,3 +49,46 @@ def test_build_policy_decision_row_records_outcome() -> None:
     assert row.id == decision.decision_id
     assert row.allowed is decision.allowed
     assert row.policy_name == decision.policy_name
+
+
+def test_audit_events_get_monotonic_per_run_sequences() -> None:
+    """The model promises a guaranteed per-run order; the session assigns it."""
+    from foundry.audit import build_audit_event
+    from foundry.db import create_all, make_engine, make_session_factory
+    from foundry.db.models import AuditEventType, FoundryAuditEvent, FoundryRun
+
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+
+    def _event(run_id: str) -> object:
+        return build_audit_event(
+            run_id=run_id, event_type=AuditEventType.RUN_STARTED, actor_type="foundry"
+        )
+
+    with sf() as session:
+        for rid in ("run-a", "run-b"):
+            session.add(
+                FoundryRun(id=rid, linear_issue_id=rid, linear_issue_key=rid,
+                           trigger_type="test")
+            )
+        # Two events in one flush, then one more in a later commit.
+        session.add(_event("run-a"))
+        session.add(_event("run-a"))
+        session.add(_event("run-b"))
+        session.commit()
+        session.add(_event("run-a"))
+        session.commit()
+
+        seq_a = [
+            e.sequence
+            for e in session.query(FoundryAuditEvent)
+            .filter_by(run_id="run-a")
+            .order_by(FoundryAuditEvent.sequence)
+        ]
+        seq_b = [
+            e.sequence
+            for e in session.query(FoundryAuditEvent).filter_by(run_id="run-b")
+        ]
+    assert seq_a == [0, 1, 2]  # monotonic per run, across separate commits
+    assert seq_b == [0]  # independent counter per run
