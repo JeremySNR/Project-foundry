@@ -1,6 +1,12 @@
 # Project Foundry
 
-**Foundry turns a Linear ticket into a reviewed pull request, safely, by letting an approved AI agent do the work under supervision.**
+[![CI](https://github.com/JeremySNR/Project-foundry/actions/workflows/ci.yml/badge.svg)](https://github.com/JeremySNR/Project-foundry/actions/workflows/ci.yml)
+[![Release](https://github.com/JeremySNR/Project-foundry/actions/workflows/release.yml/badge.svg)](https://github.com/JeremySNR/Project-foundry/actions/workflows/release.yml)
+[![PyPI](https://img.shields.io/pypi/v/project-foundry)](https://pypi.org/project/project-foundry/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/JeremySNR/Project-foundry/blob/main/pyproject.toml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
+
+**Foundry turns a ticket into a reviewed pull request, safely, by letting an approved AI agent do the work under supervision.**
 
 *Raw tickets go in. Reviewed pull requests come out. Nothing unsafe makes it through the forge.*
 
@@ -9,6 +15,20 @@ That's the whole pitch. Foundry is not another coding AI. It is the thing that s
 The quick version: it's a bit like Terraform, but for shipping code with AI agents. You describe the intent, Foundry produces a plan, a human approves it, and only then does anything actually happen. Plan, approve, apply.
 
 The formal product statement lives in [`VISION.md`](./VISION.md). This README is the practical, slightly more caffeinated version.
+
+## Why now: the Fable 5 era
+
+Anthropic's [Claude Fable 5 and Mythos 5](https://www.anthropic.com/news/claude-fable-5-mythos-5) can work autonomously for longer than any model before them - Stripe reported a codebase-wide migration that "would have taken a whole team over two months" done in a day. GitHub's early-access verdict points at the same future: *developers handing increasingly ambitious work to agents and trusting the results across the software lifecycle.*
+
+Which means raw capability is no longer the bottleneck. **The bottleneck is everything around the agent**: was the ticket actually ready, which repo does this belong in, is this change safe to delegate, who signed off, what did it cost, and why did the agent do that? An agent that can run for days unsupervised is exactly the kind of agent you should not run unsupervised.
+
+Foundry is designed for precisely this class of model. The more autonomous the agent, the more the gates matter:
+
+- A Mythos-class model will happily take on the migration ticket; Foundry is what makes `migrations/**` a hard policy block instead of a hope.
+- Long-horizon autonomy means more decisions made out of sight; Foundry writes down every one of them - content-hashed artifacts, policy decisions with reasons, a full audit timeline.
+- Frontier models retry and self-correct; Foundry makes every retry a fresh, capped, budgeted policy decision instead of an unbounded loop.
+
+Point the `claude_code` provider at Fable 5 (or `cursor_*` at Cursor's agents, or the signed webhook at anything else) and you get full agentic engineering with the seatbelt on: the model does the work, the humans keep the keys, and the audit trail keeps the receipts. True end-to-end agentic engineering is a governance problem, and that problem is the product.
 
 ## See it run (60 seconds, zero setup)
 

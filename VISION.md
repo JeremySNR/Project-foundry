@@ -13,6 +13,13 @@ provide the missing orchestration layer that understands what work is being
 requested, gathers the right context, applies governance and risk controls, and
 then directs AI agents and humans through the delivery process.
 
+Foundry is designed for the frontier-model era that Claude Fable 5 and Mythos 5
+opened: models capable of long-horizon, largely autonomous engineering work.
+As agent capability stops being the bottleneck, governance becomes the enabling
+layer - the thing that makes it responsible to hand ambitious work to an agent
+at all. Foundry's bet is that true end-to-end agentic engineering is unlocked
+by gates, approvals and audit trails, not blocked by them.
+
 The first version of Foundry focuses on a single workflow: taking a Linear ticket
 and turning it into a reviewed pull request. When a ticket is submitted for
 analysis, Foundry evaluates whether it contains enough information to be

@@ -5,11 +5,45 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "project-foundry"
 version = "0.1.0"
-description = "Project Foundry - the engineering control plane. Module 1: Ticket-to-PR."
+description = "The governance layer for AI coding agents: raw tickets in, reviewed pull requests out, every decision policy-gated and audited."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Project Foundry contributors" }]
+keywords = [
+    "ai-agents",
+    "agentic-engineering",
+    "sdlc",
+    "governance",
+    "policy",
+    "code-review",
+    "devops",
+    "automation",
+    "linear",
+    "jira",
+    "github",
+    "gitlab",
+    "cursor",
+    "claude",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Quality Assurance",
+    "Framework :: FastAPI",
+]
+
+[project.urls]
+Homepage = "https://github.com/JeremySNR/Project-foundry"
+Repository = "https://github.com/JeremySNR/Project-foundry"
+Issues = "https://github.com/JeremySNR/Project-foundry/issues"
+Documentation = "https://github.com/JeremySNR/Project-foundry/blob/main/docs/quickstart.md"
 
 # Core dependencies are deliberately minimal so the testable foundation
 # runs without external infrastructure (no Temporal/OPA/LangGraph servers).
