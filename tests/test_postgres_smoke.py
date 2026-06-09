@@ -54,6 +54,8 @@ def _ticket() -> RawTicket:
                 "Acceptance Criteria:\n- button exists\n- persists\n"
             ),
             "labels": ["repo:customer-web"],
+            # Enrichment reads known_repositories, not labels directly.
+            "known_repositories": ["customer-web"],
         }
     )
 
@@ -71,6 +73,7 @@ def test_full_run_lifecycle_on_postgres(session_factory) -> None:
 
     pr = PullRequestState.model_validate(
         {
+            "repo": "customer-web",
             "pr_number": 1,
             "url": "https://github.com/o/customer-web/pull/1",
             "branch": "foundry/lin-pg1-add-favourites",
