@@ -39,12 +39,6 @@ classifiers = [
     "Framework :: FastAPI",
 ]
 
-[project.urls]
-Homepage = "https://github.com/JeremySNR/Project-foundry"
-Repository = "https://github.com/JeremySNR/Project-foundry"
-Issues = "https://github.com/JeremySNR/Project-foundry/issues"
-Documentation = "https://github.com/JeremySNR/Project-foundry/blob/main/docs/quickstart.md"
-
 # Core dependencies are deliberately minimal so the testable foundation
 # runs without external infrastructure (no Temporal/OPA/LangGraph servers).
 dependencies = [
@@ -86,6 +80,12 @@ test = [
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
 ]
+
+[project.urls]
+Homepage = "https://github.com/JeremySNR/Project-foundry"
+Repository = "https://github.com/JeremySNR/Project-foundry"
+Issues = "https://github.com/JeremySNR/Project-foundry/issues"
+Documentation = "https://github.com/JeremySNR/Project-foundry/blob/main/docs/quickstart.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
