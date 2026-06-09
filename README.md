@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/JeremySNR/Project-foundry/actions/workflows/ci.yml/badge.svg)](https://github.com/JeremySNR/Project-foundry/actions/workflows/ci.yml)
 [![Release](https://github.com/JeremySNR/Project-foundry/actions/workflows/release.yml/badge.svg)](https://github.com/JeremySNR/Project-foundry/actions/workflows/release.yml)
-[![PyPI](https://img.shields.io/pypi/v/project-foundry)](https://pypi.org/project/project-foundry/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/JeremySNR/Project-foundry/blob/main/pyproject.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
@@ -178,7 +177,7 @@ The same code runs on a laptop (SQLite, heuristics, no keys) and in production (
 
 The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quickstart.md)** - zero to governed PR in ~30 minutes with `docker compose up` (API + Postgres, optional Temporal profile, dashboard included).
 
-Tagged releases (`vX.Y.Z`) publish automatically: the `project-foundry` package to PyPI and a container image to GHCR (`ghcr.io/jeremysnr/project-foundry`), both gated on the full test suite.
+Tagged releases (`vX.Y.Z`) publish a container image to GHCR (`ghcr.io/jeremysnr/project-foundry`) automatically, gated on the full test suite.
 
 For development:
 
@@ -288,7 +287,7 @@ Foundry takes its name from the Mandalorian forge, where the Armorer works raw b
 
 ## Where it's going
 
-The loop is complete, closed (the agent now fixes its own failing CI under governance), multi-vendor on every side (three trackers, two SCMs, five agent providers), visible (the dashboard), deployable (`docker compose up`, Alembic migrations, Postgres in CI) and released (PyPI + GHCR on tags). What's left is hardening against live traffic: finishing the Temporal driver against a real server and battle-testing the webhook payload mappings with the E2E smoke script. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
+The loop is complete, closed (the agent now fixes its own failing CI under governance), multi-vendor on every side (three trackers, two SCMs, five agent providers), visible (the dashboard), deployable (`docker compose up`, Alembic migrations, Postgres in CI) and released (GHCR image on tags). What's left is hardening against live traffic: finishing the Temporal driver against a real server and battle-testing the webhook payload mappings with the E2E smoke script. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
 
 ---
 

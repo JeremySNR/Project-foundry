@@ -1,7 +1,5 @@
-# Release pipeline: tag vX.Y.Z -> PyPI package + GHCR image + GitHub release.
+# Release pipeline: tag vX.Y.Z -> GHCR image + GitHub release.
 #
-# PyPI uses trusted publishing (no long-lived token): register this repo +
-# workflow as a trusted publisher for the "project-foundry" project on PyPI.
 # GHCR uses the built-in GITHUB_TOKEN.
 
 name: Release
@@ -18,8 +16,8 @@ jobs:
     name: Full test suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Install and test
@@ -27,25 +25,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test,workflow]"
           pytest -q
-
-  pypi:
-    name: Publish to PyPI
-    needs: test
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      id-token: write  # trusted publishing
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Build sdist and wheel
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
 
   image:
     name: Publish image to GHCR
@@ -55,7 +34,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -78,12 +57,12 @@ jobs:
 
   github-release:
     name: GitHub release
-    needs: [pypi, image]
+    needs: image
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Create release with generated notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
