@@ -9,6 +9,7 @@ elsewhere (test_workflow_decisions.py, test_temporal_activities.py).
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -58,53 +59,59 @@ def _activities() -> FoundryActivities:
 
 async def test_workflow_happy_path_with_signals(env) -> None:
     activities = _activities()
-    async with Worker(
-        env.client,
-        task_queue=TASK_QUEUE,
-        workflows=[TicketToPrWorkflow],
-        activities=activities.all(),
-    ):
-        handle = await env.client.start_workflow(
-            TicketToPrWorkflow.run,
-            {"ticket": READY_TICKET, "trigger_type": "label"},
-            id=f"wf-{uuid.uuid4()}",
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        async with Worker(
+            env.client,
             task_queue=TASK_QUEUE,
-        )
-        # Approve, then deliver the observed PR.
-        await handle.signal(
-            TicketToPrWorkflow.submit_decision, "approve", "lead@example.com", []
-        )
-        await handle.signal(
-            TicketToPrWorkflow.pr_observed,
-            {
-                "repo": "customer-web",
-                "pr_number": 1,
-                "url": "https://github.com/o/customer-web/pull/1",
-                "branch": "foundry/lin-123-add-customer-favourites",
-                "status": "open",
-                "files_changed": ["src/x.ts"],
-            },
-        )
-        result = await handle.result()
-        assert result["status"] == "pr_open"
+            workflows=[TicketToPrWorkflow],
+            activities=activities.all(),
+            activity_executor=executor,
+        ):
+            handle = await env.client.start_workflow(
+                TicketToPrWorkflow.run,
+                {"ticket": READY_TICKET, "trigger_type": "label"},
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            # Approve, then deliver the observed PR.
+            await handle.signal(
+                TicketToPrWorkflow.submit_decision,
+                args=["approve", "lead@example.com", []],
+            )
+            await handle.signal(
+                TicketToPrWorkflow.pr_observed,
+                {
+                    "repo": "customer-web",
+                    "pr_number": 1,
+                    "url": "https://github.com/o/customer-web/pull/1",
+                    "branch": "foundry/lin-123-add-customer-favourites",
+                    "status": "open",
+                    "files_changed": ["src/x.ts"],
+                },
+            )
+            result = await handle.result()
+            assert result["status"] == "pr_open"
 
 
 async def test_workflow_reject_path(env) -> None:
     activities = _activities()
-    async with Worker(
-        env.client,
-        task_queue=TASK_QUEUE,
-        workflows=[TicketToPrWorkflow],
-        activities=activities.all(),
-    ):
-        handle = await env.client.start_workflow(
-            TicketToPrWorkflow.run,
-            {"ticket": READY_TICKET, "trigger_type": "label"},
-            id=f"wf-{uuid.uuid4()}",
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        async with Worker(
+            env.client,
             task_queue=TASK_QUEUE,
-        )
-        await handle.signal(
-            TicketToPrWorkflow.submit_decision, "reject", "lead@example.com", []
-        )
-        result = await handle.result()
-        assert result["status"] == "rejected"
+            workflows=[TicketToPrWorkflow],
+            activities=activities.all(),
+            activity_executor=executor,
+        ):
+            handle = await env.client.start_workflow(
+                TicketToPrWorkflow.run,
+                {"ticket": READY_TICKET, "trigger_type": "label"},
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.signal(
+                TicketToPrWorkflow.submit_decision,
+                args=["reject", "lead@example.com", []],
+            )
+            result = await handle.result()
+            assert result["status"] == "rejected"

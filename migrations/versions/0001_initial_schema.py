@@ -114,4 +114,17 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_foundry_runs_linear_issue_key'), table_name='foundry_runs')
     op.drop_index(op.f('ix_foundry_runs_linear_issue_id'), table_name='foundry_runs')
     op.drop_table('foundry_runs')
+    # PostgreSQL ENUM types survive table drops; drop them so downgrade/upgrade
+    # round-trips work in CI (alembic downgrade base && alembic upgrade head).
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        for enum_name in (
+            "auditeventtype",
+            "artifacttype",
+            "agentjobstatus",
+            "agentmode",
+            "overallrisk",
+            "runstatus",
+        ):
+            op.execute(f"DROP TYPE IF EXISTS {enum_name}")
     # ### end Alembic commands ###
