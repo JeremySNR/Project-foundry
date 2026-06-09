@@ -1,7 +1,7 @@
 # Project Foundry
 
 [![CI](https://github.com/JeremySNR/Project-foundry/actions/workflows/ci.yml/badge.svg)](https://github.com/JeremySNR/Project-foundry/actions/workflows/ci.yml)
-[![Release](https://github.com/JeremySNR/Project-foundry/actions/workflows/release.yml/badge.svg)](https://github.com/JeremySNR/Project-foundry/actions/workflows/release.yml)
+[![Release](https://img.shields.io/github/v/release/JeremySNR/Project-foundry)](https://github.com/JeremySNR/Project-foundry/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/JeremySNR/Project-foundry/blob/main/pyproject.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
