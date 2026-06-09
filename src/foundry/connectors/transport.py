@@ -139,6 +139,63 @@ def _parse_retry_after(response: Any) -> float | None:
         return None
 
 
+def json_post_transport(
+    headers: dict[str, str] | None = None, *, client: Any | None = None
+) -> Callable[[str, dict[str, Any], dict[str, str]], Any]:
+    """``http_post(url, json_body, extra_headers) -> json|None`` for providers.
+
+    Used by the Cursor Cloud and Claude Code providers. Base headers (e.g. the
+    Authorization header) are fixed at construction so tokens never travel
+    through job inputs.
+    """
+    base_headers = dict(headers or {})
+
+    def http_post(url: str, body: dict[str, Any], extra: dict[str, str]) -> Any:
+        http = client or _new_client()
+        response = http.post(url, json=body, headers={**base_headers, **extra})
+        response.raise_for_status()
+        if response.status_code == 204 or not response.content:
+            return None
+        return response.json()
+
+    return http_post
+
+
+def json_get_transport(
+    headers: dict[str, str] | None = None, *, client: Any | None = None
+) -> Callable[[str, dict[str, str]], Any]:
+    """``http_get(url, extra_headers) -> json`` companion to json_post_transport."""
+    base_headers = dict(headers or {})
+
+    def http_get(url: str, extra: dict[str, str]) -> Any:
+        http = client or _new_client()
+        response = http.get(url, headers={**base_headers, **extra})
+        response.raise_for_status()
+        return response.json()
+
+    return http_get
+
+
+def raw_post_transport(
+    *, client: Any | None = None
+) -> Callable[[str, bytes, dict[str, str]], Any]:
+    """``http_post(url, raw_body, headers) -> json|None`` for the webhook provider.
+
+    The body is sent verbatim so the receiver can verify the HMAC signature
+    against the exact bytes.
+    """
+
+    def http_post(url: str, body: bytes, headers: dict[str, str]) -> Any:
+        http = client or _new_client()
+        response = http.post(url, content=body, headers=headers)
+        response.raise_for_status()
+        if response.status_code == 204 or not response.content:
+            return None
+        return response.json()
+
+    return http_post
+
+
 def _new_client() -> Any:  # pragma: no cover - only on the live path
     try:
         import httpx

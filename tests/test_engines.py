@@ -204,3 +204,38 @@ def test_not_ready_plan_has_no_agent_instructions() -> None:
 def test_branch_name_is_sanitised() -> None:
     ticket = _ready_ticket(title="Add Customer Favourites!!!")
     assert branch_name_for(ticket) == "foundry/lin-123-add-customer-favourites"
+
+
+# -- diff-aware risk classification --------------------------------------------
+
+
+def test_sensitive_areas_for_paths_matches_globs() -> None:
+    from foundry.engines.risk import sensitive_areas_for_paths
+
+    globs = {
+        "auth": ("**/auth/**", "**/login/**"),
+        "payments": ("**/billing/**",),
+    }
+    touched = sensitive_areas_for_paths(
+        ["src/auth/session.ts", "billing/charge.py", "src/ui/button.tsx"],
+        globs,
+    )
+    assert touched == {
+        "auth": ["src/auth/session.ts"],
+        "payments": ["billing/charge.py"],
+    }
+
+
+def test_sensitive_areas_for_paths_empty_when_clean() -> None:
+    from foundry.engines.risk import sensitive_areas_for_paths
+
+    assert sensitive_areas_for_paths(["src/ui/button.tsx"], {"auth": ("**/auth/**",)}) == {}
+
+
+def test_glob_match_handles_leading_doublestar() -> None:
+    from foundry.engines.risk import glob_match
+
+    # fnmatch alone would miss a top-level directory against "**/x/**".
+    assert glob_match("auth/handler.py", "**/auth/**")
+    assert glob_match("src/auth/handler.py", "**/auth/**")
+    assert not glob_match("src/author/file.py", "**/auth/**")

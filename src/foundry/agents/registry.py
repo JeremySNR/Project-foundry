@@ -1,18 +1,24 @@
 """Provider registry - resolve a ``CodingAgentProvider`` by name.
 
-Cursor / Claude Code / OpenAI adapters register here as they are implemented.
-The MVP ships only the manual and fake providers; the registry exists so the
-rest of the system never imports a concrete provider directly.
+The registry exists so the rest of the system never imports a concrete
+provider directly; ``agent.provider`` in the YAML config selects one by name.
 """
 
 from __future__ import annotations
 
+from .claude_code import ClaudeCodeProvider
+from .cursor import CursorCloudAgentProvider, CursorViaLinearProvider
 from .manual import InMemoryFakeProvider, ManualProvider
 from .provider import CodingAgentProvider
+from .webhook import WebhookProvider
 
 _REGISTRY: dict[str, type[CodingAgentProvider]] = {
     ManualProvider.name: ManualProvider,
     InMemoryFakeProvider.name: InMemoryFakeProvider,
+    CursorViaLinearProvider.name: CursorViaLinearProvider,
+    CursorCloudAgentProvider.name: CursorCloudAgentProvider,
+    ClaudeCodeProvider.name: ClaudeCodeProvider,
+    WebhookProvider.name: WebhookProvider,
 }
 
 

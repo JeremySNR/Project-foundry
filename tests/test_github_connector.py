@@ -79,3 +79,55 @@ def test_check_suite_maps_ci_status() -> None:
 
 def test_unhandled_event_returns_none() -> None:
     assert GitHubConnector().pr_state_from_event("push", {}) is None
+
+
+def test_failing_check_summaries_collects_failures() -> None:
+    def transport(method, path):
+        assert path == "/repos/o/customer-web/check-suites/99/check-runs"
+        return {
+            "check_runs": [
+                {
+                    "name": "unit tests",
+                    "conclusion": "failure",
+                    "output": {"summary": "2 tests failed in tests/test_x.py"},
+                },
+                {"name": "lint", "conclusion": "success", "output": {}},
+                {"name": "build", "conclusion": "timed_out", "output": {}},
+            ]
+        }
+
+    summary = GitHubConnector(transport=transport).failing_check_summaries(
+        "o/customer-web", 99
+    )
+    assert "unit tests: 2 tests failed" in summary
+    assert "build" in summary
+    assert "lint" not in summary
+
+
+def test_check_suite_failure_attaches_summaries_via_transport() -> None:
+    def transport(method, path):
+        return {
+            "check_runs": [
+                {"name": "pytest", "conclusion": "failure", "output": {"summary": "boom"}}
+            ]
+        }
+
+    payload = {
+        "check_suite": {
+            "id": 5,
+            "conclusion": "failure",
+            "pull_requests": [
+                {"number": 7, "url": "u", "head": {"ref": "foundry/lin-123"}}
+            ],
+        },
+        "repository": {"full_name": "o/customer-web"},
+    }
+    state = GitHubConnector(transport=transport).pr_state_from_event(
+        "check_suite", payload
+    )
+    assert state.ci_status is CIStatus.FAILING
+    assert "pytest: boom" in state.summary
+
+
+def test_failing_check_summaries_empty_without_transport() -> None:
+    assert GitHubConnector().failing_check_summaries("o/r", 1) == ""

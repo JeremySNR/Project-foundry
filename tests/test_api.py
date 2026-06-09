@@ -10,12 +10,14 @@ from fastapi.testclient import TestClient
 from foundry.agents.manual import InMemoryFakeProvider
 from foundry.api import create_app
 from foundry.api.security import compute_signature
-from foundry.connectors import GitHubConnector
 from foundry.db import create_all, make_engine, make_session_factory
 from foundry.orchestrator import FoundryOrchestrator
 
 SECRET = "test-secret"
-APPROVERS = {"lead@example.com"}
+API_TOKEN = "test-api-token"
+# user -> approval roles their sign-off grants (config, never request payload).
+APPROVERS = {"lead@example.com": ["engineering", "security"]}
+AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
 
 READY_DESC = (
     "Customers want to favourite items.\n\n"
@@ -25,19 +27,25 @@ READY_DESC = (
 )
 
 
-@pytest.fixture
-def client() -> TestClient:
+def _make_client(**overrides) -> TestClient:
     engine = make_engine("sqlite+pysqlite:///:memory:")
     create_all(engine)
     sf = make_session_factory(engine)
     orch = FoundryOrchestrator(sf, provider=InMemoryFakeProvider())
-    app = create_app(
+    kwargs = dict(
         webhook_secret=SECRET,
         session_factory=sf,
         orchestrator=orch,
-        authorised_approvers=APPROVERS,
+        approvers=APPROVERS,
+        api_token=API_TOKEN,
     )
-    return TestClient(app)
+    kwargs.update(overrides)
+    return TestClient(create_app(**kwargs))
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return _make_client()
 
 
 def _post_webhook(client, payload, *, delivery, sign=True):
@@ -96,12 +104,26 @@ def test_duplicate_delivery_creates_one_run(client) -> None:
     assert len(client.get("/runs").json()["runs"]) == 1
 
 
-def test_same_issue_different_delivery_does_not_duplicate(client) -> None:
-    payload = _basic_payload()
+def test_same_issue_active_run_does_not_duplicate(client) -> None:
+    payload = _ready_payload()
     _post_webhook(client, payload, delivery="d-a")
     second = _post_webhook(client, payload, delivery="d-b")
     assert second.json()["status"] == "exists"
     assert len(client.get("/runs").json()["runs"]) == 1
+
+
+def test_clarified_ticket_can_be_reanalysed(client) -> None:
+    """A needs-clarification run does not pin the issue forever."""
+    thin = _basic_payload(issue_id="i-re", key="LIN-RE")
+    first = _post_webhook(client, thin, delivery="d-re-1")
+    assert first.json()["run"]["status"] == "needs_clarification"
+
+    # The author adds acceptance criteria and a repo label; re-trigger works.
+    improved = _ready_payload(issue_id="i-re", key="LIN-RE")
+    second = _post_webhook(client, improved, delivery="d-re-2")
+    assert second.json()["status"] == "started"
+    assert second.json()["run"]["status"] == "waiting_approval"
+    assert len(client.get("/runs").json()["runs"]) == 2
 
 
 def test_non_trigger_event_is_ignored(client) -> None:
@@ -145,11 +167,52 @@ def _start_ready_run(client) -> str:
     return run["id"]
 
 
+# -- approval API auth ---------------------------------------------------------
+
+
+def test_approval_requires_bearer_token(client) -> None:
+    run_id = _start_ready_run(client)
+    no_token = client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+    )
+    assert no_token.status_code == 401
+
+    bad_token = client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert bad_token.status_code == 401
+    # Nothing was approved.
+    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+
+
+def test_approval_api_disabled_without_configured_token() -> None:
+    c = _make_client(api_token=None)
+    body = json.dumps(_ready_payload()).encode("utf-8")
+    sig = "sha256=" + compute_signature(SECRET, body)
+    run_id = c.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": "d", "Linear-Signature": sig},
+    ).json()["run"]["id"]
+
+    resp = c.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+    # Fail closed: no configured token means the endpoint is disabled.
+    assert resp.status_code == 403
+
+
 def test_only_authorised_user_can_approve(client) -> None:
     run_id = _start_ready_run(client)
     resp = client.post(
         f"/runs/{run_id}/approval",
         json={"user": "stranger@example.com", "text": "/foundry approve"},
+        headers=AUTH,
     )
     assert resp.status_code == 403
 
@@ -159,6 +222,7 @@ def test_authorised_approve_dispatches_agent(client) -> None:
     resp = client.post(
         f"/runs/{run_id}/approval",
         json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -167,11 +231,40 @@ def test_authorised_approve_dispatches_agent(client) -> None:
     assert body["run"]["approved_by"] == "lead@example.com"
 
 
+def test_roles_in_body_are_ignored(client) -> None:
+    """A caller cannot self-assert approval roles; they come from config."""
+    c = _make_client(approvers={"pm@example.com": []})
+    body = json.dumps(_ready_payload()).encode("utf-8")
+    sig = "sha256=" + compute_signature(SECRET, body)
+    run_id = c.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": "d", "Linear-Signature": sig},
+    ).json()["run"]["id"]
+
+    resp = c.post(
+        f"/runs/{run_id}/approval",
+        json={
+            "user": "pm@example.com",
+            "text": "/foundry approve",
+            # Claimed roles must have no effect.
+            "roles": ["security", "engineering"],
+        },
+        headers=AUTH,
+    )
+    # The run is approved (a role-less approver can approve ordinary work) -
+    # this ticket is low-risk, so dispatch proceeds; the point is that the
+    # roles granted are pm@'s configured roles (none), not the claimed ones.
+    assert resp.status_code == 200
+    assert resp.json()["run"]["approved_by"] == "pm@example.com"
+
+
 def test_reject_terminates_run(client) -> None:
     run_id = _start_ready_run(client)
     resp = client.post(
         f"/runs/{run_id}/approval",
         json={"user": "lead@example.com", "text": "reject"},
+        headers=AUTH,
     )
     assert resp.json()["run"]["status"] == "rejected"
 
@@ -183,6 +276,7 @@ def test_approve_on_unready_run_conflicts(client) -> None:
     out = client.post(
         f"/runs/{run_id}/approval",
         json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
     )
     assert out.status_code == 409
 
@@ -192,8 +286,60 @@ def test_unrecognised_command_is_rejected(client) -> None:
     resp = client.post(
         f"/runs/{run_id}/approval",
         json={"user": "lead@example.com", "text": "/foundry frobnicate"},
+        headers=AUTH,
     )
     assert resp.status_code == 400
+
+
+# -- approval via signed Linear comments ----------------------------------------
+
+
+def _comment_payload(issue_id, key, body_text, *, email="lead@example.com") -> dict:
+    return {
+        "data": {
+            "issueId": issue_id,
+            "identifier": key,
+            "body": body_text,
+            "actor": {"name": "Lead", "email": email},
+        }
+    }
+
+
+def test_linear_comment_approves_run(client) -> None:
+    run_id = _start_ready_run(client)
+    resp = _post_webhook(
+        client,
+        _comment_payload("issue-r", "LIN-123", "/foundry approve"),
+        delivery="d-approve",
+    )
+    body = resp.json()
+    assert body["status"] == "applied"
+    assert body["dispatched"] is True
+    assert client.get(f"/runs/{run_id}").json()["status"] == "agent_running"
+
+
+def test_linear_comment_from_unauthorised_user_is_ignored(client) -> None:
+    run_id = _start_ready_run(client)
+    resp = _post_webhook(
+        client,
+        _comment_payload(
+            "issue-r", "LIN-123", "/foundry approve", email="stranger@example.com"
+        ),
+        delivery="d-stranger",
+    )
+    assert resp.json()["status"] == "ignored"
+    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+
+
+def test_linear_comment_reject(client) -> None:
+    run_id = _start_ready_run(client)
+    resp = _post_webhook(
+        client,
+        _comment_payload("issue-r", "LIN-123", "/foundry reject"),
+        delivery="d-reject",
+    )
+    assert resp.json()["status"] == "applied"
+    assert client.get(f"/runs/{run_id}").json()["status"] == "rejected"
 
 
 # -- GitHub webhook closes the loop -------------------------------------------
@@ -213,8 +359,24 @@ def _approve_and_dispatch(client) -> str:
     client.post(
         f"/runs/{run_id}/approval",
         json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
     )
     return run_id
+
+
+def _pr_payload(branch, *, number=42, title="", state="open", merged=False) -> dict:
+    return {
+        "pull_request": {
+            "number": number,
+            "html_url": f"https://github.com/o/customer-web/pull/{number}",
+            "head": {"ref": branch},
+            "title": title,
+            "state": state,
+            "draft": False,
+            "merged": merged,
+        },
+        "repository": {"full_name": "o/customer-web"},
+    }
 
 
 def test_github_unauthorised_rejected(client) -> None:
@@ -223,17 +385,92 @@ def test_github_unauthorised_rejected(client) -> None:
 
 
 def test_github_pr_for_unknown_branch_ignored(client) -> None:
-    payload = {
-        "pull_request": {
-            "number": 1,
-            "html_url": "u",
-            "head": {"ref": "someone-elses-branch"},
-            "state": "open",
-        },
-        "repository": {"full_name": "o/customer-web"},
-    }
-    resp = _post_github(client, payload, event="pull_request")
+    resp = _post_github(
+        client, _pr_payload("someone-elses-branch"), event="pull_request"
+    )
     assert resp.json()["status"] == "ignored"
+
+
+def test_github_pr_closes_loop_to_pr_open(client) -> None:
+    run_id = _approve_and_dispatch(client)
+    assert client.get(f"/runs/{run_id}").json()["status"] == "agent_running"
+
+    branch = "foundry/lin-123-add-customer-favourites"
+    resp = _post_github(client, _pr_payload(branch), event="pull_request")
+    assert resp.json()["status"] == "recorded"
+    assert resp.json()["run_status"] == "pr_open"
+    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"
+
+
+def test_github_pr_correlated_by_issue_key_in_branch(client) -> None:
+    """Delegated agents (Cursor via Linear) pick their own branch names; the
+    embedded issue key still associates the PR with the run."""
+    run_id = _approve_and_dispatch(client)
+    branch = "cursor/lin-123-favourites-button"  # not the Foundry-chosen branch
+    resp = _post_github(client, _pr_payload(branch), event="pull_request")
+    assert resp.json()["status"] == "recorded"
+    assert resp.json()["run_id"] == run_id
+    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"
+
+
+def test_github_pr_correlated_by_issue_key_in_title(client) -> None:
+    run_id = _approve_and_dispatch(client)
+    resp = _post_github(
+        client,
+        _pr_payload("agent/some-opaque-name", title="LIN-123 add favourites"),
+        event="pull_request",
+    )
+    assert resp.json()["status"] == "recorded"
+    assert resp.json()["run_id"] == run_id
+
+
+def test_github_pr_update_events_do_not_crash(client) -> None:
+    """synchronize/review/CI events after the PR opened are recorded, not 500s."""
+    run_id = _approve_and_dispatch(client)
+    branch = "foundry/lin-123-add-customer-favourites"
+    _post_github(client, _pr_payload(branch), event="pull_request")
+
+    # A later synchronize event for the same PR.
+    second = _post_github(client, _pr_payload(branch), event="pull_request")
+    assert second.status_code == 202
+    assert second.json()["status"] == "recorded"
+
+    # A review event (no file list) keeps the run's status.
+    review = dict(_pr_payload(branch))
+    review["review"] = {"state": "approved", "user": {"type": "User"}}
+    third = _post_github(client, review, event="pull_request_review")
+    assert third.status_code == 202
+    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"
+
+
+def test_github_merged_pr_completes_run(client) -> None:
+    run_id = _approve_and_dispatch(client)
+    branch = "foundry/lin-123-add-customer-favourites"
+    _post_github(client, _pr_payload(branch), event="pull_request")
+    resp = _post_github(
+        client,
+        _pr_payload(branch, state="closed", merged=True),
+        event="pull_request",
+    )
+    assert resp.json()["run_status"] == "complete"
+    assert client.get(f"/runs/{run_id}").json()["status"] == "complete"
+
+
+def test_github_event_for_finished_run_is_ignored_not_500(client) -> None:
+    run_id = _approve_and_dispatch(client)
+    branch = "foundry/lin-123-add-customer-favourites"
+    _post_github(client, _pr_payload(branch), event="pull_request")
+    _post_github(
+        client, _pr_payload(branch, state="closed", merged=True), event="pull_request"
+    )
+    # The run is complete; a stray late event is acknowledged and ignored.
+    late = _post_github(client, _pr_payload(branch), event="pull_request")
+    assert late.status_code == 202
+    assert late.json()["status"] == "ignored"
+    assert client.get(f"/runs/{run_id}").json()["status"] == "complete"
+
+
+# -- settings-driven app boot ---------------------------------------------------
 
 
 def test_app_from_settings_boots_with_defaults() -> None:
@@ -303,24 +540,84 @@ def test_settings_custom_trigger_label_is_honored() -> None:
     assert resp2.json()["status"] == "started"
 
 
-def test_github_pr_closes_loop_to_pr_open(client) -> None:
-    run_id = _approve_and_dispatch(client)
-    run = client.get(f"/runs/{run_id}").json()
-    branch = "foundry/lin-123-add-customer-favourites"
-    assert run["status"] == "agent_running"
+# -- run timeline --------------------------------------------------------------
 
-    payload = {
-        "pull_request": {
-            "number": 42,
-            "html_url": "https://github.com/o/customer-web/pull/42",
-            "head": {"ref": branch},
-            "state": "open",
-            "draft": False,
-            "merged": False,
-        },
-        "repository": {"full_name": "o/customer-web"},
+
+def test_timeline_requires_token(client) -> None:
+    _post_webhook(client, _ready_payload(), delivery="d-tl-0")
+    run_id = client.get("/runs").json()["runs"][0]["id"]
+    assert client.get(f"/runs/{run_id}/timeline").status_code == 401
+    assert (
+        client.get(
+            f"/runs/{run_id}/timeline", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_timeline_disabled_without_configured_token() -> None:
+    client = _make_client(api_token=None)
+    _post_webhook(client, _ready_payload(), delivery="d-tl-1")
+    run_id = client.get("/runs").json()["runs"][0]["id"]
+    assert client.get(f"/runs/{run_id}/timeline", headers=AUTH).status_code == 403
+
+
+def test_timeline_unknown_run_404(client) -> None:
+    assert client.get("/runs/nope/timeline", headers=AUTH).status_code == 404
+
+
+def test_timeline_exposes_full_decision_record(client) -> None:
+    _post_webhook(client, _ready_payload(), delivery="d-tl-2")
+    run_id = client.get("/runs").json()["runs"][0]["id"]
+    # Approve via the signed Linear comment surface so the agent dispatches.
+    approval = {
+        "data": {
+            "id": "c-tl",
+            "issueId": "issue-r",
+            "identifier": "LIN-123",
+            "body": "/foundry approve",
+            "actor": {"name": "lead", "email": "lead@example.com"},
+        }
     }
-    resp = _post_github(client, payload, event="pull_request")
-    assert resp.json()["status"] == "recorded"
-    assert resp.json()["run_status"] == "pr_open"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"
+    _post_webhook(client, approval, delivery="d-tl-3")
+
+    timeline = client.get(f"/runs/{run_id}/timeline", headers=AUTH).json()
+    assert timeline["run"]["id"] == run_id
+
+    artifact_types = {a["artifact_type"] for a in timeline["artifacts"]}
+    assert "ticket_analysis" in artifact_types
+    assert "risk_assessment" in artifact_types
+    # Artifact content is parsed JSON, not a string blob.
+    assert all(isinstance(a["content"], dict) for a in timeline["artifacts"])
+
+    event_types = [e["event_type"] for e in timeline["audit_events"]]
+    assert "run.started" in event_types
+    assert "approval.granted" in event_types
+    # Audit events arrive in their guaranteed per-run order.
+    sequences = [e["sequence"] for e in timeline["audit_events"]]
+    assert sequences == sorted(sequences)
+
+    decisions = timeline["policy_decisions"]
+    assert decisions, "policy decisions must be visible"
+    assert {"policy_name", "allowed", "reason", "input", "decision"} <= set(
+        decisions[0]
+    )
+
+    assert timeline["agent_jobs"], "the dispatched agent job must be visible"
+    assert timeline["agent_jobs"][0]["provider"] == "fake"
+
+
+# -- dashboard -----------------------------------------------------------------
+
+
+def test_dashboard_served_when_token_configured(client) -> None:
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "Foundry" in resp.text
+    assert "runs/" in resp.text  # talks to the timeline API
+
+
+def test_dashboard_disabled_without_token() -> None:
+    client = _make_client(api_token=None)
+    assert client.get("/dashboard").status_code == 403

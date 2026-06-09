@@ -17,6 +17,9 @@ class PullRequestState(BaseModel):
     pr_number: int
     url: str
     branch: str
+    # PR title, used to correlate delegated-agent PRs back to a run via the
+    # embedded issue key when the branch name was not chosen by Foundry.
+    title: str = ""
     status: PRStatus
     ci_status: CIStatus = CIStatus.UNKNOWN
     review_status: ReviewStatus = ReviewStatus.NONE

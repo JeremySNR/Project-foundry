@@ -7,7 +7,8 @@ risk level, but the hard allow/deny decision is made by ``foundry.policy``.
 
 from __future__ import annotations
 
-from typing import Protocol
+import fnmatch
+from typing import Mapping, Protocol
 
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.schemas.common import AgentMode, ApprovalRole, OverallRisk
@@ -33,6 +34,32 @@ _SENSITIVE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "production_deploy": ("deploy to production", "prod deploy", "release to prod",
                           "production release"),
 }
+
+
+def glob_match(path: str, pattern: str) -> bool:
+    """fnmatch with a usable ``**/`` prefix: ``**/auth/**`` also matches a path
+    that *starts* with ``auth/`` (fnmatch alone would require a leading slash).
+    """
+    if fnmatch.fnmatch(path, pattern):
+        return True
+    return pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:])
+
+
+def sensitive_areas_for_paths(
+    files: list[str], globs_map: Mapping[str, tuple[str, ...]]
+) -> dict[str, list[str]]:
+    """Classify changed file paths against sensitive-area globs.
+
+    This is the diff-aware half of risk classification: the upfront pass reads
+    the *ticket text*, but the risk that matters materialises in the *diff*.
+    Returns ``{area: [matching files...]}`` for every area actually touched.
+    """
+    touched: dict[str, list[str]] = {}
+    for path in files:
+        for area, patterns in globs_map.items():
+            if any(glob_match(path, p) for p in patterns):
+                touched.setdefault(area, []).append(path)
+    return {area: sorted(paths) for area, paths in sorted(touched.items())}
 
 
 class RiskClassifier(Protocol):

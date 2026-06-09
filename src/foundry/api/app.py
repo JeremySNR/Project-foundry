@@ -3,9 +3,14 @@
 Surfaces:
 
 - ``POST /webhooks/linear`` - signed, idempotent intake that runs
-  ``FoundryOrchestrator.intake_and_plan`` and persists a real run.
-- ``POST /runs/{run_id}/approval`` - authorised ``/foundry approve|reject|stop``
-  commands that drive the orchestrator (approve also attempts agent dispatch).
+  ``FoundryOrchestrator.intake_and_plan``, plus the *primary* approval surface:
+  ``/foundry approve|reject|stop`` comments arrive here already authenticated
+  by the webhook signature, with the actor taken from the Linear payload.
+- ``POST /runs/{run_id}/approval`` - the API approval surface. Requires a
+  bearer token (``FOUNDRY_API_TOKEN``); disabled entirely when no token is
+  configured, because an unauthenticated approval endpoint would let anyone
+  bypass the human gate. Approval *roles* are never accepted from the caller -
+  they come from the configured approver -> roles mapping.
 - ``GET /runs`` and ``GET /runs/{run_id}`` - run status read from the DB.
 
 Everything is injected through ``app.state`` so a Postgres session factory, a
@@ -15,9 +20,14 @@ swapped in without touching the routes.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import hmac
+import json
+from datetime import datetime
+from typing import Any, Callable, Iterable, Mapping
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from sqlalchemy import func
 
 from foundry.config import Settings
 from foundry.connectors.github import GitHubConnector
@@ -25,13 +35,20 @@ from foundry.drivers import InlineDriver, RunDriver
 from foundry.connectors.linear import LinearConnector
 from foundry.connectors.transport import github_transport, linear_transport
 from foundry.db.base import create_all, make_engine, make_session_factory
-from foundry.db.models import FoundryRun
+from foundry.db.models import (
+    FoundryAgentJob,
+    FoundryArtifact,
+    FoundryAuditEvent,
+    FoundryPolicyDecision,
+    FoundryRun,
+)
 from foundry.engines import build_openai_analyzer
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.policy import LocalPolicyEngine
 from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
+from .dashboard import DASHBOARD_HTML
 from .mapping import linear_payload_to_ticket
 from .security import is_authorised_approver, parse_command, verify_signature
 
@@ -41,6 +58,10 @@ _TRIGGER_LABEL = "foundry:candidate"
 _TRIGGER_STATUS = "Ready for AI Analysis"
 
 TicketMapper = Callable[[dict[str, Any]], RawTicket]
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
 
 
 def _run_to_dict(run: FoundryRun) -> dict[str, Any]:
@@ -55,6 +76,8 @@ def _run_to_dict(run: FoundryRun) -> dict[str, Any]:
         "agent_mode": run.agent_mode.value if run.agent_mode else None,
         "approved_by": run.approved_by,
         "created_by": run.created_by,
+        "created_at": _iso(run.created_at),
+        "updated_at": _iso(run.updated_at),
     }
 
 
@@ -93,7 +116,8 @@ def create_app(
     webhook_secret: str,
     session_factory=None,
     orchestrator: FoundryOrchestrator | None = None,
-    authorised_approvers: set[str] | None = None,
+    approvers: Mapping[str, Iterable[str]] | None = None,
+    api_token: str | None = None,
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
@@ -111,9 +135,16 @@ def create_app(
     # Reads use the orchestrator/DB directly; mutations go through the driver
     # seam (inline today, durable Temporal later) so there is one execution path.
     app.state.orchestrator = orch
+    app.state.session_factory = session_factory
     app.state.driver = driver or InlineDriver(orch)
     app.state.webhook_secret = webhook_secret
-    app.state.authorised_approvers = authorised_approvers or set()
+    # user -> roles that user's approval actually grants. Roles are config,
+    # never request payload: a caller cannot self-assert "security".
+    app.state.approvers = {
+        user: {ApprovalRole(r) for r in roles}
+        for user, roles in (approvers or {}).items()
+    }
+    app.state.api_token = api_token
     app.state.ticket_mapper = ticket_mapper or linear_payload_to_ticket
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
@@ -123,9 +154,31 @@ def create_app(
     # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
     app.state.processed_events = set()
 
+    def _submit_decision(run_id: str, *, command: str, user: str) -> None:
+        """Drive an approve/reject/stop decision with config-derived roles."""
+        roles = app.state.approvers.get(user, set())
+        app.state.driver.submit_decision(
+            run_id, decision=command, user=user, roles=set(roles)
+        )
+
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/dashboard", include_in_schema=False)
+    def dashboard() -> HTMLResponse:
+        """Read-only run dashboard (static page, no build step).
+
+        Disabled when no API token is configured - the page is useless without
+        the token-gated timeline endpoint, and serving it would advertise the
+        API surface for free. Same fail-closed posture as approvals.
+        """
+        if not app.state.api_token:
+            raise HTTPException(
+                status_code=403,
+                detail="dashboard disabled: configure FOUNDRY_API_TOKEN",
+            )
+        return HTMLResponse(DASHBOARD_HTML)
 
     @app.post("/webhooks/linear", status_code=202)
     async def linear_webhook(
@@ -150,6 +203,19 @@ def create_app(
         if event_id and event_id in app.state.processed_events:
             return {"status": "duplicate", "run": _existing_run(orch, ticket.issue_id)}
 
+        # Approval commands arrive as Linear comments. The webhook signature
+        # authenticates the payload, and the actor identity comes from Linear
+        # itself - this is the primary, already-authenticated approval surface.
+        data = payload.get("data", {}) or {}
+        body_text = data.get("body") or payload.get("body") or ""
+        command = parse_command(body_text)
+        if command and command.command in {"approve", "reject", "stop"}:
+            if event_id:
+                app.state.processed_events.add(event_id)
+            return _handle_linear_decision(
+                app, orch, ticket.issue_id, command.command, payload
+            )
+
         if not _is_trigger(
             payload, label=app.state.trigger_label, status=app.state.trigger_status
         ):
@@ -160,14 +226,15 @@ def create_app(
         if not ticket.issue_id:
             raise HTTPException(status_code=400, detail="missing issue id in payload")
 
-        # Durable, idempotent guarantee: one run per Linear issue.
-        existing_id = orch.find_run_id_for_issue(ticket.issue_id)
-        if existing_id is not None:
+        # At most one *active* run per issue. A finished, blocked, rejected or
+        # needs-clarification run does not pin the issue forever: an updated
+        # ticket can be re-analysed with a fresh trigger.
+        active_id = orch.find_active_run_id_for_issue(ticket.issue_id)
+        if active_id is not None:
             if event_id:
                 app.state.processed_events.add(event_id)
-            return {"status": "exists", "run": _run_to_dict(orch.get_run(existing_id))}
+            return {"status": "exists", "run": _run_to_dict(orch.get_run(active_id))}
 
-        data = payload.get("data", {}) or {}
         run_id = app.state.driver.start(
             ticket,
             trigger_type=_trigger_type(payload, status=app.state.trigger_status),
@@ -197,12 +264,19 @@ def create_app(
             return {"status": "ignored", "reason": f"event '{event}' not handled"}
 
         orch: FoundryOrchestrator = app.state.orchestrator
-        run_id = orch.find_run_id_for_branch(pr_state.branch)
+        # Branch match first; falls back to the issue key embedded in the
+        # branch or PR title (delegated agents choose their own branch names).
+        run_id = orch.correlate_pr(pr_state)
         if run_id is None:
-            # A PR Foundry did not initiate (no agent job for this branch).
-            return {"status": "ignored", "reason": "no run for branch"}
+            # A PR Foundry did not initiate.
+            return {"status": "ignored", "reason": "no run matches this PR"}
 
-        app.state.driver.observe_pr(run_id, pr_state)
+        try:
+            app.state.driver.observe_pr(run_id, pr_state)
+        except OrchestratorError as exc:
+            # E.g. an event for a run already blocked/complete. Not an error
+            # worth a retry storm from GitHub - acknowledge and move on.
+            return {"status": "ignored", "reason": str(exc), "run_id": run_id}
         run = orch.get_run(run_id)
         return {"status": "recorded", "run_status": run.status.value, "run_id": run_id}
 
@@ -210,8 +284,20 @@ def create_app(
     def list_runs(skip: int = 0, limit: int = 100) -> dict[str, Any]:
         orch: FoundryOrchestrator = app.state.orchestrator
         all_runs = orch.list_runs()
+        with app.state.session_factory() as session:
+            costs = dict(
+                session.query(
+                    FoundryAgentJob.run_id, func.sum(FoundryAgentJob.cost_usd)
+                )
+                .filter(FoundryAgentJob.cost_usd.isnot(None))
+                .group_by(FoundryAgentJob.run_id)
+                .all()
+            )
         return {
-            "runs": [_run_to_dict(r) for r in all_runs[skip : skip + limit]],
+            "runs": [
+                {**_run_to_dict(r), "cost_usd": costs.get(r.id)}
+                for r in all_runs[skip : skip + limit]
+            ],
             "total": len(all_runs),
             "skip": skip,
             "limit": limit,
@@ -225,8 +311,105 @@ def create_app(
             raise HTTPException(status_code=404, detail="run not found")
         return _run_to_dict(run)
 
+    @app.get("/runs/{run_id}/timeline")
+    def run_timeline(run_id: str, request: Request) -> dict[str, Any]:
+        """The full decision record for a run: every artifact, audit event and
+        policy decision, in order. This is the "why did the agent do that?"
+        endpoint. Token-gated: artifacts contain ticket content and plans,
+        which are more sensitive than the bare statuses on ``GET /runs``.
+        """
+        _require_api_token(app, request)
+        orch: FoundryOrchestrator = app.state.orchestrator
+        run = orch.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        with app.state.session_factory() as session:
+            artifacts = (
+                session.query(FoundryArtifact)
+                .filter_by(run_id=run_id)
+                .order_by(FoundryArtifact.created_at, FoundryArtifact.version)
+                .all()
+            )
+            events = (
+                session.query(FoundryAuditEvent)
+                .filter_by(run_id=run_id)
+                .order_by(FoundryAuditEvent.sequence)
+                .all()
+            )
+            decisions = (
+                session.query(FoundryPolicyDecision)
+                .filter_by(run_id=run_id)
+                .order_by(FoundryPolicyDecision.created_at)
+                .all()
+            )
+            jobs = (
+                session.query(FoundryAgentJob)
+                .filter_by(run_id=run_id)
+                .order_by(FoundryAgentJob.started_at)
+                .all()
+            )
+            return {
+                "run": _run_to_dict(run),
+                "artifacts": [
+                    {
+                        "id": a.id,
+                        "artifact_type": a.artifact_type.value,
+                        "version": a.version,
+                        "content_hash": a.content_hash,
+                        "created_at": _iso(a.created_at),
+                        "content": json.loads(a.content_json),
+                    }
+                    for a in artifacts
+                ],
+                "audit_events": [
+                    {
+                        "sequence": e.sequence,
+                        "event_type": e.event_type.value,
+                        "actor_type": e.actor_type,
+                        "actor_id": e.actor_id,
+                        "metadata": json.loads(e.metadata_json)
+                        if e.metadata_json
+                        else None,
+                        "created_at": _iso(e.created_at),
+                    }
+                    for e in events
+                ],
+                "policy_decisions": [
+                    {
+                        "policy_name": d.policy_name,
+                        "allowed": d.allowed,
+                        "reason": d.reason,
+                        "input": json.loads(d.input_json),
+                        "decision": json.loads(d.decision_json),
+                        "created_at": _iso(d.created_at),
+                    }
+                    for d in decisions
+                ],
+                "agent_jobs": [
+                    {
+                        "id": j.id,
+                        "provider": j.provider,
+                        "provider_job_id": j.provider_job_id,
+                        "status": j.status.value,
+                        "repo": j.repo,
+                        "branch": j.branch,
+                        "pr_url": j.pr_url,
+                        "cost_usd": j.cost_usd,
+                        "started_at": _iso(j.started_at),
+                        "completed_at": _iso(j.completed_at),
+                        "error": j.error,
+                    }
+                    for j in jobs
+                ],
+            }
+
     @app.post("/runs/{run_id}/approval")
-    def approval(run_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    def approval(
+        run_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        _require_api_token(app, request)
         orch: FoundryOrchestrator = app.state.orchestrator
         user = body.get("user")
         text = body.get("text") or body.get("command") or ""
@@ -237,7 +420,7 @@ def create_app(
         if command is None:
             raise HTTPException(status_code=400, detail="unrecognised command")
 
-        if not is_authorised_approver(user, app.state.authorised_approvers):
+        if not is_authorised_approver(user, set(app.state.approvers)):
             raise HTTPException(status_code=403, detail="user not authorised to approve")
 
         if command.command not in {"approve", "reject", "stop"}:
@@ -249,16 +432,9 @@ def create_app(
         if orch.get_run(run_id) is None:
             raise HTTPException(status_code=404, detail="run not found")
 
-        raw_roles = body.get("roles", [])
+        # Roles deliberately ignored from the body: they are configuration.
         try:
-            roles = {ApprovalRole(r) for r in raw_roles}
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid role: {exc}") from exc
-
-        try:
-            app.state.driver.submit_decision(
-                run_id, decision=command.command, user=user, roles=roles
-            )
+            _submit_decision(run_id, command=command.command, user=user)
         except OrchestratorError as exc:
             msg = str(exc)
             # Policy gate blocked dispatch (security/risk rejection) → 403.
@@ -289,7 +465,151 @@ def _existing_run(orch: FoundryOrchestrator, issue_id: str) -> dict[str, Any] | 
     return _run_to_dict(orch.get_run(run_id)) if run_id else None
 
 
+def _require_api_token(app: FastAPI, request: Request) -> None:
+    """Enforce bearer-token auth on mutating API endpoints.
+
+    Fail closed: with no token configured the endpoint is disabled outright,
+    because an unauthenticated approval surface defeats the human gate. The
+    signed Linear webhook remains available for approvals either way.
+    """
+    expected = app.state.api_token
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "the approval API is disabled: no FOUNDRY_API_TOKEN is "
+                "configured; approve via a signed Linear comment instead"
+            ),
+        )
+    provided = request.headers.get("authorization", "")
+    if not hmac.compare_digest(provided, f"Bearer {expected}"):
+        raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+
+def _actor_identity(payload: dict[str, Any]) -> str | None:
+    """The acting user from a Linear webhook payload (email preferred)."""
+    data = payload.get("data", {}) or {}
+    for actor in (data.get("actor"), payload.get("actor")):
+        if isinstance(actor, dict):
+            identity = actor.get("email") or actor.get("name")
+            if identity:
+                return str(identity)
+    return None
+
+
+def _handle_linear_decision(
+    app: FastAPI,
+    orch: FoundryOrchestrator,
+    issue_id: str,
+    command: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply an approve/reject/stop comment from a signed Linear webhook.
+
+    Always returns 2xx payloads (never raises): a 4xx/5xx here would make
+    Linear retry-deliver a comment that was processed and refused.
+    """
+    if not issue_id:
+        return {"status": "ignored", "reason": "missing issue id in payload"}
+    user = _actor_identity(payload)
+    if not user:
+        return {"status": "ignored", "reason": "no actor identity in payload"}
+    if not is_authorised_approver(user, set(app.state.approvers)):
+        return {
+            "status": "ignored",
+            "reason": f"'{user}' is not an authorised approver",
+        }
+    run_id = orch.find_active_run_id_for_issue(issue_id)
+    if run_id is None:
+        return {"status": "ignored", "reason": "no active run for issue"}
+    roles = app.state.approvers.get(user, set())
+    try:
+        app.state.driver.submit_decision(
+            run_id, decision=command, user=user, roles=set(roles)
+        )
+    except OrchestratorError as exc:
+        return {"status": "refused", "reason": str(exc), "run_id": run_id}
+    run = orch.get_run(run_id)
+    result: dict[str, Any] = {
+        "status": "applied",
+        "command": command,
+        "run": _run_to_dict(run),
+    }
+    if command == "approve":
+        result["dispatched"] = run.status is RunStatus.AGENT_RUNNING
+    return result
+
+
 # -- deployment entrypoints ---------------------------------------------------
+
+
+def build_provider(settings: Settings, tracker=None):
+    """Resolve the configured coding-agent provider (``agent.provider``).
+
+    Fail-closed: a provider that is selected but missing its credentials is a
+    configuration error at startup, not a silent fallback to another agent.
+    """
+    from foundry.agents import (
+        ClaudeCodeProvider,
+        CursorCloudAgentProvider,
+        CursorViaLinearProvider,
+        InMemoryFakeProvider,
+        ManualProvider,
+        WebhookProvider,
+    )
+    from foundry.connectors.transport import (
+        json_get_transport,
+        json_post_transport,
+        raw_post_transport,
+    )
+
+    name = settings.agent_provider
+    if name == "manual":
+        return ManualProvider()
+    if name == "fake":
+        return InMemoryFakeProvider()
+    if name == "cursor_via_linear":
+        if tracker is None:
+            raise ValueError(
+                "agent.provider=cursor_via_linear requires FOUNDRY_LINEAR_API_TOKEN"
+            )
+        return CursorViaLinearProvider(tracker)
+    if name == "cursor_cloud":
+        if not settings.cursor_api_token:
+            raise ValueError(
+                "agent.provider=cursor_cloud requires FOUNDRY_CURSOR_API_TOKEN"
+            )
+        headers = {"Authorization": f"Bearer {settings.cursor_api_token}"}
+        return CursorCloudAgentProvider(
+            http_post=json_post_transport(headers),
+            http_get=json_get_transport(headers),
+        )
+    if name == "claude_code":
+        if not settings.github_api_token:
+            raise ValueError(
+                "agent.provider=claude_code requires FOUNDRY_GITHUB_API_TOKEN "
+                "(to fire workflow_dispatch)"
+            )
+        return ClaudeCodeProvider(
+            http_post=json_post_transport(
+                {
+                    "Authorization": f"Bearer {settings.github_api_token}",
+                    "Accept": "application/vnd.github+json",
+                }
+            ),
+            workflow_file=settings.claude_workflow_file,
+        )
+    if name == "webhook":
+        if not settings.agent_webhook_url:
+            raise ValueError(
+                "agent.provider=webhook requires FOUNDRY_AGENT_WEBHOOK_URL"
+            )
+        return WebhookProvider(
+            url=settings.agent_webhook_url,
+            http_post=raw_post_transport(),
+            signing_secret=settings.agent_webhook_secret,
+        )
+    raise ValueError(f"unknown agent.provider: {name!r}")
 
 
 def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrator:
@@ -308,11 +628,16 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         session_factory,
         analyzer=analyzer,
         issue_tracker=tracker,
+        provider=build_provider(settings, tracker),
         policy_engine=LocalPolicyEngine(
             repo_confidence_threshold=settings.repo_confidence_threshold
         ),
         max_files_changed=settings.max_files_changed,
         forbidden_globs=settings.forbidden_globs,
+        sensitive_path_globs=settings.sensitive_globs_map,
+        max_agent_retries=settings.max_agent_retries,
+        retry_on=settings.retry_on,
+        max_cost_per_run=settings.max_cost_per_run,
     )
 
 
@@ -329,7 +654,8 @@ def app_from_settings(settings: Settings) -> FastAPI:
         webhook_secret=settings.linear_webhook_secret,
         session_factory=session_factory,
         orchestrator=build_orchestrator(settings, session_factory),
-        authorised_approvers=set(settings.authorised_approvers),
+        approvers={email: roles for email, roles in settings.approvers},
+        api_token=settings.api_token,
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
         trigger_label=settings.trigger_label,

@@ -57,3 +57,6 @@ class CodingAgentJobStatus(BaseModel):
     branch: str | None = None
     pr_url: str | None = None
     error: str | None = None
+    # Spend reported by the provider for this job, where the provider exposes
+    # usage (e.g. the Cursor Cloud Agents API). None = unknown, not zero.
+    cost_usd: float | None = None

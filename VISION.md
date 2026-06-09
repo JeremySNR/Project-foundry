@@ -2,7 +2,7 @@
 
 > This is the canonical product description for Project Foundry. It is the north
 > star: read it before touching code. It keeps the wedge narrow and the layering
-> honest — every feature should help **turn product intent into governed software
+> honest - every feature should help **turn product intent into governed software
 > delivery**, not just add plumbing.
 
 Project Foundry is an AI-native engineering control plane designed to turn
@@ -44,7 +44,7 @@ These are the tests we apply to any proposed feature:
 
 1. **Intent in, governed delivery out.** The unit of work is product *intent*;
    the deliverable is *governed delivery*, not code. If a change doesn't help
-   intent become governed delivery, it's plumbing — justify it as such.
+   intent become governed delivery, it's plumbing - justify it as such.
 2. **Sit above, never replace.** Foundry owns no editor, repo, or chat. It
    integrates through adapters so existing tools keep their strengths.
 3. **Governance is hard rules, not prompts.** Allow/deny decisions live in the

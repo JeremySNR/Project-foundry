@@ -18,9 +18,10 @@ Lifecycle:
 
 from __future__ import annotations
 
-import fnmatch
 import logging
+import re
 from datetime import datetime, timezone
+from typing import Mapping
 
 from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
@@ -49,23 +50,33 @@ from foundry.engines.planner import (
     TemplatePlanner,
     branch_name_for,
 )
-from foundry.engines.risk import HeuristicRiskClassifier, RiskClassifier
+from foundry.engines.risk import (
+    HeuristicRiskClassifier,
+    RiskClassifier,
+    glob_match,
+    sensitive_areas_for_paths,
+)
 from foundry.policy.engine import (
     LocalPolicyEngine,
+    PolicyBudget,
     PolicyEngine,
     PolicyInput,
     PolicyRepo,
+    PolicyRetry,
     PolicyRisk,
     PolicyTicket,
 )
 from foundry.schemas.agent import CodingAgentJob, CodingAgentJobInput, JobConstraints
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.schemas.common import (
+    ACTIVE_RUN_STATUSES,
     AgentMode,
     ApprovalRole,
+    CIStatus,
     OverallRisk,
     PolicyAction,
     PRStatus,
+    ReviewStatus,
     RunStatus,
 )
 from foundry.schemas.context import ContextBundle
@@ -86,6 +97,14 @@ _ARTIFACT_MODELS: dict[ArtifactType, type] = {
 
 _log = logging.getLogger(__name__)
 
+# Run states in which PR webhook events are meaningful for the run.
+_PR_OBSERVABLE_STATUSES = frozenset(
+    {RunStatus.AGENT_RUNNING, RunStatus.PR_OPEN, RunStatus.REVIEW_REQUIRED}
+)
+
+# Linear-style issue keys (ENG-123) appearing in branch names or PR titles.
+_ISSUE_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
+
 
 class OrchestratorError(RuntimeError):
     """Raised when a run cannot proceed (e.g. policy blocked dispatch)."""
@@ -105,6 +124,10 @@ class FoundryOrchestrator:
         issue_tracker: IssueTracker | None = None,
         max_files_changed: int = 12,
         forbidden_globs: tuple[str, ...] | list[str] | None = None,
+        sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
+        max_agent_retries: int = 2,
+        retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
+        max_cost_per_run: float | None = None,
     ) -> None:
         self._sf = session_factory
         self._analyzer = analyzer or HeuristicAnalyzer()
@@ -119,6 +142,14 @@ class FoundryOrchestrator:
         self._forbidden_globs = list(
             forbidden_globs if forbidden_globs is not None else DEFAULT_FORBIDDEN_GLOBS
         )
+        if sensitive_path_globs is None:
+            from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
+
+            sensitive_path_globs = dict(DEFAULT_SENSITIVE_PATH_GLOBS)
+        self._sensitive_path_globs = dict(sensitive_path_globs)
+        self._max_agent_retries = max_agent_retries
+        self._retry_on = frozenset(retry_on)
+        self._max_cost_per_run = max_cost_per_run
 
     # -- intake + planning ----------------------------------------------------
 
@@ -127,6 +158,13 @@ class FoundryOrchestrator:
         self, ticket: RawTicket, *, trigger_type: str, created_by: str | None = None
     ) -> str:
         """Run analysis -> context -> risk -> plan -> policy gate; persist all."""
+        # At most one *active* run per issue; finished/blocked runs may be
+        # superseded by a fresh trigger (e.g. after the ticket is clarified).
+        active = self.find_active_run_id_for_issue(ticket.issue_id)
+        if active is not None:
+            raise OrchestratorError(
+                f"issue {ticket.issue_id} already has an active run ({active})"
+            )
         run_id = new_id("run")
         analysis = self._analyzer.analyse(ticket)
         context = self._enricher.enrich(ticket, analysis)
@@ -230,6 +268,13 @@ class FoundryOrchestrator:
                     issue_id,
                     status.value,
                 )
+
+    def _notify_comment(self, issue_id: str, body: str) -> None:
+        if self._tracker is not None:
+            try:
+                self._tracker.post_comment(issue_id, body)
+            except Exception:
+                _log.exception("tracker comment failed for issue %s", issue_id)
 
     @staticmethod
     def _post_plan_status(
@@ -335,8 +380,24 @@ class FoundryOrchestrator:
             )
             return run.id if run else None
 
+    def find_active_run_id_for_issue(self, linear_issue_id: str) -> str | None:
+        """The in-flight run for an issue, if any (None means restartable)."""
+        with self._sf() as session:
+            run = (
+                session.query(FoundryRun)
+                .filter(
+                    FoundryRun.linear_issue_id == linear_issue_id,
+                    FoundryRun.status.in_(ACTIVE_RUN_STATUSES),
+                )
+                .order_by(FoundryRun.created_at.desc())
+                .first()
+            )
+            return run.id if run else None
+
     def find_run_id_for_branch(self, branch: str) -> str | None:
         """Associate an observed PR back to its run via the agent job's branch."""
+        if not branch:
+            return None
         with self._sf() as session:
             job = (
                 session.query(FoundryAgentJob)
@@ -345,6 +406,39 @@ class FoundryOrchestrator:
                 .first()
             )
             return job.run_id if job else None
+
+    def correlate_pr(self, pr_state: PullRequestState) -> str | None:
+        """Find the run an observed PR belongs to.
+
+        Exact branch match first (direct providers control the branch name).
+        Falls back to Linear issue keys found in the branch name or PR title,
+        because delegated agents (e.g. Cursor via Linear) choose their own
+        branch names but embed the issue key. Only runs in a PR-observable
+        state are matched, so stale runs for the same issue are not revived.
+        """
+        run_id = self.find_run_id_for_branch(pr_state.branch)
+        if run_id is not None:
+            return run_id
+
+        keys: list[str] = []
+        for text in (pr_state.branch, pr_state.title):
+            keys.extend(m.upper() for m in _ISSUE_KEY_RE.findall(text or ""))
+        if not keys:
+            return None
+        with self._sf() as session:
+            for key in dict.fromkeys(keys):  # de-dup, preserve order
+                run = (
+                    session.query(FoundryRun)
+                    .filter(
+                        FoundryRun.linear_issue_key == key,
+                        FoundryRun.status.in_(_PR_OBSERVABLE_STATUSES),
+                    )
+                    .order_by(FoundryRun.created_at.desc())
+                    .first()
+                )
+                if run is not None:
+                    return run.id
+        return None
 
     def get_run(self, run_id: str) -> FoundryRun | None:
         with self._sf() as session:
@@ -461,26 +555,42 @@ class FoundryOrchestrator:
 
     @traced("foundry.record_pr")
     def record_pr(self, run_id: str, pr_state: PullRequestState) -> RunStatus:
-        """Record an observed PR and decide the resulting run status.
+        """Record an observed PR event and decide the resulting run status.
 
-        Forbidden-path changes block the run; oversized changes require human
-        review; otherwise the PR is simply open.
+        Called for *every* observed event (opened, synchronize, reviews, CI),
+        not just the first - the guardrails are re-evaluated on every push so an
+        agent cannot open a clean PR and add forbidden or sensitive files later.
+
+        Outcomes, in precedence order:
+
+        - merged                      -> COMPLETE
+        - closed without merge        -> BLOCKED (a human must restart)
+        - forbidden paths in the diff -> BLOCKED (sticky; human must intervene)
+        - diff touches a sensitive area the upfront risk pass never flagged
+                                      -> REVIEW_REQUIRED (risk escalation)
+        - more files than allowed     -> REVIEW_REQUIRED
+        - otherwise                   -> PR_OPEN
+
+        Events that carry no file list (reviews, check suites) update CI/review
+        state without weakening a prior file-based decision.
         """
-        violations = self._forbidden_violations(pr_state.files_changed)
-        too_big = len(pr_state.files_changed) > self._max_files_changed
-
         with self._sf() as session:
             run = self._require_run(session, run_id)
-            if run.status is not RunStatus.AGENT_RUNNING:
+            if run.status not in _PR_OBSERVABLE_STATUSES:
                 raise OrchestratorError(
-                    f"run {run_id} is '{run.status.value}', not agent_running; "
-                    "cannot record a PR for a run that hasn't dispatched an agent"
+                    f"run {run_id} is '{run.status.value}'; PR events are only "
+                    "recorded for runs with a dispatched agent"
                 )
+            first_observation = run.status is RunStatus.AGENT_RUNNING
             self._add(session, run_id, ArtifactType.PR_STATE, pr_state)
             session.add(
                 build_audit_event(
                     run_id=run_id,
-                    event_type=AuditEventType.PR_OPENED,
+                    event_type=(
+                        AuditEventType.PR_OPENED
+                        if first_observation
+                        else AuditEventType.PR_UPDATED
+                    ),
                     actor_type="agent",
                     output_content=pr_state,
                 )
@@ -492,28 +602,301 @@ class FoundryOrchestrator:
                 .first()
             )
             if job is not None:
-                job.pr_url = pr_state.url
+                job.pr_url = pr_state.url or job.pr_url
+                if pr_state.branch:
+                    # Delegated agents pick their own branch; record the actual
+                    # one so subsequent events correlate by exact branch match.
+                    job.branch = pr_state.branch
 
-            if violations:
-                run.status = RunStatus.BLOCKED
+            run.status = self._next_status_for_pr(session, run, pr_state)
+            if run.status is RunStatus.COMPLETE and job is not None:
+                job.status = AgentJobStatus.SUCCEEDED
+                job.completed_at = datetime.now(timezone.utc)
+
+            if pr_state.ci_status is CIStatus.FAILING:
+                session.add(
+                    build_audit_event(
+                        run_id=run_id,
+                        event_type=AuditEventType.CI_FAILED,
+                        actor_type="foundry",
+                        metadata={"pr": pr_state.url},
+                    )
+                )
+
+            run.current_step = run.status.value
+            issue_id = run.linear_issue_id
+            result_status = run.status
+            session.commit()
+        self._notify_state(issue_id, result_status)
+
+        # Feedback loop: a failing check or a changes-requested review on an
+        # otherwise-open PR re-dispatches the agent with the failure context,
+        # still through the policy gate and bounded by the retry cap.
+        reason = self._remediation_reason(pr_state)
+        if result_status is RunStatus.PR_OPEN and reason is not None:
+            return self._attempt_remediation(run_id, reason=reason, pr_state=pr_state)
+        return result_status
+
+    @staticmethod
+    def _remediation_reason(pr_state: PullRequestState) -> str | None:
+        if pr_state.ci_status is CIStatus.FAILING:
+            return "ci_failed"
+        if pr_state.review_status is ReviewStatus.CHANGES_REQUESTED:
+            return "changes_requested"
+        return None
+
+    def _attempt_remediation(
+        self, run_id: str, *, reason: str, pr_state: PullRequestState
+    ) -> RunStatus:
+        """Re-dispatch the agent to fix its own PR, governed and bounded.
+
+        The attempt passes the policy gate as ``RETRY_AGENT`` (which re-checks
+        approvals and the retry cap). A denied attempt parks the run at
+        REVIEW_REQUIRED with a tracker comment - never silent, never unbounded.
+        """
+        if reason not in self._retry_on:
+            return RunStatus.PR_OPEN
+
+        with self._sf() as session:
+            run = self._require_run(session, run_id)
+            ticket = self._load(session, run_id, ArtifactType.TICKET_SNAPSHOT)
+            analysis = self._load(session, run_id, ArtifactType.TICKET_ANALYSIS)
+            context = self._load(session, run_id, ArtifactType.CONTEXT_BUNDLE)
+            risk = self._load(session, run_id, ArtifactType.RISK_ASSESSMENT)
+            plan = self._load(session, run_id, ArtifactType.DELIVERY_PLAN)
+            approval = self._load_raw(session, run_id, ArtifactType.APPROVAL_RECORD)
+            granted = set(approval.get("granted_roles", [])) if approval else set()
+
+            # The first job was the original dispatch; everything after is a
+            # remediation attempt.
+            prior_jobs = (
+                session.query(FoundryAgentJob)
+                .filter(FoundryAgentJob.run_id == run_id)
+                .count()
+            )
+            attempt = prior_jobs  # attempt N = N-th re-dispatch
+
+            # Refresh provider-reported spend before the budget check so the
+            # decision is made on the freshest numbers we can get.
+            self._refresh_job_costs(session, run_id)
+            run_cost = sum(
+                job.cost_usd or 0.0
+                for job in session.query(FoundryAgentJob).filter_by(run_id=run_id)
+            )
+
+            payload = self._policy_input(
+                PolicyAction.RETRY_AGENT,
+                analysis,
+                context,
+                risk,
+                approvals=granted,
+                retry=PolicyRetry(
+                    attempt=attempt, max_attempts=self._max_agent_retries
+                ),
+                budget=PolicyBudget(
+                    cost_usd=run_cost, max_cost_usd=self._max_cost_per_run
+                ),
+            )
+            decision = self._policy.evaluate(payload)
+            session.add(
+                build_policy_decision_row(
+                    run_id=run_id, payload=payload, decision=decision
+                )
+            )
+
+            if not decision.allowed:
+                run.status = RunStatus.REVIEW_REQUIRED
+                run.current_step = "remediation_denied"
                 session.add(
                     build_audit_event(
                         run_id=run_id,
                         event_type=AuditEventType.RUN_BLOCKED,
                         actor_type="foundry",
-                        metadata={"forbidden_files": violations},
+                        metadata={
+                            "reason": f"remediation for '{reason}' denied",
+                            "policy_reasons": decision.reasons,
+                        },
                     )
                 )
-            elif too_big:
-                run.status = RunStatus.REVIEW_REQUIRED
-            else:
-                run.status = RunStatus.PR_OPEN
-            run.current_step = "pr_open"
+                issue_id = run.linear_issue_id
+                session.commit()
+                self._notify_state(issue_id, RunStatus.REVIEW_REQUIRED)
+                self._notify_comment(
+                    issue_id,
+                    f"Foundry could not remediate ({reason.replace('_', ' ')}): "
+                    + "; ".join(decision.reasons)
+                    + "\n\nA human needs to take this PR over the line.",
+                )
+                return RunStatus.REVIEW_REQUIRED
+
+            job_input = self._build_job_input(
+                run_id,
+                ticket,
+                plan,
+                context,
+                branch=pr_state.branch or None,
+                extra_instructions=self._remediation_instructions(reason, pr_state),
+            )
+            job = self._provider.create_job(job_input)
+            session.add(
+                FoundryAgentJob(
+                    id=new_id("job"),
+                    run_id=run_id,
+                    provider=job.provider,
+                    provider_job_id=job.job_id,
+                    status=AgentJobStatus.RUNNING,
+                    repo=job_input.repo,
+                    branch=job_input.branch_name,
+                    started_at=datetime.now(timezone.utc),
+                )
+            )
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.AGENT_REMEDIATION_REQUESTED,
+                    actor_type="foundry",
+                    metadata={
+                        "reason": reason,
+                        "attempt": attempt,
+                        "max_attempts": self._max_agent_retries,
+                        "provider": job.provider,
+                        "job_id": job.job_id,
+                    },
+                )
+            )
+            run.status = RunStatus.AGENT_RUNNING
+            run.current_step = "remediating"
             issue_id = run.linear_issue_id
-            result_status = run.status
             session.commit()
-        self._notify_state(issue_id, result_status)
-        return result_status
+        self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
+        return RunStatus.AGENT_RUNNING
+
+    def _refresh_job_costs(self, session, run_id: str) -> None:
+        """Pull provider-reported spend onto the job rows, best-effort.
+
+        Providers that observe progress out-of-band report no usage; provider
+        errors must never break the governance path that called this.
+        """
+        for job in session.query(FoundryAgentJob).filter_by(run_id=run_id):
+            if not job.provider_job_id or job.provider != self._provider.name:
+                continue
+            try:
+                status = self._provider.get_job_status(job.provider_job_id)
+            except Exception:
+                _log.debug("cost refresh failed for job %s", job.id, exc_info=True)
+                continue
+            if status.cost_usd is not None:
+                job.cost_usd = status.cost_usd
+
+    @staticmethod
+    def _remediation_instructions(reason: str, pr_state: PullRequestState) -> str:
+        lines = [
+            "",
+            "---",
+            "REMEDIATION REQUEST",
+            f"Your previous work on PR {pr_state.url or f'#{pr_state.pr_number}'} "
+            f"needs fixing: {reason.replace('_', ' ')}.",
+            "Push fixes to the same branch. Do not open a new PR. Stay strictly "
+            "within the original scope and constraints.",
+        ]
+        if pr_state.summary:
+            lines += ["", "Failure details:", pr_state.summary]
+        return "\n".join(lines)
+
+    def _next_status_for_pr(
+        self, session, run: FoundryRun, pr_state: PullRequestState
+    ) -> RunStatus:
+        run_id = run.id
+        if pr_state.status is PRStatus.MERGED:
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RUN_COMPLETED,
+                    actor_type="foundry",
+                    metadata={"pr": pr_state.url},
+                )
+            )
+            return RunStatus.COMPLETE
+        if pr_state.status is PRStatus.CLOSED:
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RUN_BLOCKED,
+                    actor_type="foundry",
+                    metadata={"reason": "PR closed without merge", "pr": pr_state.url},
+                )
+            )
+            return RunStatus.BLOCKED
+
+        if not pr_state.files_changed:
+            # No diff information on this event; keep the current file-based
+            # decision rather than silently downgrading it.
+            return (
+                RunStatus.PR_OPEN
+                if run.status is RunStatus.AGENT_RUNNING
+                else run.status
+            )
+
+        violations = self._forbidden_violations(pr_state.files_changed)
+        if violations:
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RUN_BLOCKED,
+                    actor_type="foundry",
+                    metadata={"forbidden_files": violations},
+                )
+            )
+            return RunStatus.BLOCKED
+
+        unexpected = self._unexpected_sensitive_areas(
+            session, run_id, pr_state.files_changed
+        )
+        if unexpected:
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "reason": (
+                            "diff touches sensitive areas the upfront risk "
+                            "assessment did not flag"
+                        ),
+                        "areas": unexpected,
+                    },
+                )
+            )
+            return RunStatus.REVIEW_REQUIRED
+
+        if len(pr_state.files_changed) > self._max_files_changed:
+            return RunStatus.REVIEW_REQUIRED
+        return RunStatus.PR_OPEN
+
+    def _unexpected_sensitive_areas(
+        self, session, run_id: str, files: list[str]
+    ) -> dict[str, list[str]]:
+        """Sensitive areas the diff touches that intake never flagged.
+
+        Areas flagged upfront already had their approval requirements enforced
+        by the policy gate at dispatch; an area appearing *only* in the diff has
+        had no human look at it, so it escalates the run.
+        """
+        touched = sensitive_areas_for_paths(files, self._sensitive_path_globs)
+        if not touched:
+            return {}
+        try:
+            risk: RiskAssessment = self._load(
+                session, run_id, ArtifactType.RISK_ASSESSMENT
+            )
+            anticipated = set(risk.sensitive_areas.names())
+        except OrchestratorError:
+            anticipated = set()
+        return {
+            area: paths
+            for area, paths in touched.items()
+            if area not in anticipated
+        }
 
     # -- helpers --------------------------------------------------------------
 
@@ -523,16 +906,19 @@ class FoundryOrchestrator:
         ticket: RawTicket,
         plan: DeliveryPlan,
         context: ContextBundle,
+        *,
+        branch: str | None = None,
+        extra_instructions: str = "",
     ) -> CodingAgentJobInput:
         best_repo = context.best_repository
         assert best_repo is not None  # guaranteed by policy/readiness gating
         return CodingAgentJobInput(
             run_id=run_id,
             repo=best_repo.repo,
-            branch_name=branch_name_for(ticket),
+            branch_name=branch or branch_name_for(ticket),
             ticket_url=f"https://linear.app/issue/{ticket.issue_key}",
             delivery_plan=plan,
-            agent_instructions=plan.agent_instructions or "",
+            agent_instructions=(plan.agent_instructions or "") + extra_instructions,
             constraints=JobConstraints(
                 do_not_modify=list(self._forbidden_globs),
                 required_tests=list(context.test_commands),
@@ -548,6 +934,8 @@ class FoundryOrchestrator:
         context: ContextBundle,
         risk: RiskAssessment,
         approvals: set[str] | None = None,
+        retry: PolicyRetry | None = None,
+        budget: PolicyBudget | None = None,
     ) -> PolicyInput:
         best_repo = context.best_repository
         return PolicyInput(
@@ -564,6 +952,8 @@ class FoundryOrchestrator:
                 name=best_repo.repo if best_repo else None,
                 confidence=best_repo.confidence if best_repo else 0,
             ),
+            retry=retry or PolicyRetry(),
+            budget=budget or PolicyBudget(),
             approval={role: True for role in (approvals or set())},
         )
 
@@ -571,7 +961,7 @@ class FoundryOrchestrator:
         violations: list[str] = []
         for path in files:
             for pattern in self._forbidden_globs:
-                if fnmatch.fnmatch(path, pattern):
+                if glob_match(path, pattern):
                     violations.append(path)
                     break
         return violations

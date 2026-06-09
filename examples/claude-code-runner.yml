@@ -1,0 +1,87 @@
+# Reference workflow for Foundry's claude_code provider.
+#
+# Install this in the *target* repository as
+# .github/workflows/foundry-claude-code.yml (or set agent.claude_workflow_file
+# in foundry.yaml to match a different name).
+#
+# Foundry dispatches approved, policy-gated work here via workflow_dispatch.
+# The Anthropic key lives in this repo's secrets - Foundry never holds it.
+# Claude Code pushes the branch Foundry chose and opens a PR; Foundry's GitHub
+# webhook picks the PR up from there (guardrails re-run on every push).
+
+name: Foundry - Claude Code runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Foundry run id (for traceability)
+        required: true
+        type: string
+      branch_name:
+        description: Branch to create the work on (chosen by Foundry)
+        required: true
+        type: string
+      ticket_url:
+        description: Tracker ticket URL
+        required: false
+        type: string
+      instructions:
+        description: Governed agent instructions (already policy-gated)
+        required: true
+        type: string
+      do_not_modify:
+        description: Newline-separated globs the agent must not touch
+        required: false
+        type: string
+      required_tests:
+        description: Newline-separated test commands that must pass
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  claude-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create the work branch
+        run: |
+          git checkout -b "${{ inputs.branch_name }}"
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are completing a governed change for Foundry run ${{ inputs.run_id }}.
+            Ticket: ${{ inputs.ticket_url }}
+
+            ${{ inputs.instructions }}
+
+            Hard constraints (enforced by Foundry on the PR - violating them
+            blocks the run):
+            - Do NOT modify any file matching:
+            ${{ inputs.do_not_modify }}
+            - These commands must pass before you finish:
+            ${{ inputs.required_tests }}
+          allowed_tools: "Bash(git:*),Bash(npm:*),Bash(python:*),Bash(pytest:*),Edit,Read,Write,Glob,Grep"
+
+      - name: Push branch and open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add -A
+          git -c user.name="foundry-claude" -c user.email="foundry@users.noreply.github.com" \
+            commit -m "Foundry run ${{ inputs.run_id }}" || echo "nothing to commit"
+          git push origin "${{ inputs.branch_name }}"
+          gh pr create \
+            --head "${{ inputs.branch_name }}" \
+            --title "Foundry: ${{ inputs.run_id }}" \
+            --body "Automated change for ${{ inputs.ticket_url }} (Foundry run ${{ inputs.run_id }}). Opened by the Claude Code runner; review before merge."

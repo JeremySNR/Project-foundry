@@ -21,12 +21,12 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
     String,
     Text,
-    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -70,7 +70,10 @@ class AuditEventType(str, enum.Enum):
     APPROVAL_REJECTED = "approval.rejected"
     AGENT_STARTED = "agent.started"
     AGENT_FAILED = "agent.failed"
+    AGENT_REMEDIATION_REQUESTED = "agent.remediation_requested"
     PR_OPENED = "pr.opened"
+    PR_UPDATED = "pr.updated"
+    RISK_ESCALATED = "risk.escalated"
     CI_FAILED = "ci.failed"
     REVIEW_COMPLETED = "review.completed"
     RUN_COMPLETED = "run.completed"
@@ -79,10 +82,12 @@ class AuditEventType(str, enum.Enum):
 
 class FoundryRun(Base):
     __tablename__ = "foundry_runs"
-    __table_args__ = (UniqueConstraint("linear_issue_id", name="uq_run_issue_id"),)
 
+    # NOTE: deliberately no unique constraint on linear_issue_id - a ticket may
+    # be re-analysed after clarification, rejection or failure. "At most one
+    # *active* run per issue" is enforced at intake, not by the schema.
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    linear_issue_id: Mapped[str] = mapped_column(String(128))
+    linear_issue_id: Mapped[str] = mapped_column(String(128), index=True)
     linear_issue_key: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[RunStatus] = mapped_column(
         Enum(RunStatus), default=RunStatus.ANALYSING
@@ -197,5 +202,7 @@ class FoundryAgentJob(Base):
         DateTime(timezone=True), nullable=True
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Provider-reported spend; None = the provider does not expose usage.
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     run: Mapped[FoundryRun] = relationship(back_populates="agent_jobs")

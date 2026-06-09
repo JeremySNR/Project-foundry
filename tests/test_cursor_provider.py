@@ -112,3 +112,20 @@ def test_cloud_provider_full_repo_url_passthrough() -> None:
     provider = CursorCloudAgentProvider(http_post=http.post)
     provider.create_job(_job_input(repo="https://github.com/org/repo"))
     assert http.post_calls[0][1]["source"]["repository"] == "https://github.com/org/repo"
+
+
+def test_cloud_provider_captures_cost() -> None:
+    http = FakeHttp(
+        {"id": "agent_1", "status": "CREATING"},
+        {"status": "FINISHED", "target": {}, "usage": {"totalCostUsd": 3.42}},
+    )
+    provider = CursorCloudAgentProvider(http_post=http.post, http_get=http.get)
+    provider.create_job(_job_input())
+    assert provider.get_job_status("agent_1").cost_usd == 3.42
+
+
+def test_cloud_provider_cost_absent_is_none() -> None:
+    http = FakeHttp({"id": "a", "status": "RUNNING"}, {"status": "RUNNING", "target": {}})
+    provider = CursorCloudAgentProvider(http_post=http.post, http_get=http.get)
+    provider.create_job(_job_input())
+    assert provider.get_job_status("a").cost_usd is None

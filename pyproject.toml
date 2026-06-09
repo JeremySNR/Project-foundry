@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Project Foundry - the engineering control plane. Module 1: Ticket-to-PR."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Proprietary" }
-authors = [{ name = "Project Foundry" }]
+license = { text = "Apache-2.0" }
+authors = [{ name = "Project Foundry contributors" }]
 
 # Core dependencies are deliberately minimal so the testable foundation
 # runs without external infrastructure (no Temporal/OPA/LangGraph servers).
@@ -42,6 +42,11 @@ otel = [
 server = [
     "uvicorn[standard]>=0.29",
 ]
+# Postgres driver + schema migrations for production deployments.
+postgres = [
+    "psycopg2-binary>=2.9",
+    "alembic>=1.13",
+]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -58,6 +63,9 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
+markers = [
+    "e2e: live end-to-end smoke tests against real services (opt-in, never CI)",
+]
 
 [tool.ruff]
 line-length = 100

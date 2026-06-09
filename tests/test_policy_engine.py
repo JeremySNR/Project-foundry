@@ -162,3 +162,83 @@ def test_decision_records_policy_name_and_id() -> None:
     )
     assert decision.policy_name == "foundry.ticket_to_pr.v1"
     assert decision.decision_id
+
+
+def test_auto_merge_denied_even_for_perfect_run() -> None:
+    """'No auto-merge' is an enforced decision, not an absence of code."""
+    decision = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                "action": "auto_merge",
+                "ticket": {"readiness": "ready"},
+                "risk": {"overall_risk": "low"},
+                "repo": {"name": "customer-web", "confidence": 100},
+                "approval": {"engineering": True, "security": True},
+            }
+        )
+    )
+    assert decision.allowed is False
+    assert decision.allowed_agent_mode is AgentMode.HUMAN_ONLY
+    assert any("never run autonomously" in r for r in decision.reasons)
+
+
+def test_retry_within_cap_allowed_past_cap_denied() -> None:
+    base = {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+    }
+    within = _engine().evaluate(
+        PolicyInput.model_validate({**base, "retry": {"attempt": 2, "max_attempts": 2}})
+    )
+    assert within.allowed is True
+    over = _engine().evaluate(
+        PolicyInput.model_validate({**base, "retry": {"attempt": 3, "max_attempts": 2}})
+    )
+    assert over.allowed is False
+    assert any("exceeds the maximum" in r for r in over.reasons)
+
+
+def test_retry_over_budget_denied_under_budget_allowed() -> None:
+    base = {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+    }
+    over = _engine().evaluate(
+        PolicyInput.model_validate(
+            {**base, "budget": {"cost_usd": 5.5, "max_cost_usd": 5.0}}
+        )
+    )
+    assert over.allowed is False
+    assert any("budget cap" in r for r in over.reasons)
+    under = _engine().evaluate(
+        PolicyInput.model_validate(
+            {**base, "budget": {"cost_usd": 1.0, "max_cost_usd": 5.0}}
+        )
+    )
+    assert under.allowed is True
+    # No cap configured -> spend is informational only.
+    uncapped = _engine().evaluate(
+        PolicyInput.model_validate({**base, "budget": {"cost_usd": 999.0}})
+    )
+    assert uncapped.allowed is True
+
+
+def test_production_deploy_action_denied_unconditionally() -> None:
+    decision = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                "action": "production_deploy",
+                "ticket": {"readiness": "ready"},
+                "risk": {"overall_risk": "low"},
+                "repo": {"confidence": 100},
+                "approval": {},
+            }
+        )
+    )
+    assert decision.allowed is False

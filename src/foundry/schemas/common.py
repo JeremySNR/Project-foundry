@@ -107,7 +107,27 @@ class PolicyAction(str, Enum):
     REQUEST_CHANGES = "request_changes"
     RETRY_AGENT = "retry_agent"
     MARK_COMPLETE = "mark_complete"
+    # Modelled explicitly so "never autonomous" is an enforced decision with an
+    # audit row, not an absence of code. Both are denied unconditionally in
+    # this version regardless of risk level or approvals.
+    AUTO_MERGE = "auto_merge"
+    PRODUCTION_DEPLOY = "production_deploy"
 
+
+# Run states that are still in flight. A ticket with a run in one of these
+# states cannot start another run; anything else (clarification, rejection,
+# blocked, failed, complete) is restartable by a fresh trigger.
+ACTIVE_RUN_STATUSES = frozenset(
+    {
+        RunStatus.ANALYSING,
+        RunStatus.PLAN_READY,
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.APPROVED,
+        RunStatus.AGENT_RUNNING,
+        RunStatus.PR_OPEN,
+        RunStatus.REVIEW_REQUIRED,
+    }
+)
 
 # Confidence threshold (0-100) below which a repository match cannot be trusted
 # to start autonomous work. Sourced from the build plan's minimum policy rules.

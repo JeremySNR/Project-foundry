@@ -50,6 +50,31 @@ class GitHubConnector:
         data = self._transport("GET", f"/repos/{repo}/pulls/{number}/files")
         return [f["filename"] for f in data if f.get("filename")]
 
+    def failing_check_summaries(self, repo: str, suite_id: int) -> str:
+        """Names + output summaries of failed check runs, for remediation context.
+
+        Empty string when no transport is configured or nothing failed - the
+        feedback loop still works, the agent just gets less detail.
+        """
+        if self._transport is None or not suite_id:
+            return ""
+        data = self._transport(
+            "GET", f"/repos/{repo}/check-suites/{suite_id}/check-runs"
+        )
+        lines: list[str] = []
+        for check in data.get("check_runs", []) or []:
+            if (check.get("conclusion") or "").lower() not in {
+                "failure",
+                "timed_out",
+                "cancelled",
+            }:
+                continue
+            name = check.get("name", "unnamed check")
+            output = check.get("output") or {}
+            summary = (output.get("summary") or output.get("title") or "").strip()
+            lines.append(f"- {name}: {summary}" if summary else f"- {name}")
+        return "\n".join(lines)
+
     def pr_state_from_event(
         self, event: str, payload: dict[str, Any]
     ) -> PullRequestState | None:
@@ -70,6 +95,7 @@ class GitHubConnector:
             pr_number=pr["number"],
             url=pr.get("html_url", ""),
             branch=pr.get("head", {}).get("ref", ""),
+            title=pr.get("title", "") or "",
             status=self._status(pr),
         )
 
@@ -112,6 +138,10 @@ class GitHubConnector:
         )
         conclusion = (suite.get("conclusion") or "").lower()
         state.ci_status = _CHECK_CONCLUSION.get(conclusion, CIStatus.PENDING)
+        if state.ci_status is CIStatus.FAILING:
+            # Attach failing check details so a remediation dispatch can tell
+            # the agent *what* failed, not just that something did.
+            state.summary = self.failing_check_summaries(repo, suite.get("id") or 0)
         return state
 
     @staticmethod

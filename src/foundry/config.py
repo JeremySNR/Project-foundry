@@ -17,7 +17,7 @@ bits (and a few operational ones) from its environment.
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +26,20 @@ _TRUE = {"1", "true", "yes", "on"}
 DEFAULT_FORBIDDEN_GLOBS = ("infra/**", "migrations/**", "**/.env*", "**/secrets/**")
 DEFAULT_TRIGGER_LABEL = "foundry:candidate"
 DEFAULT_TRIGGER_STATUS = "Ready for AI Analysis"
+
+# Path patterns that indicate a PR actually touched a sensitive area. Used by
+# the diff-aware risk check after a PR opens/updates - the upfront (ticket-text)
+# risk classification can miss work that only becomes sensitive in the diff.
+DEFAULT_SENSITIVE_PATH_GLOBS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("auth", ("**/auth/**", "**/authn/**", "**/authz/**", "**/login/**",
+              "**/session*/**", "**/sso/**", "**/oauth/**")),
+    ("payments", ("**/payment*/**", "**/billing/**", "**/stripe/**",
+                  "**/invoice*/**", "**/checkout/**")),
+    ("database_migration", ("**/migrations/**", "**/migrate/**", "**/alembic/**")),
+    ("infrastructure", ("infra/**", "**/terraform/**", "**/helm/**", "**/k8s/**",
+                        "**/.github/workflows/**", "**/Dockerfile*")),
+    ("customer_data", ("**/customers/**", "**/customer_data/**")),
+)
 
 
 def _bool(value: Any, default: bool = False) -> bool:
@@ -49,21 +63,50 @@ class Settings:
     linear_api_token: str | None = None
     github_api_token: str | None = None
 
+    # --- API auth (secret: env); None => mutating API endpoints are disabled ---
+    api_token: str | None = None
+
+    # --- coding agent (behaviour: yaml; tokens: env) ---
+    # Which CodingAgentProvider receives approved work. See foundry.agents.
+    agent_provider: str = "manual"
+    cursor_api_token: str | None = None
+    claude_workflow_file: str = "foundry-claude-code.yml"
+    agent_webhook_url: str | None = None
+    agent_webhook_secret: str | None = None
+
     # --- intelligence (behaviour: yaml) ---
     use_openai_analyzer: bool = False
-    openai_model: str = "gpt-4o"
+    openai_model: str = "gpt-5.5"
 
     # --- policy / safety knobs (behaviour: yaml) ---
     repo_confidence_threshold: int = 70
     max_files_changed: int = 12
     forbidden_globs: tuple[str, ...] = DEFAULT_FORBIDDEN_GLOBS
+    # area name -> path globs; a PR touching these paths is treated as touching
+    # that sensitive area even when the ticket text never mentioned it.
+    sensitive_path_globs: tuple[tuple[str, tuple[str, ...]], ...] = (
+        DEFAULT_SENSITIVE_PATH_GLOBS
+    )
+
+    # --- remediation / feedback loop (behaviour: yaml) ---
+    # When CI fails or a reviewer requests changes, Foundry can re-dispatch the
+    # agent with the failure context - still through the policy gate, and never
+    # more than max_agent_retries times per run.
+    max_agent_retries: int = 2
+    retry_on: tuple[str, ...] = ("ci_failed", "changes_requested")
+    # Deny further agent retries once a run's provider-reported spend reaches
+    # this many USD. None = no budget cap.
+    max_cost_per_run: float | None = None
 
     # --- triggers (behaviour: yaml) ---
     trigger_label: str = DEFAULT_TRIGGER_LABEL
     trigger_status: str = DEFAULT_TRIGGER_STATUS
 
     # --- approval (behaviour: yaml) ---
-    authorised_approvers: tuple[str, ...] = ()
+    # Who may approve runs. Role grants are configured per user, never asserted
+    # by the API caller: (email, (role, ...)). A user with no roles can approve
+    # ordinary work but cannot satisfy sensitive-area approval requirements.
+    approvers: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     # --- durable execution (behaviour: yaml; address often env) ---
     temporal_address: str = "localhost:7233"
@@ -94,6 +137,17 @@ class Settings:
             raise ValueError(
                 f"max_files_changed must be >= 1, got {self.max_files_changed}"
             )
+        if self.max_agent_retries < 0:
+            raise ValueError(
+                f"max_agent_retries must be >= 0, got {self.max_agent_retries}"
+            )
+        unknown = set(self.retry_on) - {"ci_failed", "changes_requested"}
+        if unknown:
+            raise ValueError(f"unknown retry_on triggers: {sorted(unknown)}")
+        if self.max_cost_per_run is not None and self.max_cost_per_run <= 0:
+            raise ValueError(
+                f"max_cost_per_run must be positive, got {self.max_cost_per_run}"
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -103,6 +157,22 @@ class Settings:
     def _with(self, overrides: Mapping[str, Any]) -> "Settings":
         valid = {k: v for k, v in overrides.items() if k in asdict(self)}
         return replace(self, **valid)
+
+    # ------------------------------------------------------------- accessors
+    @property
+    def approver_emails(self) -> frozenset[str]:
+        return frozenset(email for email, _roles in self.approvers)
+
+    def roles_for(self, user: str) -> frozenset[str]:
+        """Roles configured for ``user``; empty when unknown or role-less."""
+        for email, roles in self.approvers:
+            if email == user:
+                return frozenset(roles)
+        return frozenset()
+
+    @property
+    def sensitive_globs_map(self) -> dict[str, tuple[str, ...]]:
+        return {area: globs for area, globs in self.sensitive_path_globs}
 
 
 def _from_yaml(path: Path) -> dict[str, Any]:
@@ -126,6 +196,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "model" in analyzer:
         out["openai_model"] = analyzer["model"]
 
+    agent = data.get("agent", {}) or {}
+    if "provider" in agent:
+        out["agent_provider"] = agent["provider"]
+    if "claude_workflow_file" in agent:
+        out["claude_workflow_file"] = agent["claude_workflow_file"]
+
     policy = data.get("policy", {}) or {}
     if "repo_confidence_threshold" in policy:
         out["repo_confidence_threshold"] = int(policy["repo_confidence_threshold"])
@@ -133,6 +209,22 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["max_files_changed"] = int(policy["max_files_changed"])
     if "forbidden_globs" in policy:
         out["forbidden_globs"] = tuple(policy["forbidden_globs"])
+    if "sensitive_path_globs" in policy:
+        out["sensitive_path_globs"] = tuple(
+            (str(area), tuple(globs))
+            for area, globs in (policy["sensitive_path_globs"] or {}).items()
+        )
+
+    remediation = data.get("remediation", {}) or {}
+    if "max_agent_retries" in remediation:
+        out["max_agent_retries"] = int(remediation["max_agent_retries"])
+    if "retry_on" in remediation:
+        out["retry_on"] = tuple(remediation["retry_on"] or [])
+
+    budget = data.get("budget", {}) or {}
+    if "max_cost_per_run" in budget:
+        raw_cap = budget["max_cost_per_run"]
+        out["max_cost_per_run"] = None if raw_cap is None else float(raw_cap)
 
     triggers = data.get("triggers", {}) or {}
     if "label" in triggers:
@@ -141,8 +233,16 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["trigger_status"] = triggers["status"]
 
     approval = data.get("approval", {}) or {}
-    if "authorised_approvers" in approval:
-        out["authorised_approvers"] = tuple(approval["authorised_approvers"])
+    if "approvers" in approval:
+        out["approvers"] = tuple(
+            (entry["email"], tuple(entry.get("roles", []) or []))
+            for entry in (approval["approvers"] or [])
+        )
+    elif "authorised_approvers" in approval:
+        # Legacy form: a flat list of emails, no role grants.
+        out["approvers"] = tuple(
+            (email, ()) for email in approval["authorised_approvers"]
+        )
 
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
@@ -162,6 +262,11 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_GITHUB_WEBHOOK_SECRET": "github_webhook_secret",
         "FOUNDRY_LINEAR_API_TOKEN": "linear_api_token",
         "FOUNDRY_GITHUB_API_TOKEN": "github_api_token",
+        "FOUNDRY_API_TOKEN": "api_token",
+        "FOUNDRY_AGENT_PROVIDER": "agent_provider",
+        "FOUNDRY_CURSOR_API_TOKEN": "cursor_api_token",
+        "FOUNDRY_AGENT_WEBHOOK_URL": "agent_webhook_url",
+        "FOUNDRY_AGENT_WEBHOOK_SECRET": "agent_webhook_secret",
         "FOUNDRY_OPENAI_MODEL": "openai_model",
         "TEMPORAL_ADDRESS": "temporal_address",
         "FOUNDRY_TASK_QUEUE": "task_queue",

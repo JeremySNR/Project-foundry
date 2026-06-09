@@ -41,6 +41,27 @@ def _bullets(items: list[str], *, empty: str = "_none_") -> str:
     return "\n".join(f"- {i}" for i in items) if items else empty
 
 
+def draft_acceptance_criteria(analysis: TicketAnalysis) -> list[str]:
+    """Draft acceptance-criteria skeletons the ticket author can edit.
+
+    Clarification should do work for the author, not just bounce the ticket:
+    a copy-editable draft converts "needs clarification" from a rejection into
+    a 30-second fix.
+    """
+    drafts = [
+        f"Given <starting state>, when {analysis.title.strip().rstrip('.').lower()}, "
+        "then <observable outcome>",
+    ]
+    if "reproduction steps" in analysis.missing_information:
+        drafts.append(
+            "Steps to reproduce: 1. <go to...> 2. <do...> 3. <observe...>"
+        )
+    if "a description of the desired outcome" in analysis.missing_information:
+        drafts.append("The desired outcome is <what the user should see/be able to do>")
+    drafts.append("Out of scope: <anything this ticket deliberately does not change>")
+    return drafts
+
+
 def format_analysis_comment(
     analysis: TicketAnalysis,
     risk: RiskAssessment,
@@ -80,7 +101,14 @@ def format_analysis_comment(
             "`/foundry approve` · `/foundry reject` · `/foundry stop`",
         ]
     elif status is RunStatus.NEEDS_CLARIFICATION:
-        lines += ["", "_Needs clarification before an agent can start._"]
+        lines += [
+            "",
+            "_Needs clarification before an agent can start._",
+            "",
+            "**Suggested acceptance criteria** (edit these and add them to the "
+            "ticket, then re-trigger Foundry):",
+            _bullets(draft_acceptance_criteria(analysis)),
+        ]
     elif status is RunStatus.BLOCKED:
         lines += ["", "_Blocked: " + "; ".join(risk.risk_reasons or ["see policy"]) + "._"]
     return "\n".join(lines)

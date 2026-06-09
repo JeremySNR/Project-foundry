@@ -24,10 +24,14 @@ Linear ticket
    -> Foundry hands the approved plan to a coding agent
    -> the agent opens a PR
    -> CI, CodeRabbit and humans review it
+   -> if CI fails or changes are requested, Foundry re-dispatches the agent
+      with the failure context (policy-gated, capped, audited)
    -> Linear gets updated with status, summary and next action
 ```
 
 And it deliberately **stops at a reviewed PR**. No auto-merge, no auto-deploy to production, no autonomous database migrations, no touching auth or payments without a human saying yes. The brakes are the product, not a missing feature.
+
+The loop is also restartable where it should be: a ticket parked for clarification (or rejected, blocked, failed) can be re-triggered after it's improved - one *active* run per issue, not one run per issue forever.
 
 ## What actually exists today
 
@@ -41,14 +45,32 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.orchestrator` | The state machine that runs one ticket through the whole loop and writes down every decision. |
 | `foundry.drivers` | One seam for *how* a run executes: inline in-process today, durable Temporal later, same interface. |
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
-| `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, and **Cursor** two ways (see below). |
-| `foundry.connectors` | Adapters for the tools Foundry talks to: Linear (read the issue, write back status and comments) and GitHub (watch the PR). |
-| `foundry.api` | FastAPI app: signed Linear and GitHub webhooks, approval commands, run status. |
+| `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, **Cursor** two ways, **Claude Code** via GitHub Actions, or *any* agent behind a signed webhook (see below). |
+| `foundry.connectors` | Adapters for the tools Foundry talks to: Linear (read the issue, write back status and comments) and GitHub (watch the PR, pull failing check summaries). |
+| `foundry.api` | FastAPI app: signed Linear and GitHub webhooks, approval commands, run status, the per-run decision timeline, and the dashboard. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
 ### The Cursor handoff (the nice bit)
 
-The cleanest way to hand work off is the [Cursor Linear integration](https://cursor.com/blog/linear). Once a plan is approved, `CursorViaLinearProvider` drops an `@Cursor` comment with the governed instructions onto the Linear issue. Cursor's own integration runs the cloud agent, shows live status in Linear, and opens the PR. Foundry then watches that PR via the GitHub webhook and keeps Linear in sync. Foundry stays the control plane and never tries to be the agent. For triggers that don't come through Linear, `CursorCloudAgentProvider` calls the Cursor API directly (`POST /v0/agents`).
+The cleanest way to hand work off is the [Cursor Linear integration](https://cursor.com/blog/linear). Once a plan is approved, `CursorViaLinearProvider` drops an `@Cursor` comment with the governed instructions onto the Linear issue. Cursor's own integration runs the cloud agent, shows live status in Linear, and opens the PR. Foundry then watches that PR via the GitHub webhook and keeps Linear in sync. Delegated agents pick their own branch names, so PR-to-run correlation falls back to the Linear issue key embedded in the branch or PR title - the loop closes either way. Foundry stays the control plane and never tries to be the agent. For triggers that don't come through Linear, `CursorCloudAgentProvider` calls the Cursor API directly (`POST /v0/agents`).
+
+### The other agents (vendor neutrality, for real)
+
+Set `agent.provider` in the YAML and Foundry dispatches approved work elsewhere, no code changes:
+
+- **`claude_code`** - fires a GitHub Actions `workflow_dispatch` in the target repo; the repo runs Claude Code headless with the governed instructions (reference workflow in [`examples/claude-code-runner.yml`](./examples/claude-code-runner.yml)). The Anthropic key lives in the repo's secrets - Foundry never holds it.
+- **`webhook`** - POSTs the HMAC-signed job input to *your* endpoint. Wire up Codex CLI, Aider, an internal tool, anything: do the work on the branch named in the payload, open a PR, and Foundry's GitHub webhook takes it from there.
+- **`cursor_cloud` / `cursor_via_linear` / `manual`** - as above, or record the job for a human.
+
+Every provider goes through the same `create_job` path, so the secret-leak guard and the policy gate apply no matter whose agent does the typing.
+
+### The feedback loop
+
+A PR that opens and then fails CI used to be where automation stalled. Now: a failing check suite or a changes-requested review re-dispatches the agent onto the *same branch* with the failure context (failing check names and summaries pulled from GitHub). Every retry passes the policy gate as `retry_agent` - approvals are re-checked, attempts are counted against `remediation.max_agent_retries`, and optional spend is checked against `budget.max_cost_per_run`. Past the cap, the run parks at *review required* with a comment saying a human is needed. Forbidden-path blocks are never retried - blocked stays blocked.
+
+### The dashboard
+
+`GET /dashboard` serves a zero-build, read-only page over the audit data: every run with status badges, and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`).
 
 ## Customising it
 
@@ -67,10 +89,24 @@ policy:
   repo_confidence_threshold: 70   # block work we can't confidently place in a repo
   max_files_changed: 12           # bigger PRs go to a human
   forbidden_globs: ["infra/**", "migrations/**", "**/.env*", "**/secrets/**"]
+  sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
+    auth: ["**/auth/**", "**/login/**", "**/sso/**"]
+    payments: ["**/billing/**", "**/stripe/**"]
+remediation:
+  max_agent_retries: 2            # CI-failure/review retries before a human takes over
+  retry_on: ["ci_failed", "changes_requested"]
+budget:
+  max_cost_per_run: 25.0          # deny retries once provider-reported spend hits this
+agent:
+  provider: cursor_via_linear     # or cursor_cloud / claude_code / webhook / manual
 triggers:
   label: "foundry:candidate"      # runs only start on an explicit opt-in
 approval:
-  authorised_approvers: ["lead@example.com"]
+  approvers:                      # roles are config, never request payload
+    - email: "lead@example.com"
+      roles: ["engineering"]
+    - email: "security@example.com"
+      roles: ["security"]
 ```
 
 Secrets via env:
@@ -83,12 +119,20 @@ Secrets via env:
 | `FOUNDRY_GITHUB_WEBHOOK_SECRET` | Verifies inbound GitHub webhooks. |
 | `FOUNDRY_LINEAR_API_TOKEN` | Turns on the live Linear connector (write-back). |
 | `FOUNDRY_GITHUB_API_TOKEN` | Turns on the live GitHub connector (PR files). |
+| `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
+| `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
+| `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
+| `FOUNDRY_AGENT_WEBHOOK_URL` / `..._SECRET` | Needed when the provider is `webhook`; the secret HMAC-signs the job payload. |
 | `OPENAI_API_KEY` | Needed when the analyzer provider is `openai`. |
 | `TEMPORAL_ADDRESS` | The Temporal server, for durable runs. |
 
 The same code runs on a laptop (SQLite, heuristics, no keys) and in production (Postgres, GPT-5.5, live Linear and GitHub) with nothing changing but config. That's the point.
 
 ## Running it
+
+The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quickstart.md)** - zero to governed PR in ~30 minutes with `docker compose up` (API + Postgres, optional Temporal profile, dashboard included).
+
+For development:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -110,7 +154,10 @@ Optional extras, install what you need:
 - `.[llm]` GPT-5.5 analyzer
 - `.[http]` live Linear and GitHub transports
 - `.[workflow]` Temporal durable execution
+- `.[postgres]` Postgres driver + Alembic migrations (`alembic upgrade head`)
 - `.[otel]` OpenTelemetry tracing (without it, the spans are free no-ops)
+
+There is also a live end-to-end smoke test (`scripts/smoke_e2e.py`) that drives a real Linear issue through approval, agent dispatch and PR observation. It is gated on `FOUNDRY_E2E=1` plus real credentials and never runs in CI.
 
 There's also a real OPA bundle in `src/foundry/policy/foundry.rego`; run `opa test src/foundry/policy` if you have the OPA CLI. It's kept in lock-step with the Python engine and the two are tested against the same cases.
 
@@ -118,11 +165,15 @@ There's also a real OPA bundle in `src/foundry/policy/foundry.rego`; run `opa te
 
 These are enforced, tested, and not negotiable by a prompt:
 
-- No acceptance criteria, no build. Even if the model swears it's ready.
+- No acceptance criteria, no build. Even if the model swears it's ready. (And when Foundry bounces a ticket, it drafts the acceptance criteria for you - clarification is a 30-second edit, not a rejection.)
 - If we can't confidently say which repo this belongs in, we stop and ask.
-- Production deploys and database migrations cannot run autonomously. Full stop, for now.
-- Auth, payments, PII and customer data need a human approval before an agent goes near them.
+- Production deploys and database migrations cannot run autonomously. Full stop, for now. `auto_merge` and `production_deploy` are modelled as policy actions that are **denied unconditionally** - "never" is an enforced, audited decision, not an absence of code.
+- The policy gate is **default-deny**: an action it doesn't recognise is refused.
+- Auth, payments, PII and customer data need a human approval before an agent goes near them - and the approval has to come from someone whose *configured role* covers it. Roles live in committed YAML; an API caller cannot claim "security" for themselves.
+- Approval surfaces are authenticated, full stop. Linear comments arrive over a signed webhook with the actor identity from Linear; the REST endpoint needs a bearer token and is disabled outright when none is configured.
+- Risk is checked twice: once from the ticket (before dispatch) and again from the **diff** (after the PR opens). A ticket that said "fix the button" whose PR touches `auth/` escalates to human review - and the guardrails re-run on *every push*, so an agent can't open a clean PR and sneak files in later.
 - Bigger-than-expected PRs and anything touching forbidden paths get bounced to a human.
+- The agent may retry its own failing PR, but every retry is a fresh policy decision: approvals re-checked, attempts capped, budget capped, all audited. Past the cap, a human takes over. A forbidden-path block is never retried.
 - No auto-merge. Ever, in this version.
 - Secrets never end up in an agent prompt; job inputs are scanned before dispatch.
 - Every decision, every artifact, every approval is content-hashed and written down, so you can always answer "why did the agent do that?".
@@ -146,7 +197,7 @@ Linear --webhook--> Foundry API
                        |
                   Human approval (in Linear)
                        |
-              CodingAgentProvider  (Cursor via Linear, Cursor API, manual)
+              CodingAgentProvider  (Cursor x2, Claude Code, webhook, manual)
                        |
                   GitHub PR opens
                        |
@@ -165,13 +216,21 @@ src/foundry/
   drivers.py       the RunDriver seam (inline today, Temporal attaches here)
   workflows/       decisions.py (pure) + the Temporal workflow, activities, worker
   policy/          the Python engine + foundry.rego (kept in sync)
-  agents/          provider abstraction: manual, fake, Cursor (two ways)
+  agents/          provider abstraction: manual, fake, Cursor (two ways), Claude Code, webhook
   connectors/      Linear, GitHub, comment/state rendering, live HTTP transports
   db/              SQLAlchemy models (runs, artifacts, audit, policy, jobs)
   audit/           content hashing + the verifiable trail
-  api/             the FastAPI app, webhook security, payload mapping
-tests/             one module per package, plus the gated Temporal tests
+  api/             the FastAPI app, webhook security, payload mapping, dashboard
+tests/             one module per package, plus the gated Temporal/Postgres/E2E tests
+migrations/        Alembic migrations (Postgres prod; SQLite dev uses create_all)
+examples/          reference Claude Code runner workflow
+scripts/           the live E2E smoke test
+docs/              quickstart
 ```
+
+## License & contributing
+
+Apache-2.0. See [`LICENSE`](./LICENSE), [`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`SECURITY.md`](./SECURITY.md). The short version of the contribution rules: the safety gates are the product - PRs that weaken a gate, an approval requirement or the audit trail don't merge, and any policy change lands in the Python engine and the Rego bundle together, with tests on both.
 
 ## A note on the name
 
@@ -179,7 +238,7 @@ Foundry takes its name from the Mandalorian forge, where the Armorer works raw b
 
 ## Where it's going
 
-The loop is complete and the seams are in place. What's left is mostly the stuff that needs real credentials or live infra to be worth doing: finishing the Temporal driver against a real server, Postgres migrations, container and deploy manifests, and a proper end-to-end smoke test against live Linear, GitHub, Cursor and OpenAI. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
+The loop is complete, closed (the agent now fixes its own failing CI under governance), multi-vendor, visible (the dashboard), and deployable (`docker compose up`, Alembic migrations, Postgres in CI). What's left is hardening against live traffic: finishing the Temporal driver against a real server and battle-testing the webhook payload mappings with the E2E smoke script. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
 
 ---
 

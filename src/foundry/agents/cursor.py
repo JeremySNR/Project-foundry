@@ -21,7 +21,7 @@ before anything is dispatched.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Callable
 
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_cursor_delegation
@@ -134,6 +134,7 @@ class CursorCloudAgentProvider(CodingAgentProvider):
             status=_CURSOR_STATUS.get(data.get("status", ""), AgentJobStatus.RUNNING),
             branch=target.get("branchName"),
             pr_url=target.get("prUrl") or target.get("url"),
+            cost_usd=_extract_cost(data),
         )
 
     def cancel_job(self, job_id: str) -> None:
@@ -144,3 +145,16 @@ class CursorCloudAgentProvider(CodingAgentProvider):
         if repo.startswith("http://") or repo.startswith("https://"):
             return repo
         return f"https://github.com/{repo}"
+
+
+def _extract_cost(data: dict) -> float | None:
+    """Provider-reported spend, tolerant of the usage shape evolving."""
+    usage = data.get("usage") or {}
+    for key in ("totalCostUsd", "costUsd", "totalCost", "cost_usd"):
+        value = usage.get(key, data.get(key))
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None

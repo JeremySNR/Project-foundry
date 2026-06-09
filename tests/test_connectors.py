@@ -122,6 +122,9 @@ def test_analysis_comment_for_needs_clarification() -> None:
     analysis, risk, plan = _artifacts("vague", [])
     body = format_analysis_comment(analysis, risk, plan, RunStatus.NEEDS_CLARIFICATION)
     assert "Needs clarification" in body
+    # Clarification does work for the author: a copy-editable draft, not a bounce.
+    assert "Suggested acceptance criteria" in body
+    assert "Given <starting state>" in body
 
 
 def test_state_for_known_and_unknown() -> None:

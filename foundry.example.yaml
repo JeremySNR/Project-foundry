@@ -19,12 +19,43 @@ policy:
   repo_confidence_threshold: 70
   # PRs larger than this are routed to human review.
   max_files_changed: 12
-  # Paths an agent may never touch. Matches are blocked.
+  # Paths an agent may never touch. Matches block the run.
   forbidden_globs:
     - "infra/**"
     - "migrations/**"
     - "**/.env*"
     - "**/secrets/**"
+  # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)
+  # risk pass never flagged the area, the run escalates to human review.
+  # Override per area; unlisted areas keep the built-in defaults.
+  sensitive_path_globs:
+    auth: ["**/auth/**", "**/login/**", "**/session*/**", "**/sso/**", "**/oauth/**"]
+    payments: ["**/payment*/**", "**/billing/**", "**/stripe/**", "**/checkout/**"]
+    database_migration: ["**/migrations/**", "**/alembic/**"]
+    infrastructure: ["infra/**", "**/terraform/**", "**/helm/**", "**/k8s/**", "**/.github/workflows/**"]
+    customer_data: ["**/customers/**", "**/customer_data/**"]
+
+remediation:
+  # When CI fails or a reviewer requests changes, Foundry re-dispatches the
+  # agent with the failure context - still through the policy gate. After the
+  # cap, the run parks at "review required" for a human.
+  max_agent_retries: 2
+  retry_on: ["ci_failed", "changes_requested"]
+
+budget:
+  # Deny further agent retries once a run's provider-reported spend reaches
+  # this many USD. Omit (or null) for no cap. Only providers that expose
+  # usage (e.g. Cursor Cloud) report spend.
+  max_cost_per_run: 25.0
+
+agent:
+  # Which coding agent receives approved work:
+  #   manual           - record the job for a human (safe default)
+  #   cursor_via_linear- @Cursor comment on the Linear issue (needs linear token)
+  #   cursor_cloud     - Cursor Cloud Agents API (set FOUNDRY_CURSOR_API_TOKEN)
+  #   claude_code      - GitHub Actions workflow_dispatch (set FOUNDRY_GITHUB_API_TOKEN)
+  #   webhook          - POST the job to your own endpoint (set FOUNDRY_AGENT_WEBHOOK_*)
+  provider: manual
 
 triggers:
   # A run starts only on an explicit opt-in, never for every new issue.
@@ -32,9 +63,18 @@ triggers:
   status: "Ready for AI Analysis"
 
 approval:
-  # Who may run /foundry approve. Empty means nobody can approve yet.
-  authorised_approvers:
-    - "lead@example.com"
+  # Who may run /foundry approve, and which approval roles each person's
+  # sign-off grants. Roles are CONFIG, never request payload - an API caller
+  # cannot claim "security" for themselves. Empty means nobody can approve.
+  approvers:
+    - email: "lead@example.com"
+      roles: ["engineering"]
+    - email: "security@example.com"
+      roles: ["security"]
+    # Approvers with no roles can approve ordinary work but cannot satisfy
+    # sensitive-area approval requirements (auth, payments, PII, ...).
+    - email: "pm@example.com"
+      roles: []
 
 temporal:
   # Durable execution worker. Address is often set via TEMPORAL_ADDRESS.

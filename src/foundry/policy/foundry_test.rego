@@ -92,3 +92,90 @@ test_analysis_always_allowed if {
 	}
 	decision.allow == true
 }
+
+# Auto-merge is denied unconditionally, even for a perfect low-risk run.
+test_auto_merge_always_denied if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "auto_merge",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 100},
+		"approval": {"engineering": true, "security": true},
+	}
+	decision.allow == false
+	decision.allowed_agent_mode == "human_only"
+}
+
+# Production deploys are denied unconditionally.
+test_production_deploy_always_denied if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "production_deploy",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 100},
+		"approval": {},
+	}
+	decision.allow == false
+}
+
+# A remediation retry within the cap is allowed; past the cap it is denied.
+test_retry_within_cap_allowed if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "retry_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"retry": {"attempt": 2, "max_attempts": 2},
+		"approval": {},
+	}
+	decision.allow == true
+}
+
+test_retry_past_cap_denied if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "retry_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"retry": {"attempt": 3, "max_attempts": 2},
+		"approval": {},
+	}
+	decision.allow == false
+}
+
+# A retry past the budget cap is denied; under the cap (or no cap) it is allowed.
+test_retry_over_budget_denied if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "retry_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"budget": {"cost_usd": 5.5, "max_cost_usd": 5.0},
+		"approval": {},
+	}
+	decision.allow == false
+}
+
+test_retry_under_budget_allowed if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "retry_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"budget": {"cost_usd": 1.0, "max_cost_usd": 5.0},
+		"approval": {},
+	}
+	decision.allow == true
+}
+
+# An action the policy does not recognise is denied by default.
+test_unknown_action_denied_by_default if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "launch_the_missiles",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 100},
+		"approval": {},
+	}
+	decision.allow == false
+}

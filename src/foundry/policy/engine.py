@@ -31,8 +31,11 @@ from foundry.schemas.common import (
     PolicyAction,
 )
 
-# Actions that, in the MVP, may never run autonomously regardless of approvals.
-_MVP_FORBIDDEN_ACTIONS = frozenset({"auto_merge", "production_deploy"})
+# Actions that may never run autonomously in this version, regardless of risk
+# level or approvals. Evaluating them produces a recorded deny decision.
+_FORBIDDEN_ACTIONS = frozenset(
+    {PolicyAction.AUTO_MERGE, PolicyAction.PRODUCTION_DEPLOY}
+)
 
 
 class PolicyTicket(BaseModel):
@@ -69,6 +72,25 @@ class PolicyActor(BaseModel):
     user: str = "agent-system"
 
 
+class PolicyRetry(BaseModel):
+    """Remediation attempt counters; only meaningful for ``retry_agent``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=2, ge=0)
+
+
+class PolicyBudget(BaseModel):
+    """Run spend so far vs the configured cap; only checked for ``retry_agent``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cost_usd: float = Field(default=0.0, ge=0)
+    # None = no budget cap configured.
+    max_cost_usd: float | None = Field(default=None, gt=0)
+
+
 class PolicyInput(BaseModel):
     """The full context handed to the policy gate for a single action."""
 
@@ -79,6 +101,8 @@ class PolicyInput(BaseModel):
     ticket: PolicyTicket = Field(default_factory=PolicyTicket)
     risk: PolicyRisk = Field(default_factory=PolicyRisk)
     repo: PolicyRepo = Field(default_factory=PolicyRepo)
+    retry: PolicyRetry = Field(default_factory=PolicyRetry)
+    budget: PolicyBudget = Field(default_factory=PolicyBudget)
     # Map of approval role -> granted. Missing keys are treated as not granted.
     approval: dict[str, bool] = Field(default_factory=dict)
 
@@ -99,8 +123,7 @@ class PolicyEngine(Protocol):
     def evaluate(self, payload: PolicyInput) -> PolicyDecision: ...
 
 
-# Actions that actually launch or progress autonomous work. Read-only actions
-# (analysis, planning) are always allowed but still recorded.
+# Actions that actually launch or progress autonomous work.
 _AUTONOMOUS_ACTIONS = frozenset(
     {
         PolicyAction.START_AGENT,
@@ -108,6 +131,18 @@ _AUTONOMOUS_ACTIONS = frozenset(
         PolicyAction.OPEN_PR,
         PolicyAction.RETRY_AGENT,
         PolicyAction.MARK_COMPLETE,
+    }
+)
+
+# Read-only / advisory actions: always allowed, still recorded. This is an
+# explicit allowlist - anything not listed here or in _AUTONOMOUS_ACTIONS is
+# denied (default-deny), so a new action cannot slip through ungoverned.
+_ADVISORY_ACTIONS = frozenset(
+    {
+        PolicyAction.ANALYSE_TICKET,
+        PolicyAction.CREATE_PLAN,
+        PolicyAction.REQUEST_APPROVAL,
+        PolicyAction.REQUEST_CHANGES,
     }
 )
 
@@ -147,14 +182,41 @@ class LocalPolicyEngine:
         required = _required_approvals(payload.risk)
         threshold = self._repo_confidence_threshold
 
+        # Hard-forbidden actions are denied unconditionally - no risk level or
+        # approval can unlock them in this version.
+        if payload.action in _FORBIDDEN_ACTIONS:
+            return PolicyDecision(
+                policy_name=self.policy_name,
+                allowed=False,
+                reasons=[
+                    f"action '{payload.action.value}' may never run autonomously "
+                    "in this version"
+                ],
+                allowed_agent_mode=AgentMode.HUMAN_ONLY,
+                required_approvals=required,
+            )
+
         # Read-only actions never need the autonomous-work gate, but we still
         # surface required approvals so the UI can plan ahead.
-        if payload.action not in _AUTONOMOUS_ACTIONS:
+        if payload.action in _ADVISORY_ACTIONS:
             return PolicyDecision(
                 policy_name=self.policy_name,
                 allowed=True,
                 reasons=[f"action '{payload.action.value}' is read-only / advisory"],
                 allowed_agent_mode=self._allowed_mode(payload, blocked=False),
+                required_approvals=required,
+            )
+
+        # Default-deny: an action this policy does not recognise is refused.
+        if payload.action not in _AUTONOMOUS_ACTIONS:
+            return PolicyDecision(
+                policy_name=self.policy_name,
+                allowed=False,
+                reasons=[
+                    f"action '{payload.action.value}' is not covered by this "
+                    "policy; denying by default"
+                ],
+                allowed_agent_mode=AgentMode.HUMAN_ONLY,
                 required_approvals=required,
             )
 
@@ -174,6 +236,23 @@ class LocalPolicyEngine:
             )
         if payload.risk.overall_risk is OverallRisk.BLOCKED:
             reasons.append("risk assessment marked the work as blocked")
+        if (
+            payload.action is PolicyAction.RETRY_AGENT
+            and payload.retry.attempt > payload.retry.max_attempts
+        ):
+            reasons.append(
+                f"remediation attempt {payload.retry.attempt} exceeds the "
+                f"maximum of {payload.retry.max_attempts}"
+            )
+        if (
+            payload.action is PolicyAction.RETRY_AGENT
+            and payload.budget.max_cost_usd is not None
+            and payload.budget.cost_usd >= payload.budget.max_cost_usd
+        ):
+            reasons.append(
+                f"run spend ${payload.budget.cost_usd:.2f} has reached the "
+                f"budget cap of ${payload.budget.max_cost_usd:.2f}"
+            )
 
         # --- sensitive areas require explicit approval ---
         for role in required:

@@ -1,0 +1,76 @@
+# Foundry in one command: `docker compose up`.
+#
+#   API       -> http://localhost:8000        (dashboard at /dashboard)
+#   Postgres  -> persistent volume `foundry-pg`
+#   Temporal  -> optional: `docker compose --profile temporal up`
+#
+# Put secrets in a `.env` file next to this one (compose reads it
+# automatically); behavioural config lives in ./foundry.yaml (mounted in).
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      FOUNDRY_DATABASE_URL: postgresql+psycopg2://foundry:foundry@db:5432/foundry
+      FOUNDRY_CONFIG: /etc/foundry/foundry.yaml
+      # Secrets - set these in .env, never here.
+      FOUNDRY_LINEAR_WEBHOOK_SECRET: ${FOUNDRY_LINEAR_WEBHOOK_SECRET:-}
+      FOUNDRY_GITHUB_WEBHOOK_SECRET: ${FOUNDRY_GITHUB_WEBHOOK_SECRET:-}
+      FOUNDRY_API_TOKEN: ${FOUNDRY_API_TOKEN:-}
+      FOUNDRY_LINEAR_API_TOKEN: ${FOUNDRY_LINEAR_API_TOKEN:-}
+      FOUNDRY_GITHUB_API_TOKEN: ${FOUNDRY_GITHUB_API_TOKEN:-}
+      FOUNDRY_CURSOR_API_TOKEN: ${FOUNDRY_CURSOR_API_TOKEN:-}
+      FOUNDRY_AGENT_PROVIDER: ${FOUNDRY_AGENT_PROVIDER:-}
+      FOUNDRY_AGENT_WEBHOOK_URL: ${FOUNDRY_AGENT_WEBHOOK_URL:-}
+      FOUNDRY_AGENT_WEBHOOK_SECRET: ${FOUNDRY_AGENT_WEBHOOK_SECRET:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./foundry.yaml:/etc/foundry/foundry.yaml:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: foundry
+      POSTGRES_PASSWORD: foundry
+      POSTGRES_DB: foundry
+    volumes:
+      - foundry-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U foundry"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional durable-execution backend: `docker compose --profile temporal up`.
+  temporal:
+    profiles: ["temporal"]
+    image: temporalio/auto-setup:1.24
+    ports:
+      - "7233:7233"
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: foundry
+      POSTGRES_PWD: foundry
+      POSTGRES_SEEDS: db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  temporal-ui:
+    profiles: ["temporal"]
+    image: temporalio/ui:2.26.2
+    ports:
+      - "8080:8080"
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      - temporal
+
+volumes:
+  foundry-pg:

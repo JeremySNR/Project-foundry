@@ -24,7 +24,7 @@ def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
     """Constant-time comparison of the provided signature against the expected one.
 
     Accepts an optional ``sha256=`` prefix (GitHub-style) on the header.
-    Returns False when no secret is configured — an empty secret cannot
+    Returns False when no secret is configured - an empty secret cannot
     authenticate anything because an attacker can trivially forge it.
     """
     if not secret:
