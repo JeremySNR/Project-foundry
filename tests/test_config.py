@@ -168,3 +168,68 @@ def test_invalid_remediation_and_budget_rejected(tmp_path) -> None:
         config.write_text(content)
         with pytest.raises(ValueError):
             Settings.load(str(config), env={})
+
+
+_CONTEXT_YAML = """
+context:
+  provider: catalog
+  org: acme
+  max_catalog_age_days: 14
+  sync_call_budget: 500
+  repo_keywords:
+    acme/billing-service: ["invoice", "stripe"]
+    acme/shipping: ["shipment", "tracking"]
+"""
+
+
+def test_context_yaml_parsing(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(_CONTEXT_YAML)
+    s = Settings.load(path, env={})
+
+    assert s.context_provider == "catalog"
+    assert s.context_org == "acme"
+    assert s.context_max_catalog_age_days == 14
+    assert s.context_sync_call_budget == 500
+    kw = dict(s.context_repo_keywords)
+    assert set(kw["acme/billing-service"]) == {"invoice", "stripe"}
+    assert set(kw["acme/shipping"]) == {"shipment", "tracking"}
+
+
+def test_context_defaults_when_block_absent() -> None:
+    s = Settings.from_env({})
+    assert s.context_provider == "static"
+    assert s.context_org is None
+    assert s.context_max_catalog_age_days == 7
+    assert s.context_sync_call_budget == 3000
+    assert s.context_repo_keywords == ()
+
+
+def test_context_env_overrides(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(_CONTEXT_YAML)
+    s = Settings.load(path, env={"FOUNDRY_CONTEXT_PROVIDER": "static", "FOUNDRY_CONTEXT_ORG": "other"})
+    assert s.context_provider == "static"
+    assert s.context_org == "other"
+
+
+def test_context_invalid_provider_rejected(tmp_path) -> None:
+    import pytest
+
+    path = tmp_path / "bad.yaml"
+    path.write_text("context:\n  provider: unknown\n")
+    with pytest.raises(ValueError, match="context_provider"):
+        Settings.load(path, env={})
+
+
+def test_context_invalid_age_and_budget_rejected(tmp_path) -> None:
+    import pytest
+
+    for i, content in enumerate([
+        "context:\n  max_catalog_age_days: 0\n",
+        "context:\n  sync_call_budget: 0\n",
+    ]):
+        path = tmp_path / f"bad-ctx-{i}.yaml"
+        path.write_text(content)
+        with pytest.raises(ValueError):
+            Settings.load(path, env={})

@@ -566,6 +566,162 @@ def test_timeline_unknown_run_404(client) -> None:
     assert client.get("/runs/nope/timeline", headers=AUTH).status_code == 404
 
 
+# -- Enricher wiring via build_orchestrator ------------------------------------
+
+
+def test_build_orchestrator_static_uses_static_enricher() -> None:
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.engines.enrichment import StaticContextEnricher
+    from foundry.db import create_all, make_engine, make_session_factory
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+    settings = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"})
+    assert settings.context_provider == "static"
+
+    orch = build_orchestrator(settings, sf)
+    assert isinstance(orch._enricher, StaticContextEnricher)
+
+
+def test_build_orchestrator_catalog_uses_catalog_enricher() -> None:
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.engines.enrichment import CatalogContextEnricher
+    from foundry.db import create_all, make_engine, make_session_factory
+    from dataclasses import replace
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+    base = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"})
+    settings = replace(base, context_provider="catalog")
+
+    orch = build_orchestrator(settings, sf)
+    assert isinstance(orch._enricher, CatalogContextEnricher)
+
+
+def test_build_orchestrator_static_carries_yaml_keywords() -> None:
+    """Keywords from context.repo_keywords are wired into StaticContextEnricher."""
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.engines.enrichment import StaticContextEnricher
+    from foundry.db import create_all, make_engine, make_session_factory
+    from dataclasses import replace
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+    base = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"})
+    settings = replace(base, context_repo_keywords=(("org/billing", ("invoice",)),))
+
+    orch = build_orchestrator(settings, sf)
+    assert isinstance(orch._enricher, StaticContextEnricher)
+    assert "org/billing" in orch._enricher._catalog
+
+
+# -- GitHub webhook freshness nudge -------------------------------------------
+
+
+def test_github_webhook_nudges_catalog_pushed_at() -> None:
+    """A GitHub push payload updates pushed_at on the catalog row."""
+    import json
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.db import create_all, make_engine, make_session_factory
+    from foundry.db.models import FoundryRepoCatalogEntry
+    from foundry.api.security import compute_signature
+    from datetime import timezone
+    from dataclasses import replace
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+
+    with sf() as session:
+        session.add(FoundryRepoCatalogEntry(
+            repo="org/watched-repo",
+            topics="[]",
+            top_dirs="[]",
+            recent_pr_titles="[]",
+            top_contributors="[]",
+            created_at=__import__("datetime").datetime.now(timezone.utc),
+            updated_at=__import__("datetime").datetime.now(timezone.utc),
+        ))
+        session.commit()
+
+    base = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": SECRET})
+    orch = build_orchestrator(base, sf)
+    from fastapi.testclient import TestClient
+    from foundry.api.app import create_app
+    tc = TestClient(create_app(
+        webhook_secret=SECRET,
+        session_factory=sf,
+        orchestrator=orch,
+        api_token=API_TOKEN,
+        github_webhook_secret=SECRET,
+    ))
+
+    payload = {
+        "action": "opened",
+        "repository": {"full_name": "org/watched-repo"},
+        "pull_request": {
+            "number": 1,
+            "head": {"ref": "branch-x", "sha": "abc"},
+            "base": {"ref": "main"},
+            "state": "open",
+            "draft": False,
+            "merged": False,
+            "merged_at": None,
+            "title": "some PR",
+            "html_url": "https://github.com/org/watched-repo/pull/1",
+            "user": {"type": "User"},
+        },
+    }
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + compute_signature(SECRET, body)
+    resp = tc.post(
+        "/webhooks/github",
+        content=body,
+        headers={"X-GitHub-Event": "push", "X-Hub-Signature-256": sig},
+    )
+    assert resp.status_code == 202
+
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/watched-repo")
+        assert entry is not None
+        assert entry.pushed_at is not None
+
+
+def test_github_webhook_nudge_absent_row_via_client(client) -> None:
+    """Webhook returns 202 even when no catalog row exists for the repo."""
+    payload = {
+        "action": "opened",
+        "repository": {"full_name": "org/no-catalog-row"},
+        "pull_request": {
+            "number": 1,
+            "head": {"ref": "branch-x", "sha": "abc"},
+            "base": {"ref": "main"},
+            "state": "open",
+            "draft": False,
+            "merged": False,
+            "merged_at": None,
+            "title": "some PR",
+            "html_url": "https://github.com/org/no-catalog-row/pull/1",
+            "user": {"type": "User"},
+        },
+    }
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + compute_signature(SECRET, body)
+    resp = client.post(
+        "/webhooks/github",
+        content=body,
+        headers={"X-GitHub-Event": "push", "X-Hub-Signature-256": sig},
+    )
+    assert resp.status_code == 202
+
+
 def test_timeline_exposes_full_decision_record(client) -> None:
     _post_webhook(client, _ready_payload(), delivery="d-tl-2")
     run_id = client.get("/runs").json()["runs"][0]["id"]

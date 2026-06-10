@@ -81,6 +81,9 @@ test = [
     "httpx>=0.27",
 ]
 
+[project.scripts]
+foundry-catalog = "foundry.catalog.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/JeremySNR/Project-foundry"
 Repository = "https://github.com/JeremySNR/Project-foundry"

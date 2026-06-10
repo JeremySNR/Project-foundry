@@ -275,6 +275,9 @@ def create_app(
                 app.state.processed_events.add(delivery_id)
             return result
 
+        # Best-effort: keep catalog staleness detection live between sweeps.
+        _nudge_catalog_pushed_at(app, payload)
+
         connector: GitHubConnector = app.state.github_connector
         pr_state = connector.pr_state_from_event(event or "", payload)
         if pr_state is None:
@@ -524,6 +527,34 @@ def create_app(
         return result
 
     return app
+
+
+def _nudge_catalog_pushed_at(app: FastAPI, payload: dict[str, Any]) -> None:
+    """Best-effort: bump pushed_at on the catalog row when a GitHub push arrives.
+
+    This keeps staleness detection live between sync sweeps so an active repo
+    won't be confidently served from stale metadata.  A catalog hiccup must
+    never fail webhook processing.
+    """
+    try:
+        from datetime import timezone
+
+        from foundry.db.models import FoundryRepoCatalogEntry
+
+        repo_name = (payload.get("repository") or {}).get("full_name")
+        if not repo_name:
+            return
+        now = datetime.now(timezone.utc)
+        with app.state.session_factory() as session:
+            entry = session.get(FoundryRepoCatalogEntry, repo_name)
+            if entry is not None:
+                entry.pushed_at = now
+                session.commit()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug(
+            "catalog pushed_at nudge failed", exc_info=True
+        )
 
 
 def _existing_run(orch: FoundryOrchestrator, issue_id: str) -> dict[str, Any] | None:
@@ -787,6 +818,8 @@ def build_provider(settings: Settings, tracker=None):
 
 def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrator:
     """Assemble an orchestrator from settings: analyzer, policy thresholds, Linear."""
+    from foundry.engines.enrichment import CatalogContextEnricher, StaticContextEnricher
+
     analyzer = (
         build_openai_analyzer(model=settings.openai_model)
         if settings.use_openai_analyzer
@@ -824,9 +857,21 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
             )
     else:
         raise ValueError(f"unknown tracker.provider: {settings.tracker_provider!r}")
+
+    repo_keywords = {repo: list(kws) for repo, kws in settings.context_repo_keywords}
+    if settings.context_provider == "catalog":
+        enricher = CatalogContextEnricher(
+            session_factory,
+            repo_keywords=repo_keywords,
+            max_catalog_age_days=settings.context_max_catalog_age_days,
+        )
+    else:
+        enricher = StaticContextEnricher(repo_catalog=repo_keywords)
+
     return FoundryOrchestrator(
         session_factory,
         analyzer=analyzer,
+        enricher=enricher,
         issue_tracker=tracker,
         provider=build_provider(settings, tracker),
         policy_engine=LocalPolicyEngine(

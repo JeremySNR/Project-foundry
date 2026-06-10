@@ -125,6 +125,13 @@ class Settings:
     # ordinary work but cannot satisfy sensitive-area approval requirements.
     approvers: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
+    # --- context enrichment (behaviour: yaml) ---
+    context_provider: str = "static"          # "static" | "catalog"
+    context_org: str | None = None            # GitHub org for foundry-catalog sync
+    context_repo_keywords: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    context_max_catalog_age_days: int = 7
+    context_sync_call_budget: int = 3000
+
     # --- durable execution (behaviour: yaml; address often env) ---
     temporal_address: str = "localhost:7233"
     task_queue: str = "foundry-ticket-to-pr"
@@ -164,6 +171,18 @@ class Settings:
         if self.max_cost_per_run is not None and self.max_cost_per_run <= 0:
             raise ValueError(
                 f"max_cost_per_run must be positive, got {self.max_cost_per_run}"
+            )
+        if self.context_provider not in ("static", "catalog"):
+            raise ValueError(
+                f"context_provider must be 'static' or 'catalog', got {self.context_provider!r}"
+            )
+        if self.context_max_catalog_age_days < 1:
+            raise ValueError(
+                f"context_max_catalog_age_days must be >= 1, got {self.context_max_catalog_age_days}"
+            )
+        if self.context_sync_call_budget < 1:
+            raise ValueError(
+                f"context_sync_call_budget must be >= 1, got {self.context_sync_call_budget}"
             )
 
     @classmethod
@@ -273,6 +292,21 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "task_queue" in temporal:
         out["task_queue"] = temporal["task_queue"]
 
+    context = data.get("context", {}) or {}
+    if "provider" in context:
+        out["context_provider"] = context["provider"]
+    if "org" in context:
+        out["context_org"] = context["org"]
+    if "max_catalog_age_days" in context:
+        out["context_max_catalog_age_days"] = int(context["max_catalog_age_days"])
+    if "sync_call_budget" in context:
+        out["context_sync_call_budget"] = int(context["sync_call_budget"])
+    if "repo_keywords" in context:
+        out["context_repo_keywords"] = tuple(
+            (str(repo), tuple(kws))
+            for repo, kws in (context["repo_keywords"] or {}).items()
+        )
+
     return out
 
 
@@ -299,6 +333,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_OPENAI_MODEL": "openai_model",
         "TEMPORAL_ADDRESS": "temporal_address",
         "FOUNDRY_TASK_QUEUE": "task_queue",
+        "FOUNDRY_CONTEXT_PROVIDER": "context_provider",
+        "FOUNDRY_CONTEXT_ORG": "context_org",
     }
     for env_key, field_name in mapping.items():
         if env_key in env:

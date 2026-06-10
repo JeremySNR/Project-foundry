@@ -8,7 +8,7 @@ slot into the orchestrator without changes elsewhere.
 from __future__ import annotations
 
 from .analyzer import HeuristicAnalyzer, TicketAnalyzer
-from .enrichment import ContextEnricher, StaticContextEnricher
+from .enrichment import CatalogContextEnricher, ContextEnricher, StaticContextEnricher
 from .llm import (
     FakeStructuredLLM,
     LLMError,
@@ -35,6 +35,7 @@ __all__ = [
     "LLMError",
     "ContextEnricher",
     "StaticContextEnricher",
+    "CatalogContextEnricher",
     "RiskClassifier",
     "HeuristicRiskClassifier",
     "DeliveryPlanner",
