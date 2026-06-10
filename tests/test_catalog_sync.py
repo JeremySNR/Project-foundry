@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from foundry.catalog.sync import CatalogSync, SyncReport
+from foundry.catalog.sync import CatalogSync, CatalogSyncError, SyncReport
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRepoCatalogEntry
 
@@ -83,7 +83,7 @@ def test_bootstrap_populates_rows_with_pagination() -> None:
         if "/orgs/org/repos" in path and pn and pn > 2:
             return 200, {}, []
         if "/readme" in path:
-            return 200, {}, _readme_response("README content " * 50)
+            return 200, {}, _readme_response("README content " * 400)
         if "/contents/" in path:
             return 200, {}, [{"name": "src"}, {"name": "tests"}]
         if "/pulls" in path:
@@ -107,6 +107,7 @@ def test_bootstrap_populates_rows_with_pagination() -> None:
         assert alpha.synced_at is not None
         assert alpha.readme_head is not None
         assert "README content" in alpha.readme_head
+        assert len(alpha.readme_head) == 4096  # truncated from ~6000 chars
         assert json.loads(alpha.top_dirs) == ["src", "tests"]
         assert json.loads(alpha.recent_pr_titles) == ["Add feature", "Fix bug"]
         assert json.loads(alpha.top_contributors) == ["alice", "bob"]
@@ -295,6 +296,38 @@ def test_readme_404_results_in_none() -> None:
         assert entry is not None
         assert entry.readme_head is None
         assert entry.synced_at is not None
+
+
+# ---------------------------------------------------------------------------
+# 6b. A failed org listing aborts the sweep instead of wiping the catalog
+# ---------------------------------------------------------------------------
+
+def test_failed_listing_aborts_without_deleting() -> None:
+    """An org 404 (typo, lost access) must not delete every catalog row."""
+    _, sf = _engine_and_sf()
+
+    def transport_ok(method: str, path: str):
+        if "/orgs/org/repos" in path:
+            return 200, {}, [_repo("org/keep")] if _page_num(path) == 1 else []
+        if "/readme" in path:
+            return 200, {}, _readme_response()
+        if "/contents/" in path:
+            return 200, {}, []
+        if "/pulls" in path:
+            return 200, {}, []
+        return 404, {}, None
+
+    CatalogSync(sf, transport_ok, call_budget=3000).sync("org", bootstrap=True)
+
+    def transport_404(method: str, path: str):
+        return 404, {}, None
+
+    sync = CatalogSync(sf, transport_404, call_budget=3000)
+    with pytest.raises(CatalogSyncError):
+        sync.sync("org")
+
+    with sf() as session:
+        assert session.get(FoundryRepoCatalogEntry, "org/keep") is not None
 
 
 # ---------------------------------------------------------------------------

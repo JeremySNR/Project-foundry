@@ -114,6 +114,8 @@ def test_single_term_does_not_cross_threshold() -> None:
     if "org/billing" in candidates:
         assert candidates["org/billing"].confidence < 70
     assert not bundle.has_confident_repository()
+    # The entry is fresh: a low score must not be mistaken for staleness.
+    assert not any("stale" in u.lower() for u in bundle.unknowns)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +276,44 @@ def test_determinism() -> None:
 
     assert bundle_a.candidate_repositories == bundle_b.candidate_repositories
     assert bundle_a.unknowns == bundle_b.unknowns
+
+
+# ---------------------------------------------------------------------------
+# 9b. Equal confidence ties rank by weighted field score, not repo name
+# ---------------------------------------------------------------------------
+
+def test_tie_broken_by_weighted_field_score() -> None:
+    _, sf = _engine_and_sf()
+    # "org/alpha" matches only in readme (weight 1.0); "org/zeta" in topics (3.0).
+    # Same single matched term -> same confidence; zeta must rank first despite
+    # sorting after alpha lexicographically.
+    _seed(sf, [
+        _entry("org/alpha", readme_head="kafka mentioned in passing"),
+        _entry("org/zeta", topics=["kafka"]),
+    ])
+    ticket = _ticket(title="kafka consumer lag")
+    bundle = _enrich(sf, ticket)
+
+    repos = [c.repo for c in bundle.candidate_repositories]
+    assert repos.index("org/zeta") < repos.index("org/alpha")
+
+
+# ---------------------------------------------------------------------------
+# 9c. docs only lists above-threshold catalog candidates
+# ---------------------------------------------------------------------------
+
+def test_docs_only_above_threshold_candidates() -> None:
+    _, sf = _engine_and_sf()
+    _seed(sf, [
+        _entry("org/billing", description="invoice reconciliation service"),
+        _entry("org/shipping", description="parcel tracking service"),
+    ])
+    # Two terms for billing (70), one for shipping (60).
+    ticket = _ticket(title="Fix invoice reconciliation and parcel label")
+    bundle = _enrich(sf, ticket)
+
+    assert any(d.startswith("org/billing:") for d in bundle.docs)
+    assert not any(d.startswith("org/shipping:") for d in bundle.docs)
 
 
 # ---------------------------------------------------------------------------

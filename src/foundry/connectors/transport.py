@@ -160,9 +160,6 @@ def github_rest_transport(
                 # 404 is returned, not raised - missing resources are normal.
                 if response.status_code == 404:
                     return (404, dict(response.headers), None)
-                # Other 4xx are not retryable and should raise.
-                if 400 <= response.status_code < 500 and response.status_code != 429:
-                    response.raise_for_status()
                 response.raise_for_status()
                 headers = dict(response.headers)
                 if response.status_code == 204 or not response.content:

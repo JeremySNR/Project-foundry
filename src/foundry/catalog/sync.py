@@ -23,6 +23,15 @@ from typing import Any, Callable
 _log = logging.getLogger(__name__)
 
 
+class CatalogSyncError(RuntimeError):
+    """The org listing failed; the sweep is aborted before any deletion.
+
+    Proceeding with a partial (or empty) listing would delete every catalog
+    row not in it - a typo'd org or lost token access must never wipe the
+    catalog the enricher depends on.
+    """
+
+
 @dataclass(frozen=True)
 class SyncReport:
     repos_listed: int
@@ -79,7 +88,10 @@ class CatalogSync:
                 f"/orgs/{org}/repos?type=all&per_page=100&page={page}",
             )
             if status != 200 or not isinstance(data, list):
-                break
+                raise CatalogSyncError(
+                    f"Listing repos for org {org!r} failed (HTTP {status}, page {page}); "
+                    "aborting sweep without touching the catalog."
+                )
             repos_listed.extend(data)
             if len(data) < 100:
                 break

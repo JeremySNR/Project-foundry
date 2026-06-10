@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from foundry.schemas.analysis import TicketAnalysis
+from foundry.schemas.common import REPO_CONFIDENCE_THRESHOLD
 from foundry.schemas.context import CandidateRepository, ContextBundle
 from foundry.schemas.ticket import RawTicket
 
@@ -282,18 +283,24 @@ class CatalogContextEnricher:
                 .all()
             )
 
+        docs: list[str] = []
         if not entries:
             unknowns.append(
                 "Repo catalog is empty - run 'foundry-catalog sync' to populate it."
             )
         else:
             catalog_candidates = self._score_catalog(entries, blob, now)
-            stale_capped = False
-            for repo, confidence, reason in catalog_candidates:
+            entry_map = {e.repo: e for e in entries}
+            any_stale = False
+            for repo, confidence, reason, stale, _score in catalog_candidates:
                 _consider(candidates, repo, confidence, reason)
-                if confidence <= _STALE_CONFIDENCE_CAP:
-                    stale_capped = True
-            if stale_capped:
+                if stale:
+                    any_stale = True
+                elif confidence >= REPO_CONFIDENCE_THRESHOLD:
+                    description = entry_map[repo].description
+                    if description:
+                        docs.append(f"{repo}: {description}")
+            if any_stale:
                 unknowns.append(
                     "Repo catalog data is stale for some candidates - run 'foundry-catalog sync'."
                 )
@@ -307,12 +314,6 @@ class CatalogContextEnricher:
             candidates.values(),
             key=lambda c: (-c.confidence,),
         )
-
-        docs = [
-            f"{c.repo}: {_entry_description(entries if entries else [], c.repo)}"
-            for c in sorted_candidates
-            if _entry_description(entries if entries else [], c.repo)
-        ]
 
         return ContextBundle(
             candidate_repositories=sorted_candidates,
@@ -328,8 +329,12 @@ class CatalogContextEnricher:
         entries: list[Any],
         blob: str,
         now: datetime,
-    ) -> list[tuple[str, int, str]]:
-        """Score all non-archived catalog entries against the ticket blob."""
+    ) -> list[tuple[str, int, str, bool, float]]:
+        """Score all non-archived catalog entries against the ticket blob.
+
+        Returns ``(repo, confidence, reason, stale, weighted_score)`` tuples.
+        The weighted score only ranks candidates - it never inflates confidence.
+        """
         query_tokens = _tokens(blob)
         if not query_tokens:
             return []
@@ -352,7 +357,7 @@ class CatalogContextEnricher:
 
         surviving_query = [t for t in query_tokens if doc_freq.get(t, 0) <= idf_threshold]
 
-        results: list[tuple[str, int, str]] = []
+        results: list[tuple[str, int, str, bool, float]] = []
         entry_map = {e.repo: e for e in entries}
 
         for repo, repo_doc in docs.items():
@@ -383,10 +388,10 @@ class CatalogContextEnricher:
             # Build reason string
             terms_str = ", ".join(f"'{t}'" for t in sorted(matched_terms))
             # Summarise strongest matched fields
-            field_counts: Counter_like = defaultdict(int)
+            field_counts: dict[str, int] = defaultdict(int)
             for fields in term_fields.values():
                 for f in fields:
-                    field_counts[f] += 1  # type: ignore[index]
+                    field_counts[f] += 1
             sorted_fields = sorted(field_counts.items(), key=lambda x: -x[1])
             top_fields = [f for f, _ in sorted_fields[:3]]
             fields_str = ", ".join(top_fields)
@@ -402,19 +407,8 @@ class CatalogContextEnricher:
             else:
                 reason = f"Catalog match: {terms_str} ({fields_str}; {sync_age})."
 
-            results.append((repo, confidence, reason))
+            results.append((repo, confidence, reason, stale, weighted_score))
 
         # Sort: descending confidence, then descending weighted score, then lexicographic
-        results.sort(key=lambda x: (-x[1], x[0]))
+        results.sort(key=lambda x: (-x[1], -x[4], x[0]))
         return results
-
-
-def _entry_description(entries: list[Any], repo: str) -> str | None:
-    for e in entries:
-        if e.repo == repo:
-            return e.description
-    return None
-
-
-# Alias for type annotation (avoid importing collections.Counter for type hints)
-Counter_like = defaultdict

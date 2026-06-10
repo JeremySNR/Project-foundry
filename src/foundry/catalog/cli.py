@@ -48,7 +48,7 @@ def _run_sync(args: argparse.Namespace) -> None:
     from foundry.config import Settings
     from foundry.connectors.transport import github_rest_transport
     from foundry.db.base import create_all, make_engine, make_session_factory
-    from foundry.catalog.sync import CatalogSync
+    from foundry.catalog.sync import CatalogSync, CatalogSyncError
 
     settings = Settings.load(os.environ.get("FOUNDRY_CONFIG"), env=os.environ)
 
@@ -76,7 +76,11 @@ def _run_sync(args: argparse.Namespace) -> None:
     transport = github_rest_transport(token)
 
     sync = CatalogSync(session_factory, transport, call_budget=call_budget)
-    report = sync.sync(org, bootstrap=args.bootstrap)
+    try:
+        report = sync.sync(org, bootstrap=args.bootstrap)
+    except CatalogSyncError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     status = " (budget exhausted — run again to continue)" if report.budget_exhausted else ""
     print(
