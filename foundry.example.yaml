@@ -106,3 +106,15 @@ context:
   # Optional manual keyword hints, merged with catalog scoring (catalog provider only).
   # repo_keywords:
   #   acme/billing-service: ["invoice", "stripe"]
+
+memory:
+  # Delivery memory: routing priors mined from this org's own finished runs
+  # ("14 of 16 of this team's tickets merged in billing-service"). Catalog
+  # context provider only; inert until min_samples routed outcomes exist.
+  # Backfill historical runs with 'foundry-memory backfill'.
+  priors_enabled: true
+  # Routed runs required before history influences routing (default: 3).
+  min_samples: 3
+  # Confidence ceiling for priors (default: 89) - keeps history below an
+  # explicit repo association on the ticket (90).
+  confidence_cap: 89

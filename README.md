@@ -112,6 +112,15 @@ A PR that opens and then fails CI used to be where automation stalled. Now: a fa
 
 `GET /dashboard` serves a zero-build, read-only page over the audit data: every run with status badges, and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`).
 
+### Delivery memory
+
+A run used to end at "PR merged" and the data died there. Now every finished run is distilled into an outcome row - time to merge, retries consumed, escalations, spend, and a block-reason taxonomy - derived entirely from the audit trail (so `foundry-memory backfill` rebuilds it for runs that finished before the table existed). That history feeds back in two ways:
+
+- **Routing priors.** With the catalog enricher, "14 of 16 of this team's feature tickets merged in billing-service" becomes a routing signal with an audit-friendly reason string. It is bounded on every side: a minimum sample size before history speaks at all, a smoothed (never triumphalist) success rate that must clear 50%, and a confidence cap of 89 so an explicit repo association on the ticket (90) always wins. `memory.priors_enabled: false` switches it off.
+- **ROI evidence.** `GET /metrics/delivery?days=90` (token-gated) answers the question a buyer actually asks - PRs shipped, blocked and why, median/p90 time to merge, retries, escalations, total agent spend - plus observed routing precision by confidence band, which is the data you need before moving `policy.repo_confidence_threshold` off its default. The dashboard shows the same numbers in a strip above the run list, and `foundry-memory show-priors` prints the mined history.
+
+Blocks are never auto-judged: a blocked run whose issue later merges in a fresh run is reported as *superseded*, which is the honest proxy for "the gate held and a human fixed the input".
+
 ## Customising it
 
 Two kinds of config, kept deliberately separate:
@@ -164,7 +173,7 @@ Secrets via env:
 | `FOUNDRY_JIRA_WEBHOOK_SECRET` | Enables `/webhooks/jira` (token-compared; endpoint disabled without it). |
 | `FOUNDRY_JIRA_BASE_URL` / `..._EMAIL` / `..._API_TOKEN` | Jira Cloud credentials when the tracker is `jira`. |
 | `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
-| `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
+| `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
 | `FOUNDRY_AGENT_WEBHOOK_URL` / `..._SECRET` | Needed when the provider is `webhook`; the secret HMAC-signs the job payload. |

@@ -8,6 +8,7 @@ Tables (from the build plan):
 - ``foundry_policy_decisions`` - every policy gate decision.
 - ``foundry_agent_jobs``       - coding-agent jobs dispatched for a run.
 - ``foundry_repo_catalog``     - per-repo metadata synced from the GitHub org.
+- ``foundry_run_outcomes``     - one denormalized row per *finished* run.
 
 Artifact and audit rows carry a content hash so the immutable input snapshot and
 every decision can be verified after the fact.
@@ -207,6 +208,75 @@ class FoundryAgentJob(Base):
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     run: Mapped[FoundryRun] = relationship(back_populates="agent_jobs")
+
+
+class FoundryRunOutcome(Base):
+    """Delivery memory: one denormalized row per finished run.
+
+    Every field is *derived* from rows that already exist (audit events, agent
+    jobs, artifacts), so the row is a reproducible cache, never the source of
+    truth - ``foundry-memory backfill`` can rebuild it for any terminal run.
+    Priors mining and delivery metrics read this table instead of re-joining
+    the audit trail on every request.
+
+    ``outcome`` and the taxonomy columns are plain strings (not sa.Enum) so
+    new values never need a Postgres ALTER TYPE.
+    """
+
+    __tablename__ = "foundry_run_outcomes"
+    __table_args__ = (
+        Index("idx_outcome_priors", "issue_key_prefix", "work_type", "repo", "outcome"),
+        Index("idx_outcome_completed", "completed_at"),
+    )
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("foundry_runs.id"), primary_key=True
+    )
+    linear_issue_id: Mapped[str] = mapped_column(String(128), index=True)
+    # Team proxy: the "ENG" in "ENG-123". RawTicket carries no team field.
+    issue_key_prefix: Mapped[str] = mapped_column(String(16))
+    # Terminal RunStatus mapped to a stable vocabulary:
+    # merged / blocked / rejected / failed / needs_clarification.
+    outcome: Mapped[str] = mapped_column(String(32), index=True)
+    # Where the work landed (latest agent job). NULL = never routed/dispatched.
+    repo: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Best-candidate confidence at routing time, from the context_bundle
+    # artifact - the raw material for precision-by-confidence-band calibration.
+    routed_confidence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    work_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    labels_json: Mapped[str] = mapped_column(Text, default="[]")
+    risk_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    trigger_type: Mapped[str] = mapped_column(String(64))
+    created_at_run: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # When the run actually finished (terminal audit event time).
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    time_to_merge_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Retries consumed = max(jobs_count - 1, 0).
+    jobs_count: Mapped[int] = mapped_column(Integer, default=0)
+    escalations_count: Mapped[int] = mapped_column(Integer, default=0)
+    ci_failures_count: Mapped[int] = mapped_column(Integer, default=0)
+    # From the latest pr_state artifact; seeds the future plan-vs-diff gate.
+    files_changed_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Block taxonomy: forbidden_paths / pr_closed_unmerged / policy_denied /
+    # human_stopped / unroutable. NULL unless outcome is blocked.
+    blocked_reason_category: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    # Deliberately NULL in v1: justification is derived on read (a later run on
+    # the same issue merging is the supersession proxy), never guessed at write.
+    block_justified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    run: Mapped[FoundryRun] = relationship()
 
 
 class FoundryRepoCatalogEntry(Base):

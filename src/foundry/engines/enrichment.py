@@ -243,12 +243,16 @@ class CatalogContextEnricher:
         repo_keywords: dict[str, list[str]] | None = None,
         default_test_commands: list[str] | None = None,
         max_catalog_age_days: int = 7,
+        priors: Any = None,
         now: Any = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._session_factory = session_factory
         self._repo_keywords = repo_keywords or {}
         self._default_test_commands = default_test_commands or []
         self._max_catalog_age_days = max_catalog_age_days
+        # Optional DeliveryMemoryPriors: historical routing outcomes as a
+        # confidence signal between explicit links and keyword/catalog scoring.
+        self._priors = priors
         self._now = now
 
     def enrich(self, ticket: RawTicket, analysis: TicketAnalysis) -> ContextBundle:
@@ -261,6 +265,13 @@ class CatalogContextEnricher:
 
         # Step 1: Tier 0 — explicit and linked repos
         _apply_tier0(ticket, candidates)
+
+        # Step 1.5: Delivery-memory priors — where this team's similar tickets
+        # actually merged. Capped below the explicit-link confidence; merged
+        # via _consider so ordering never matters.
+        if self._priors is not None:
+            for prior in self._priors.candidates_for(ticket, analysis):
+                _consider(candidates, prior.repo, prior.confidence, prior.reason)
 
         # Step 2: Manual keywords (legacy, still honoured)
         if self._repo_keywords:

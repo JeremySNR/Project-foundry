@@ -132,6 +132,15 @@ class Settings:
     context_max_catalog_age_days: int = 7
     context_sync_call_budget: int = 3000
 
+    # --- delivery memory (behaviour: yaml) ---
+    # Historical routing priors mined from finished runs ("14 of 16 of this
+    # team's tickets merged in billing-service"). Only active with the catalog
+    # context provider; inert until enough outcomes exist. The cap keeps
+    # history below an explicit repo association on the ticket (90).
+    memory_priors_enabled: bool = True
+    memory_min_samples: int = 3
+    memory_confidence_cap: int = 89
+
     # --- durable execution (behaviour: yaml; address often env) ---
     temporal_address: str = "localhost:7233"
     task_queue: str = "foundry-ticket-to-pr"
@@ -183,6 +192,14 @@ class Settings:
         if self.context_sync_call_budget < 1:
             raise ValueError(
                 f"context_sync_call_budget must be >= 1, got {self.context_sync_call_budget}"
+            )
+        if self.memory_min_samples < 1:
+            raise ValueError(
+                f"memory_min_samples must be >= 1, got {self.memory_min_samples}"
+            )
+        if not (0 <= self.memory_confidence_cap <= 100):
+            raise ValueError(
+                f"memory_confidence_cap must be 0-100, got {self.memory_confidence_cap}"
             )
 
     @classmethod
@@ -285,6 +302,14 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["approvers"] = tuple(
             (email, ()) for email in approval["authorised_approvers"]
         )
+
+    memory = data.get("memory", {}) or {}
+    if "priors_enabled" in memory:
+        out["memory_priors_enabled"] = _bool(memory["priors_enabled"], default=True)
+    if "min_samples" in memory:
+        out["memory_min_samples"] = int(memory["min_samples"])
+    if "confidence_cap" in memory:
+        out["memory_confidence_cap"] = int(memory["confidence_cap"])
 
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:

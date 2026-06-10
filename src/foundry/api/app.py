@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hmac
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
@@ -474,6 +474,22 @@ def create_app(
                 ],
             }
 
+    @app.get("/metrics/delivery")
+    def metrics_delivery(request: Request, days: int = 90) -> dict[str, Any]:
+        """Delivery-memory aggregates: PRs shipped, blocks, time-to-merge,
+        cost, and routing precision by confidence band. Token-gated like the
+        timeline - per-team cost and routing history are more sensitive than
+        the bare statuses on ``GET /runs``.
+        """
+        from foundry.memory.metrics import delivery_metrics
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **delivery_metrics(session, since=since)}
+
     @app.post("/runs/{run_id}/approval")
     def approval(
         run_id: str,
@@ -860,10 +876,20 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
 
     repo_keywords = {repo: list(kws) for repo, kws in settings.context_repo_keywords}
     if settings.context_provider == "catalog":
+        priors = None
+        if settings.memory_priors_enabled:
+            from foundry.memory.priors import DeliveryMemoryPriors
+
+            priors = DeliveryMemoryPriors(
+                session_factory,
+                min_samples=settings.memory_min_samples,
+                confidence_cap=settings.memory_confidence_cap,
+            )
         enricher = CatalogContextEnricher(
             session_factory,
             repo_keywords=repo_keywords,
             max_catalog_age_days=settings.context_max_catalog_age_days,
+            priors=priors,
         )
     else:
         enricher = StaticContextEnricher(repo_catalog=repo_keywords)

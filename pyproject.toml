@@ -83,6 +83,7 @@ test = [
 
 [project.scripts]
 foundry-catalog = "foundry.catalog.cli:main"
+foundry-memory = "foundry.memory.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/JeremySNR/Project-foundry"
