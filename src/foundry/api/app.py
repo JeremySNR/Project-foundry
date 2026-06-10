@@ -132,7 +132,7 @@ def create_app(
         create_all(engine)
         session_factory = make_session_factory(engine)
 
-    app = FastAPI(title="Project Foundry", version="0.1.0")
+    app = FastAPI(title="Project Foundry", version="1.1.0")
     orch = orchestrator or FoundryOrchestrator(session_factory)
     # Reads use the orchestrator/DB directly; mutations go through the driver
     # seam (inline today, durable Temporal later) so there is one execution path.
