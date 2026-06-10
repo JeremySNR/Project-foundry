@@ -126,6 +126,63 @@ def github_transport(
     return transport
 
 
+def github_rest_transport(
+    token: str,
+    *,
+    client: Any | None = None,
+    base: str = GITHUB_API_BASE,
+) -> Callable[..., tuple[int, dict[str, str], Any]]:
+    """``transport(method, path) -> (status, headers, json|None)`` for the catalog sync.
+
+    Unlike ``github_transport`` this exposes status and headers, because the sync
+    needs pagination metadata and (later) conditional requests. 404 is returned,
+    not raised - missing READMEs are normal.
+    """
+
+    def transport(method: str, path: str) -> tuple[int, dict[str, str], Any]:
+        http = client or _new_client()
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = http.request(
+                    method,
+                    f"{base}{path}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                if response.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+                    retry_after = _parse_retry_after(response)
+                    _retry_sleep(attempt, retry_after)
+                    continue
+                # 404 is returned, not raised - missing resources are normal.
+                if response.status_code == 404:
+                    return (404, dict(response.headers), None)
+                # Other 4xx are not retryable and should raise.
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    response.raise_for_status()
+                response.raise_for_status()
+                headers = dict(response.headers)
+                if response.status_code == 204 or not response.content:
+                    return (response.status_code, headers, None)
+                return (response.status_code, headers, response.json())
+            except Exception as exc:
+                if _is_client_error(exc):
+                    raise
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    _retry_sleep(attempt, None)
+                    continue
+                raise TransportError(
+                    f"GitHub request failed after {_MAX_RETRIES} retries"
+                ) from exc
+        raise TransportError("GitHub request failed") from last_exc  # pragma: no cover
+
+    return transport
+
+
 def jira_transport(
     base_url: str,
     email: str,

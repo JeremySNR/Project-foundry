@@ -90,3 +90,19 @@ temporal:
   # Durable execution worker. Address is often set via TEMPORAL_ADDRESS.
   address: "localhost:7233"
   task_queue: "foundry-ticket-to-pr"
+
+context:
+  # Which enricher decides the target repository for each ticket:
+  #   static  - keyword lists only (default, no DB required)
+  #   catalog - scores against GitHub org metadata synced by 'foundry-catalog sync'
+  # Override with FOUNDRY_CONTEXT_PROVIDER.
+  provider: static
+  # GitHub org to sync with 'foundry-catalog sync'. Override with FOUNDRY_CONTEXT_ORG.
+  # org: acme
+  # How many days before a catalog entry is considered stale (default: 7).
+  max_catalog_age_days: 7
+  # Maximum GitHub API calls per sync sweep (default: 3000).
+  sync_call_budget: 3000
+  # Optional manual keyword hints, merged with catalog scoring (catalog provider only).
+  # repo_keywords:
+  #   acme/billing-service: ["invoice", "stripe"]

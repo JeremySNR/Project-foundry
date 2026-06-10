@@ -7,6 +7,7 @@ Tables (from the build plan):
 - ``foundry_audit_events``     - append-only audit trail.
 - ``foundry_policy_decisions`` - every policy gate decision.
 - ``foundry_agent_jobs``       - coding-agent jobs dispatched for a run.
+- ``foundry_repo_catalog``     - per-repo metadata synced from the GitHub org.
 
 Artifact and audit rows carry a content hash so the immutable input snapshot and
 every decision can be verified after the fact.
@@ -206,3 +207,32 @@ class FoundryAgentJob(Base):
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     run: Mapped[FoundryRun] = relationship(back_populates="agent_jobs")
+
+
+class FoundryRepoCatalogEntry(Base):
+    """One row per repository in the org: the metadata the enricher scores against.
+
+    Metadata only - never file contents beyond the README head. ``synced_at`` is
+    when we last deep-fetched; ``pushed_at`` is GitHub's last-push time refreshed
+    on every sweep. ``pushed_at > synced_at`` means the entry is stale.
+    """
+
+    __tablename__ = "foundry_repo_catalog"
+
+    repo: Mapped[str] = mapped_column(String(255), primary_key=True)  # "org/name"
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    topics: Mapped[str] = mapped_column(Text, default="[]")            # JSON list[str]
+    primary_language: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    default_branch: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    readme_head: Mapped[str | None] = mapped_column(Text, nullable=True)   # first 4096 chars
+    top_dirs: Mapped[str] = mapped_column(Text, default="[]")          # JSON list[str]
+    recent_pr_titles: Mapped[str] = mapped_column(Text, default="[]")  # JSON list[str]
+    top_contributors: Mapped[str] = mapped_column(Text, default="[]")  # JSON list[str] of logins
+    pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    etag: Mapped[str | None] = mapped_column(String(128), nullable=True)  # reserved, unused
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

@@ -170,6 +170,8 @@ Secrets via env:
 | `FOUNDRY_AGENT_WEBHOOK_URL` / `..._SECRET` | Needed when the provider is `webhook`; the secret HMAC-signs the job payload. |
 | `OPENAI_API_KEY` | Needed when the analyzer provider is `openai`. |
 | `TEMPORAL_ADDRESS` | The Temporal server, for durable runs. |
+| `FOUNDRY_CONTEXT_PROVIDER` | Overrides `context.provider` (`static` or `catalog`). |
+| `FOUNDRY_CONTEXT_ORG` | GitHub org for `foundry-catalog sync`; overrides `context.org`. |
 
 The same code runs on a laptop (SQLite, heuristics, no keys) and in production (Postgres, GPT-5.5, live Linear and GitHub) with nothing changing but config. That's the point.
 
@@ -195,6 +197,17 @@ export FOUNDRY_CONFIG=foundry.yaml
 export FOUNDRY_LINEAR_WEBHOOK_SECRET=...   # and friends
 uvicorn foundry.api.app:app_from_env --factory
 ```
+
+To use the catalog-backed context enricher (`context.provider: catalog`), populate the repo
+catalog first and then keep it fresh with a periodic sweep:
+
+```bash
+export FOUNDRY_GITHUB_API_TOKEN=...
+foundry-catalog sync --org <your-github-org> --bootstrap
+```
+
+Run this on a schedule (e.g. daily cron or a Temporal workflow) so the catalog stays current.
+The sync is stateful and budget-aware: interrupted sweeps resume automatically on the next run.
 
 Optional extras, install what you need:
 
