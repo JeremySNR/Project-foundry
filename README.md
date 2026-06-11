@@ -134,6 +134,10 @@ Copy [`foundry.example.yaml`](./foundry.example.yaml) to `foundry.yaml`, edit it
 analyzer:
   provider: openai          # or "heuristic" for the no-key default
   model: gpt-5.5
+risk:
+  provider: llm             # or "heuristic" (default): keywords + globs, no key.
+                            # "llm" adds cited evidence to the audit trail and can
+                            # only ESCALATE over the deterministic floor, never lower it.
 policy:
   repo_confidence_threshold: 70   # block work we can't confidently place in a repo
   max_files_changed: 12           # bigger PRs go to a human
@@ -248,7 +252,7 @@ These are enforced, tested, and not negotiable by a prompt:
 - The policy gate is **default-deny**: an action it doesn't recognise is refused.
 - Auth, payments, PII and customer data need a human approval before an agent goes near them - and the approval has to come from someone whose *configured role* covers it. Roles live in committed YAML; an API caller cannot claim "security" for themselves.
 - Approval surfaces are authenticated, full stop. Linear comments arrive over a signed webhook with the actor identity from Linear; the REST endpoint needs a bearer token and is disabled outright when none is configured.
-- Risk is checked twice: once from the ticket (before dispatch) and again from the **diff** (after the PR opens). A ticket that said "fix the button" whose PR touches `auth/` escalates to human review - and the guardrails re-run on *every push*, so an agent can't open a clean PR and sneak files in later.
+- Risk is checked twice: once from the ticket (before dispatch) and again from the **diff** (after the PR opens). A ticket that said "fix the button" whose PR touches `auth/` escalates to human review - and the guardrails re-run on *every push*, so an agent can't open a clean PR and sneak files in later. With `risk.provider: llm`, a model pass writes its cited reasoning into the audit trail ("touches session issuance in `auth/tokens.py`") - and it may only *escalate* over the deterministic keyword/glob floor, never downgrade it.
 - Bigger-than-expected PRs and anything touching forbidden paths get bounced to a human.
 - The agent may retry its own failing PR, but every retry is a fresh policy decision: approvals re-checked, attempts capped, budget capped, all audited. Past the cap, a human takes over. A forbidden-path block is never retried.
 - No auto-merge. Ever, in this version.
@@ -290,6 +294,7 @@ src/foundry/
   observability.py OpenTelemetry spans (no-op without the extra)
   schemas/         the run artifact contracts (+ enums in common.py)
   engines/         analyzer / enrichment / risk / planner, plus the GPT-5.5 analyzer
+                   and the escalate-only LLM risk classifier (llm_risk.py)
   orchestrator.py  the state machine that runs a ticket end to end
   drivers.py       the RunDriver seam (inline today, Temporal attaches here)
   workflows/       decisions.py (pure) + the Temporal workflow, activities, worker

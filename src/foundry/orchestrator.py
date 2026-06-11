@@ -51,10 +51,11 @@ from foundry.engines.planner import (
     branch_name_for,
 )
 from foundry.engines.risk import (
+    DiffRiskClassifier,
+    GlobDiffRiskClassifier,
     HeuristicRiskClassifier,
     RiskClassifier,
     glob_match,
-    sensitive_areas_for_paths,
 )
 from foundry.policy.engine import (
     LocalPolicyEngine,
@@ -84,7 +85,7 @@ from foundry.schemas.common import (
 from foundry.schemas.context import ContextBundle
 from foundry.schemas.plan import DeliveryPlan
 from foundry.schemas.pr import PullRequestState
-from foundry.schemas.risk import RiskAssessment
+from foundry.schemas.risk import RiskAssessment, RiskEvidence
 from foundry.schemas.ticket import RawTicket
 
 # Which Pydantic model each loadable artifact type deserialises back into.
@@ -120,6 +121,7 @@ class FoundryOrchestrator:
         analyzer: TicketAnalyzer | None = None,
         enricher: ContextEnricher | None = None,
         risk_classifier: RiskClassifier | None = None,
+        diff_risk_classifier: DiffRiskClassifier | None = None,
         planner: DeliveryPlanner | None = None,
         policy_engine: PolicyEngine | None = None,
         provider: CodingAgentProvider | None = None,
@@ -149,6 +151,9 @@ class FoundryOrchestrator:
 
             sensitive_path_globs = dict(DEFAULT_SENSITIVE_PATH_GLOBS)
         self._sensitive_path_globs = dict(sensitive_path_globs)
+        self._diff_risk = diff_risk_classifier or GlobDiffRiskClassifier(
+            self._sensitive_path_globs
+        )
         self._max_agent_retries = max_agent_retries
         self._retry_on = frozenset(retry_on)
         self._max_cost_per_run = max_cost_per_run
@@ -888,7 +893,7 @@ class FoundryOrchestrator:
             )
             return RunStatus.BLOCKED
 
-        unexpected = self._unexpected_sensitive_areas(
+        unexpected, evidence = self._unexpected_sensitive_areas(
             session, run_id, pr_state.files_changed
         )
         if unexpected:
@@ -903,6 +908,7 @@ class FoundryOrchestrator:
                             "assessment did not flag"
                         ),
                         "areas": unexpected,
+                        "evidence": [e.model_dump() for e in evidence],
                     },
                 )
             )
@@ -914,16 +920,23 @@ class FoundryOrchestrator:
 
     def _unexpected_sensitive_areas(
         self, session, run_id: str, files: list[str]
-    ) -> dict[str, list[str]]:
+    ) -> tuple[dict[str, list[str]], list[RiskEvidence]]:
         """Sensitive areas the diff touches that intake never flagged.
 
         Areas flagged upfront already had their approval requirements enforced
         by the policy gate at dispatch; an area appearing *only* in the diff has
-        had no human look at it, so it escalates the run.
+        had no human look at it, so it escalates the run. Returns the unexpected
+        areas plus the classifier's cited evidence for them.
         """
-        touched = sensitive_areas_for_paths(files, self._sensitive_path_globs)
-        if not touched:
-            return {}
+        try:
+            ticket: RawTicket | None = self._load(
+                session, run_id, ArtifactType.TICKET_SNAPSHOT
+            )
+        except OrchestratorError:
+            ticket = None
+        findings = self._diff_risk.classify_diff(files, ticket)
+        if not findings.areas:
+            return {}, []
         try:
             risk: RiskAssessment = self._load(
                 session, run_id, ArtifactType.RISK_ASSESSMENT
@@ -931,11 +944,13 @@ class FoundryOrchestrator:
             anticipated = set(risk.sensitive_areas.names())
         except OrchestratorError:
             anticipated = set()
-        return {
+        unexpected = {
             area: paths
-            for area, paths in touched.items()
+            for area, paths in findings.areas.items()
             if area not in anticipated
         }
+        evidence = [e for e in findings.evidence if e.area in unexpected]
+        return unexpected, evidence
 
     # -- helpers --------------------------------------------------------------
 

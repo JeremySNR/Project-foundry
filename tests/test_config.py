@@ -282,3 +282,35 @@ def test_memory_validation(tmp_path) -> None:
     path.write_text("memory:\n  confidence_cap: 101\n")
     with pytest.raises(ValueError, match="memory_confidence_cap"):
         Settings.load(path, env={})
+
+
+def test_risk_provider_defaults_to_heuristic() -> None:
+    s = Settings.from_env({})
+    assert s.risk_provider == "heuristic"
+    assert s.risk_model == "gpt-5.5"
+
+
+def test_risk_provider_from_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("risk:\n  provider: llm\n  model: gpt-4o-2026-04-23\n")
+    s = Settings.load(path, env={})
+    assert s.risk_provider == "llm"
+    assert s.risk_model == "gpt-4o-2026-04-23"
+
+
+def test_risk_provider_env_overrides_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("risk:\n  provider: heuristic\n")
+    s = Settings.load(
+        path,
+        env={"FOUNDRY_RISK_PROVIDER": "llm", "FOUNDRY_RISK_MODEL": "gpt-5.5-mini"},
+    )
+    assert s.risk_provider == "llm"
+    assert s.risk_model == "gpt-5.5-mini"
+
+
+def test_invalid_risk_provider_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="risk_provider"):
+        Settings.from_env({"FOUNDRY_RISK_PROVIDER": "bogus"})

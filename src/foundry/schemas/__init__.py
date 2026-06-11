@@ -34,7 +34,7 @@ from .context import (
 )
 from .plan import DeliveryPlan, ImplementationStep, TestPlan
 from .pr import PullRequestState
-from .risk import RiskAssessment, SensitiveAreas
+from .risk import DiffRiskFindings, RiskAssessment, RiskEvidence, SensitiveAreas
 from .ticket import LinkedResource, RawTicket
 
 __all__ = [
@@ -63,7 +63,9 @@ __all__ = [
     "RepoCodeFacts",
     # risk
     "RiskAssessment",
+    "RiskEvidence",
     "SensitiveAreas",
+    "DiffRiskFindings",
     # plan
     "DeliveryPlan",
     "ImplementationStep",

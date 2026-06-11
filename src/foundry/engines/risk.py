@@ -13,7 +13,12 @@ from typing import Mapping, Protocol
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.schemas.common import AgentMode, ApprovalRole, OverallRisk
 from foundry.schemas.context import ContextBundle
-from foundry.schemas.risk import RiskAssessment, SensitiveAreas
+from foundry.schemas.risk import (
+    DiffRiskFindings,
+    RiskAssessment,
+    RiskEvidence,
+    SensitiveAreas,
+)
 from foundry.schemas.ticket import RawTicket
 
 # Keyword signals for each sensitive area. Prefer multi-word phrases over
@@ -68,6 +73,39 @@ class RiskClassifier(Protocol):
     ) -> RiskAssessment: ...
 
 
+class DiffRiskClassifier(Protocol):
+    """Classifies the sensitive areas a PR diff touches, from its file paths."""
+
+    def classify_diff(
+        self, files: list[str], ticket: RawTicket | None = None
+    ) -> DiffRiskFindings: ...
+
+
+class GlobDiffRiskClassifier:
+    """Deterministic diff-stage classifier: sensitive-area path globs only.
+
+    This is the floor every other diff classifier builds on - its matches are
+    never dropped, only added to.
+    """
+
+    def __init__(self, globs_map: Mapping[str, tuple[str, ...]]) -> None:
+        self._globs = globs_map
+
+    def classify_diff(
+        self, files: list[str], ticket: RawTicket | None = None
+    ) -> DiffRiskFindings:
+        areas = sensitive_areas_for_paths(files, self._globs)
+        evidence = [
+            RiskEvidence(
+                area=area,
+                detail=f"changed path(s) match sensitive globs: {', '.join(paths)}",
+                source="diff",
+            )
+            for area, paths in areas.items()
+        ]
+        return DiffRiskFindings(areas=areas, evidence=evidence)
+
+
 class HeuristicRiskClassifier:
     """Keyword-driven reference risk classifier."""
 
@@ -77,15 +115,24 @@ class HeuristicRiskClassifier:
         # Use risk_blob (title + description only) to avoid stale comments
         # inflating risk scores.
         blob = ticket.risk_blob()
-        flags = {
-            area: any(k in blob for k in keywords)
+        hits = {
+            area: [k for k in keywords if k in blob]
             for area, keywords in _SENSITIVE_KEYWORDS.items()
         }
-        sensitive = SensitiveAreas(**flags)
+        sensitive = SensitiveAreas(**{area: bool(found) for area, found in hits.items()})
 
         reasons: list[str] = []
+        evidence: list[RiskEvidence] = []
         for area in sensitive.names():
             reasons.append(f"Ticket text suggests it touches '{area}'.")
+            evidence.append(
+                RiskEvidence(
+                    area=area,
+                    detail="keyword(s) in ticket title/description: "
+                    + ", ".join(f"'{k}'" for k in hits[area]),
+                    source="heuristic",
+                )
+            )
 
         overall = self._overall_risk(sensitive, context)
         if overall is OverallRisk.BLOCKED:
@@ -100,6 +147,7 @@ class HeuristicRiskClassifier:
             sensitive_areas=sensitive,
             allowed_agent_mode=mode,
             required_approvals=required,
+            evidence=evidence,
         )
 
     @staticmethod

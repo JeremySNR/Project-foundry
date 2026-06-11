@@ -94,6 +94,11 @@ class Settings:
     # --- intelligence (behaviour: yaml) ---
     use_openai_analyzer: bool = False
     openai_model: str = "gpt-5.5"
+    # Risk classification backend. "heuristic" is deterministic keywords/globs;
+    # "llm" adds an escalate-only LLM pass with cited evidence on top of that
+    # same heuristic floor (needs OPENAI_API_KEY).
+    risk_provider: str = "heuristic"
+    risk_model: str = "gpt-5.5"
 
     # --- policy / safety knobs (behaviour: yaml) ---
     repo_confidence_threshold: int = 70
@@ -186,6 +191,10 @@ class Settings:
             raise ValueError(
                 f"max_cost_per_run must be positive, got {self.max_cost_per_run}"
             )
+        if self.risk_provider not in ("heuristic", "llm"):
+            raise ValueError(
+                f"risk_provider must be 'heuristic' or 'llm', got {self.risk_provider!r}"
+            )
         if self.context_provider not in ("static", "catalog", "code"):
             raise ValueError(
                 "context_provider must be 'static', 'catalog' or 'code', "
@@ -258,6 +267,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["use_openai_analyzer"] = analyzer["provider"] == "openai"
     if "model" in analyzer:
         out["openai_model"] = analyzer["model"]
+
+    risk = data.get("risk", {}) or {}
+    if "provider" in risk:
+        out["risk_provider"] = risk["provider"]
+    if "model" in risk:
+        out["risk_model"] = risk["model"]
 
     agent = data.get("agent", {}) or {}
     if "provider" in agent:
@@ -370,6 +385,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_AGENT_WEBHOOK_URL": "agent_webhook_url",
         "FOUNDRY_AGENT_WEBHOOK_SECRET": "agent_webhook_secret",
         "FOUNDRY_OPENAI_MODEL": "openai_model",
+        "FOUNDRY_RISK_PROVIDER": "risk_provider",
+        "FOUNDRY_RISK_MODEL": "risk_model",
         "TEMPORAL_ADDRESS": "temporal_address",
         "FOUNDRY_TASK_QUEUE": "task_queue",
         "FOUNDRY_CONTEXT_PROVIDER": "context_provider",

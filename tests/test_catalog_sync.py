@@ -7,11 +7,10 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from foundry.catalog.sync import CatalogSync, CatalogSyncError, SyncReport
+from foundry.catalog.sync import CatalogSync, CatalogSyncError
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRepoCatalogEntry
 

@@ -14,6 +14,17 @@ analyzer:
   provider: heuristic
   model: gpt-5.5
 
+risk:
+  # Risk classification backend (override with FOUNDRY_RISK_PROVIDER):
+  #   heuristic - keyword lists on ticket text + path globs on the diff
+  #               (default, deterministic, no API key)
+  #   llm       - adds an LLM pass that cites its evidence into the audit
+  #               trail (set OPENAI_API_KEY). The heuristic stays as a hard
+  #               floor: the LLM may only ESCALATE risk, never downgrade it.
+  #               Costs one model call at intake plus one per PR-push event.
+  provider: heuristic
+  model: gpt-5.5
+
 policy:
   # A run is blocked unless one repo clears this confidence (0-100).
   repo_confidence_threshold: 70

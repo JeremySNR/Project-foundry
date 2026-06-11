@@ -15,6 +15,11 @@ from .llm import (
     OpenAIStructuredLLM,
     StructuredLLM,
 )
+from .llm_risk import (
+    LlmDiffRiskClassifier,
+    LlmRiskClassifier,
+    build_llm_risk_classifier,
+)
 from .openai_analyzer import OpenAITicketAnalyzer, build_openai_analyzer
 from .planner import (
     DEFAULT_FORBIDDEN_GLOBS,
@@ -22,7 +27,12 @@ from .planner import (
     TemplatePlanner,
     branch_name_for,
 )
-from .risk import HeuristicRiskClassifier, RiskClassifier
+from .risk import (
+    DiffRiskClassifier,
+    GlobDiffRiskClassifier,
+    HeuristicRiskClassifier,
+    RiskClassifier,
+)
 
 __all__ = [
     "TicketAnalyzer",
@@ -38,6 +48,11 @@ __all__ = [
     "CatalogContextEnricher",
     "RiskClassifier",
     "HeuristicRiskClassifier",
+    "DiffRiskClassifier",
+    "GlobDiffRiskClassifier",
+    "LlmRiskClassifier",
+    "LlmDiffRiskClassifier",
+    "build_llm_risk_classifier",
     "DeliveryPlanner",
     "TemplatePlanner",
     "branch_name_for",

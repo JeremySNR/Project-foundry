@@ -532,3 +532,48 @@ def test_cursor_via_linear_delegation_end_to_end(session_factory) -> None:
     # An @Cursor delegation comment was posted in addition to the analysis comment.
     assert any(c.startswith("@Cursor") for c in tracker.comments["i-1"])
     assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+
+def test_injected_diff_risk_classifier_escalates_with_evidence(session_factory) -> None:
+    """The diff-stage seam: a classifier that flags beyond the globs escalates
+    the run and its cited evidence lands in the RISK_ESCALATED audit event."""
+    import json
+
+    from foundry.db.models import AuditEventType, FoundryAuditEvent
+    from foundry.schemas.risk import DiffRiskFindings, RiskEvidence
+
+    class FlaggingDiffClassifier:
+        def classify_diff(self, files, ticket=None):
+            return DiffRiskFindings(
+                areas={"auth": sorted(files)},
+                evidence=[
+                    RiskEvidence(
+                        area="auth",
+                        detail="touches session issuance in src/tokens/issue.ts",
+                        source="llm",
+                    )
+                ],
+            )
+
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"diff_risk_classifier": FlaggingDiffClassifier()},
+    )
+    pr = _pr(files_changed=["src/tokens/issue.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
+    with session_factory() as s:
+        events = [
+            e
+            for e in s.query(FoundryAuditEvent).filter_by(run_id=run_id)
+            if e.event_type is AuditEventType.RISK_ESCALATED
+        ]
+        assert len(events) == 1
+        meta = json.loads(events[0].metadata_json)
+        assert meta["areas"] == {"auth": ["src/tokens/issue.ts"]}
+        assert meta["evidence"] == [
+            {
+                "area": "auth",
+                "detail": "touches session issuance in src/tokens/issue.ts",
+                "source": "llm",
+            }
+        ]

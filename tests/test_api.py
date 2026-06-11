@@ -650,7 +650,6 @@ def test_github_webhook_nudges_catalog_pushed_at() -> None:
     from foundry.db.models import FoundryRepoCatalogEntry
     from foundry.api.security import compute_signature
     from datetime import timezone
-    from dataclasses import replace
 
     engine = make_engine()
     create_all(engine)
@@ -794,3 +793,26 @@ def test_dashboard_served_when_token_configured(client) -> None:
 def test_dashboard_disabled_without_token() -> None:
     client = _make_client(api_token=None)
     assert client.get("/dashboard").status_code == 403
+
+
+def test_build_orchestrator_llm_risk_provider_wires_both_classifiers() -> None:
+    from dataclasses import replace
+
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.db import create_all, make_engine, make_session_factory
+    from foundry.engines.llm_risk import LlmDiffRiskClassifier, LlmRiskClassifier
+    from foundry.engines.risk import GlobDiffRiskClassifier, HeuristicRiskClassifier
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+    base = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"})
+
+    orch = build_orchestrator(base, sf)
+    assert isinstance(orch._risk, HeuristicRiskClassifier)
+    assert isinstance(orch._diff_risk, GlobDiffRiskClassifier)
+
+    orch = build_orchestrator(replace(base, risk_provider="llm"), sf)
+    assert isinstance(orch._risk, LlmRiskClassifier)
+    assert isinstance(orch._diff_risk, LlmDiffRiskClassifier)
