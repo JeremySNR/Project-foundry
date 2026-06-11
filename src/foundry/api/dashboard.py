@@ -275,6 +275,10 @@ function dur(seconds) {
 
 async function loadMetrics() {
   const el = $("#metrics");
+  if (!localStorage.getItem("foundry_token")) {
+    el.style.display = "none";  // no token: skip the call, it can only 401
+    return;
+  }
   try {
     const resp = await fetch("metrics/delivery?days=90", { headers: authHeaders() });
     if (!resp.ok) { el.style.display = "none"; return; }

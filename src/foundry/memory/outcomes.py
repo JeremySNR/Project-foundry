@@ -44,6 +44,17 @@ _TERMINAL_EVENT_TYPES = (
 )
 
 
+_BLOCK_CATEGORIES = frozenset(
+    {
+        "forbidden_paths",
+        "pr_closed_unmerged",
+        "policy_denied",
+        "human_stopped",
+        "unroutable",
+    }
+)
+
+
 def _utc(dt: datetime | None) -> datetime | None:
     """Normalize to UTC-aware (SQLite returns naive datetimes)."""
     if dt is None:
@@ -53,30 +64,45 @@ def _utc(dt: datetime | None) -> datetime | None:
     return dt
 
 
-def _latest_artifact_content(
-    session, run_id: str, artifact_type: ArtifactType
-) -> dict | None:
-    row = (
+def issue_key_prefix(issue_key: str | None) -> str:
+    """The team proxy: the ``ENG`` in ``ENG-123``."""
+    if not issue_key:
+        return ""
+    return issue_key.split("-")[0].upper()
+
+
+def _latest_artifact_contents(
+    session, run_id: str, artifact_types: tuple[ArtifactType, ...]
+) -> dict[ArtifactType, dict]:
+    """Latest (highest version, newest) parsed content per artifact type."""
+    rows = (
         session.query(FoundryArtifact)
-        .filter_by(run_id=run_id, artifact_type=artifact_type)
-        .order_by(FoundryArtifact.version.desc(), FoundryArtifact.created_at.desc())
-        .first()
+        .filter(
+            FoundryArtifact.run_id == run_id,
+            FoundryArtifact.artifact_type.in_(artifact_types),
+        )
+        .order_by(FoundryArtifact.version, FoundryArtifact.created_at)
+        .all()
     )
-    if row is None:
-        return None
-    try:
-        content = json.loads(row.content_json)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    return content if isinstance(content, dict) else None
+    contents: dict[ArtifactType, dict] = {}
+    for row in rows:  # ascending order: the last row per type wins
+        try:
+            content = json.loads(row.content_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(content, dict):
+            contents[row.artifact_type] = content
+    return contents
 
 
 def _classify_block(session, run_id: str) -> str:
     """Taxonomy for a blocked run, from its last RUN_BLOCKED audit event.
 
-    Categories: forbidden_paths / pr_closed_unmerged / policy_denied /
-    human_stopped / unroutable. ``block_justified`` is deliberately not set
-    here - justification is derived on read from supersession, never guessed.
+    The orchestrator writes a structured ``category`` into the event metadata;
+    the heuristics below only classify events recorded before that existed
+    (so backfill still works on old audit trails). ``block_justified`` is
+    deliberately not set here - justification is derived on read from
+    supersession, never guessed.
     """
     event = (
         session.query(FoundryAuditEvent)
@@ -86,14 +112,16 @@ def _classify_block(session, run_id: str) -> str:
     )
     if event is None:
         return "unroutable"
-    if event.actor_type == "human":
-        return "human_stopped"
     metadata: dict = {}
     if event.metadata_json:
         try:
             metadata = json.loads(event.metadata_json)
         except json.JSONDecodeError:
             metadata = {}
+    if metadata.get("category") in _BLOCK_CATEGORIES:
+        return metadata["category"]
+    if event.actor_type == "human":
+        return "human_stopped"
     if "forbidden_files" in metadata:
         return "forbidden_paths"
     if "closed without merge" in str(metadata.get("reason", "")):
@@ -145,7 +173,17 @@ def derive_outcome(session, run: FoundryRun) -> FoundryRunOutcome:
     if outcome == "merged" and completed_at is not None and created_at_run is not None:
         time_to_merge = max(int((completed_at - created_at_run).total_seconds()), 0)
 
-    context = _latest_artifact_content(session, run.id, ArtifactType.CONTEXT_BUNDLE)
+    artifacts = _latest_artifact_contents(
+        session,
+        run.id,
+        (
+            ArtifactType.CONTEXT_BUNDLE,
+            ArtifactType.TICKET_ANALYSIS,
+            ArtifactType.TICKET_SNAPSHOT,
+            ArtifactType.PR_STATE,
+        ),
+    )
+    context = artifacts.get(ArtifactType.CONTEXT_BUNDLE)
     routed_confidence = None
     if context:
         confidences = [
@@ -155,16 +193,15 @@ def derive_outcome(session, run: FoundryRun) -> FoundryRunOutcome:
         ]
         routed_confidence = max(confidences, default=None)
 
-    analysis = _latest_artifact_content(session, run.id, ArtifactType.TICKET_ANALYSIS)
-    snapshot = _latest_artifact_content(session, run.id, ArtifactType.TICKET_SNAPSHOT)
-    pr_state = _latest_artifact_content(session, run.id, ArtifactType.PR_STATE)
+    analysis = artifacts.get(ArtifactType.TICKET_ANALYSIS)
+    snapshot = artifacts.get(ArtifactType.TICKET_SNAPSHOT)
+    pr_state = artifacts.get(ArtifactType.PR_STATE)
     files_changed = pr_state.get("files_changed") if pr_state else None
 
-    issue_key = run.linear_issue_key or ""
     return FoundryRunOutcome(
         run_id=run.id,
         linear_issue_id=run.linear_issue_id,
-        issue_key_prefix=issue_key.split("-")[0].upper() if issue_key else "",
+        issue_key_prefix=issue_key_prefix(run.linear_issue_key),
         outcome=outcome,
         repo=repo,
         routed_confidence=routed_confidence,

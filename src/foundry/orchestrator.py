@@ -240,6 +240,7 @@ class FoundryOrchestrator:
                         run_id=run_id,
                         event_type=AuditEventType.RUN_BLOCKED,
                         actor_type="foundry",
+                        metadata={"category": "unroutable"},
                     )
                 )
             self._record_outcome_if_terminal(session, run)
@@ -365,6 +366,11 @@ class FoundryOrchestrator:
                     event_type=event_type,
                     actor_type="human",
                     actor_id=user,
+                    metadata=(
+                        {"category": "human_stopped"}
+                        if event_type is AuditEventType.RUN_BLOCKED
+                        else None
+                    ),
                 )
             )
             issue_id = run.linear_issue_id
@@ -488,6 +494,7 @@ class FoundryOrchestrator:
                         event_type=AuditEventType.RUN_BLOCKED,
                         actor_type="foundry",
                         output_content=decision,
+                        metadata={"category": "policy_denied"},
                     )
                 )
                 blocked_issue = run.linear_issue_id
@@ -848,7 +855,11 @@ class FoundryOrchestrator:
                     run_id=run_id,
                     event_type=AuditEventType.RUN_BLOCKED,
                     actor_type="foundry",
-                    metadata={"reason": "PR closed without merge", "pr": pr_state.url},
+                    metadata={
+                        "category": "pr_closed_unmerged",
+                        "reason": "PR closed without merge",
+                        "pr": pr_state.url,
+                    },
                 )
             )
             return RunStatus.BLOCKED
@@ -869,7 +880,10 @@ class FoundryOrchestrator:
                     run_id=run_id,
                     event_type=AuditEventType.RUN_BLOCKED,
                     actor_type="foundry",
-                    metadata={"forbidden_files": violations},
+                    metadata={
+                        "category": "forbidden_paths",
+                        "forbidden_files": violations,
+                    },
                 )
             )
             return RunStatus.BLOCKED

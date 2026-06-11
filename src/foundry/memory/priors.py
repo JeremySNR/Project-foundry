@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from sqlalchemy import case, func
 
+from foundry.memory.outcomes import issue_key_prefix
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.schemas.context import CandidateRepository
 from foundry.schemas.ticket import RawTicket
@@ -44,6 +45,38 @@ def smoothed_confidence(merged: int, routed: int, *, cap: int) -> int:
     return min(cap, round(100 * (merged + 1) / (routed + 2)))
 
 
+def routing_prior_rows(session) -> list[tuple[str, str | None, str, int, int]]:
+    """The one priors aggregate, shared by the enricher, metrics and CLI.
+
+    ``(issue_key_prefix, work_type, repo, routed, merged)`` per group, over
+    every outcome where an agent was actually dispatched to a repo, most
+    routed first.
+    """
+    from foundry.db.models import FoundryRunOutcome
+
+    rows = (
+        session.query(
+            FoundryRunOutcome.issue_key_prefix,
+            FoundryRunOutcome.work_type,
+            FoundryRunOutcome.repo,
+            func.count(FoundryRunOutcome.run_id),
+            func.sum(case((FoundryRunOutcome.outcome == "merged", 1), else_=0)),
+        )
+        .filter(FoundryRunOutcome.repo.isnot(None))
+        .group_by(
+            FoundryRunOutcome.issue_key_prefix,
+            FoundryRunOutcome.work_type,
+            FoundryRunOutcome.repo,
+        )
+        .order_by(func.count(FoundryRunOutcome.run_id).desc())
+        .all()
+    )
+    return [
+        (prefix, work_type, repo, int(routed), int(merged or 0))
+        for prefix, work_type, repo, routed, merged in rows
+    ]
+
+
 class DeliveryMemoryPriors:
     """Mines ``foundry_run_outcomes`` into candidate-repository priors."""
 
@@ -54,13 +87,11 @@ class DeliveryMemoryPriors:
         min_samples: int = 3,
         confidence_cap: int = 89,
         cache_ttl_seconds: int = 300,
-        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._session_factory = session_factory
         self._min_samples = min_samples
         self._confidence_cap = confidence_cap
         self._cache_ttl_seconds = cache_ttl_seconds
-        self._now = now
         self._cached_at: datetime | None = None
         # (prefix, work_type) -> repo -> (routed, merged); work_type None rows
         # are folded into the prefix-level aggregate only.
@@ -70,39 +101,19 @@ class DeliveryMemoryPriors:
     # ------------------------------------------------------------------ stats
     def _stats(self) -> None:
         """(Re)build the in-process aggregate when the cache has expired."""
-        now = self._now()
+        now = datetime.now(timezone.utc)
         if (
             self._cached_at is not None
             and (now - self._cached_at).total_seconds() < self._cache_ttl_seconds
         ):
             return
-        from foundry.db.models import FoundryRunOutcome
-
         with self._session_factory() as session:
-            rows = (
-                session.query(
-                    FoundryRunOutcome.issue_key_prefix,
-                    FoundryRunOutcome.work_type,
-                    FoundryRunOutcome.repo,
-                    func.count(FoundryRunOutcome.run_id),
-                    func.sum(
-                        case((FoundryRunOutcome.outcome == "merged", 1), else_=0)
-                    ),
-                )
-                .filter(FoundryRunOutcome.repo.isnot(None))
-                .group_by(
-                    FoundryRunOutcome.issue_key_prefix,
-                    FoundryRunOutcome.work_type,
-                    FoundryRunOutcome.repo,
-                )
-                .all()
-            )
+            rows = routing_prior_rows(session)
         by_pair: dict[tuple[str, str], dict[str, _Cell]] = {}
         by_prefix: dict[str, dict[str, _Cell]] = {}
         for prefix, work_type, repo, routed, merged in rows:
             if not prefix or not repo:
                 continue
-            routed, merged = int(routed), int(merged or 0)
             if work_type:
                 cell = by_pair.setdefault((prefix, work_type), {})
                 old = cell.get(repo, (0, 0))
@@ -129,7 +140,7 @@ class DeliveryMemoryPriors:
             _log.exception("delivery-memory priors unavailable; skipping")
             return []
 
-        prefix = ticket.issue_key.split("-")[0].upper() if ticket.issue_key else ""
+        prefix = issue_key_prefix(ticket.issue_key)
         if not prefix:
             return []
         work_type = analysis.work_type.value

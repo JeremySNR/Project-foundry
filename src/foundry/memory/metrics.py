@@ -12,10 +12,8 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
-from sqlalchemy import case, func
-
 from foundry.db.models import FoundryRunOutcome
-from foundry.memory.priors import smoothed_confidence
+from foundry.memory.priors import routing_prior_rows, smoothed_confidence
 
 
 def _percentile(sorted_values: list[int], fraction: float) -> int | None:
@@ -73,18 +71,30 @@ def delivery_metrics(session, *, since: datetime) -> dict:
     # a later merge means a human fixed the input and reran it (supersession).
     blocked_rows = [r for r in rows if r.outcome == "blocked"]
     superseded = 0
-    for blocked in blocked_rows:
-        later_merge = (
-            session.query(FoundryRunOutcome.run_id)
-            .filter(
-                FoundryRunOutcome.linear_issue_id == blocked.linear_issue_id,
-                FoundryRunOutcome.outcome == "merged",
-                FoundryRunOutcome.created_at_run > blocked.created_at_run,
+    if blocked_rows:
+        merge_times_by_issue: dict[str, list] = {}
+        merges = (
+            session.query(
+                FoundryRunOutcome.linear_issue_id, FoundryRunOutcome.created_at_run
             )
-            .first()
+            .filter(
+                FoundryRunOutcome.outcome == "merged",
+                FoundryRunOutcome.linear_issue_id.in_(
+                    {b.linear_issue_id for b in blocked_rows}
+                ),
+            )
+            .all()
         )
-        if later_merge is not None:
-            superseded += 1
+        for issue_id, created_at_run in merges:
+            merge_times_by_issue.setdefault(issue_id, []).append(created_at_run)
+        superseded = sum(
+            1
+            for blocked in blocked_rows
+            if any(
+                t > blocked.created_at_run
+                for t in merge_times_by_issue.get(blocked.linear_issue_id, [])
+            )
+        )
 
     merge_times.sort()
     precision_by_band = [
@@ -98,36 +108,16 @@ def delivery_metrics(session, *, since: datetime) -> dict:
     ]
 
     # Top routing priors (all-time, not window-limited: priors only grow).
-    prior_rows = (
-        session.query(
-            FoundryRunOutcome.issue_key_prefix,
-            FoundryRunOutcome.work_type,
-            FoundryRunOutcome.repo,
-            func.count(FoundryRunOutcome.run_id).label("routed"),
-            func.sum(
-                case((FoundryRunOutcome.outcome == "merged", 1), else_=0)
-            ).label("merged"),
-        )
-        .filter(FoundryRunOutcome.repo.isnot(None))
-        .group_by(
-            FoundryRunOutcome.issue_key_prefix,
-            FoundryRunOutcome.work_type,
-            FoundryRunOutcome.repo,
-        )
-        .order_by(func.count(FoundryRunOutcome.run_id).desc())
-        .limit(10)
-        .all()
-    )
     top_priors = [
         {
             "issue_key_prefix": prefix,
             "work_type": work_type,
             "repo": repo,
-            "routed": int(routed),
-            "merged": int(merged or 0),
-            "confidence": smoothed_confidence(int(merged or 0), int(routed), cap=100),
+            "routed": routed,
+            "merged": merged,
+            "confidence": smoothed_confidence(merged, routed, cap=100),
         }
-        for prefix, work_type, repo, routed, merged in prior_rows
+        for prefix, work_type, repo, routed, merged in routing_prior_rows(session)[:10]
     ]
 
     return {

@@ -85,37 +85,17 @@ def _run_backfill(args: argparse.Namespace) -> None:
 
 
 def _run_show_priors() -> None:
-    from sqlalchemy import case, func
-
-    from foundry.db.models import FoundryRunOutcome
-    from foundry.memory.priors import smoothed_confidence
+    from foundry.memory.priors import routing_prior_rows, smoothed_confidence
 
     _settings, session_factory = _session_factory()
     with session_factory() as session:
-        rows = (
-            session.query(
-                FoundryRunOutcome.issue_key_prefix,
-                FoundryRunOutcome.work_type,
-                FoundryRunOutcome.repo,
-                func.count(FoundryRunOutcome.run_id),
-                func.sum(case((FoundryRunOutcome.outcome == "merged", 1), else_=0)),
-            )
-            .filter(FoundryRunOutcome.repo.isnot(None))
-            .group_by(
-                FoundryRunOutcome.issue_key_prefix,
-                FoundryRunOutcome.work_type,
-                FoundryRunOutcome.repo,
-            )
-            .order_by(func.count(FoundryRunOutcome.run_id).desc())
-            .all()
-        )
+        rows = routing_prior_rows(session)
     if not rows:
         print("No routed outcomes recorded yet - run 'foundry-memory backfill' first.")
         return
     print(f"{'team':<8} {'work type':<14} {'repository':<40} {'merged/routed':<14} conf")
     for prefix, work_type, repo, routed, merged in rows:
-        merged = int(merged or 0)
-        conf = smoothed_confidence(merged, int(routed), cap=100)
+        conf = smoothed_confidence(merged, routed, cap=100)
         print(
             f"{prefix:<8} {(work_type or '-'):<14} {repo:<40} "
             f"{f'{merged}/{routed}':<14} {conf}"
