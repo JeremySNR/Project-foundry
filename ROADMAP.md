@@ -24,7 +24,7 @@ Status values: `not started` | `in progress (branch, who/what)` | `blocked (why)
 
 ## 1. Code-aware context engine
 
-**Status:** not started
+**Status:** in progress (`claude/roadmap-top-item-plan-qxbema`, Claude Code)
 
 The highest-leverage build: it upgrades routing, risk, planning, and the policy
 gate at once. At enrichment time, gather real code facts for candidate repos —
@@ -34,11 +34,11 @@ README head, dir names, PR titles); routing is lexical token overlap and the
 README's "which files, what tests" claim is unmet. Plugs into the existing
 `context.provider` seam (`engines/enrichment.py`, `catalog/`).
 
-- [ ] New context provider that returns file tree, test layout, CODEOWNERS, and manifests for candidate repos
-- [ ] Offline tests via recorded tree fixtures (no network, per AGENTS.md)
-- [ ] Enrichment confidence can cite code-level evidence in its reason string
-- [ ] Catalog sync stays budget-aware and resumable
-- [ ] `foundry.example.yaml` + README + AGENTS.md updated
+- [x] New context provider that returns file tree, test layout, CODEOWNERS, and manifests for candidate repos (`context.provider: code`, `engines/code_context.py`)
+- [x] Offline tests via recorded tree fixtures (no network, per AGENTS.md)
+- [x] Enrichment confidence can cite code-level evidence in its reason string
+- [x] Catalog sync stays budget-aware and resumable (per-repo call reservation; code facts default off)
+- [x] `foundry.example.yaml` + README + AGENTS.md updated
 
 ## 2. LLM-backed risk classification with cited evidence
 

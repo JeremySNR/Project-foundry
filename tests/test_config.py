@@ -203,6 +203,22 @@ def test_context_defaults_when_block_absent() -> None:
     assert s.context_max_catalog_age_days == 7
     assert s.context_sync_call_budget == 3000
     assert s.context_repo_keywords == ()
+    assert s.context_sync_code_facts is False
+    assert s.context_tree_max_paths == 2000
+
+
+def test_context_code_provider_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "context:\n"
+        "  provider: code\n"
+        "  sync_code_facts: true\n"
+        "  tree_max_paths: 500\n"
+    )
+    s = Settings.load(path, env={})
+    assert s.context_provider == "code"
+    assert s.context_sync_code_facts is True
+    assert s.context_tree_max_paths == 500
 
 
 def test_context_env_overrides(tmp_path) -> None:
@@ -228,6 +244,7 @@ def test_context_invalid_age_and_budget_rejected(tmp_path) -> None:
     for i, content in enumerate([
         "context:\n  max_catalog_age_days: 0\n",
         "context:\n  sync_call_budget: 0\n",
+        "context:\n  tree_max_paths: 50\n",
     ]):
         path = tmp_path / f"bad-ctx-{i}.yaml"
         path.write_text(content)

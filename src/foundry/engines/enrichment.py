@@ -236,6 +236,9 @@ def _sync_age_str(entry: Any, now: datetime) -> str:
 class CatalogContextEnricher:
     """Scores ticket text against the synced repo catalog, with freshness-aware confidence."""
 
+    # Subclasses may add scored fields (e.g. code-aware path tokens).
+    _field_weights: dict[str, float] = _FIELD_WEIGHTS
+
     def __init__(
         self,
         session_factory: Any,
@@ -335,6 +338,14 @@ class CatalogContextEnricher:
             unknowns=unknowns,
         )
 
+    def _document(self, entry: Any) -> dict[str, set[str]]:
+        """Field -> token-set document for one catalog entry (overridable)."""
+        return _repo_document(entry)
+
+    def _evidence_suffix(self, entry: Any, matched_terms: set[str]) -> str:
+        """Extra reason-string evidence for a match (overridable; default none)."""
+        return ""
+
     def _score_catalog(
         self,
         entries: list[Any],
@@ -353,7 +364,7 @@ class CatalogContextEnricher:
         # Build documents
         docs: dict[str, dict[str, set[str]]] = {}
         for entry in entries:
-            docs[entry.repo] = _repo_document(entry)
+            docs[entry.repo] = self._document(entry)
 
         # IDF filter: drop tokens present in too many repos
         repo_count = len(docs)
@@ -381,7 +392,7 @@ class CatalogContextEnricher:
                 for field, field_tokens in repo_doc.items():
                     if tok in field_tokens:
                         matched_in.append(field)
-                        weighted_score += _FIELD_WEIGHTS[field]
+                        weighted_score += self._field_weights[field]
                 if matched_in:
                     matched_terms.add(tok)
                     term_fields[tok] = matched_in
@@ -407,16 +418,18 @@ class CatalogContextEnricher:
             top_fields = [f for f, _ in sorted_fields[:3]]
             fields_str = ", ".join(top_fields)
 
+            evidence = self._evidence_suffix(entry, matched_terms)
             if stale:
                 confidence = min(confidence, _STALE_CONFIDENCE_CAP)
                 synced_utc = _ensure_utc(entry.synced_at)
                 stale_days = int((now - synced_utc).days) if synced_utc else 0
                 stale_suffix = f" (stale: last synced {stale_days}d ago)"
                 reason = (
-                    f"Catalog match: {terms_str} ({fields_str}; {sync_age}).{stale_suffix}"
+                    f"Catalog match: {terms_str} ({fields_str}; {sync_age})."
+                    f"{evidence}{stale_suffix}"
                 )
             else:
-                reason = f"Catalog match: {terms_str} ({fields_str}; {sync_age})."
+                reason = f"Catalog match: {terms_str} ({fields_str}; {sync_age}).{evidence}"
 
             results.append((repo, confidence, reason, stale, weighted_score))
 

@@ -4,7 +4,9 @@
 
 1. **List sweep** — page through all org repos, upsert lightweight fields.
 2. **Deep fetch** — for new or changed repos, fetch README, top-level dirs,
-   and recent merged PR metadata (titles + contributor logins).
+   and recent merged PR metadata (titles + contributor logins). With
+   ``fetch_code_facts=True``, also one Git Trees call plus targeted content
+   fetches (CODEOWNERS and root manifests) feeding the code-aware enricher.
 
 Everything is state-driven: a crash mid-sweep loses at most one repo's work,
 and the next run resumes automatically from whatever ``synced_at`` rows record.
@@ -20,7 +22,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from foundry.catalog.code_facts import (
+    MAX_MANIFEST_FETCHES,
+    cap_tree_paths,
+    derive_languages,
+    derive_test_layout,
+    find_codeowners_path,
+    find_manifest_paths,
+    parse_codeowners,
+    parse_manifest,
+)
+
 _log = logging.getLogger(__name__)
+
+# Calls a plain deep-fetch makes per repo: readme + contents + pulls.
+_BASE_CALLS_PER_REPO = 3
+# Extra worst case with code facts: tree + CODEOWNERS + capped manifests.
+_CODE_FACTS_CALLS_PER_REPO = 1 + 1 + MAX_MANIFEST_FETCHES
 
 
 class CatalogSyncError(RuntimeError):
@@ -50,11 +68,15 @@ class CatalogSync:
         transport: Callable[..., tuple[int, dict[str, str], Any]],
         *,
         call_budget: int = 3000,
+        fetch_code_facts: bool = False,
+        tree_max_paths: int = 2000,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._session_factory = session_factory
         self._transport = transport
         self._call_budget = call_budget
+        self._fetch_code_facts = fetch_code_facts
+        self._tree_max_paths = tree_max_paths
         self._now = now
         self._calls_used = 0
 
@@ -64,6 +86,12 @@ class CatalogSync:
 
     def _budget_remaining(self) -> int:
         return self._call_budget - self._calls_used
+
+    def _per_repo_reservation(self) -> int:
+        """Calls to reserve before starting a repo, so it never half-finishes."""
+        if self._fetch_code_facts:
+            return _BASE_CALLS_PER_REPO + _CODE_FACTS_CALLS_PER_REPO
+        return _BASE_CALLS_PER_REPO
 
     def sync(self, org: str, *, bootstrap: bool = False) -> SyncReport:
         from foundry.db.models import FoundryRepoCatalogEntry
@@ -153,11 +181,11 @@ class CatalogSync:
                     or (pushed is not None and synced is not None and pushed > synced)
                 )
                 if needs_deep:
-                    to_deep_fetch.append(entry.repo)
+                    to_deep_fetch.append((entry.repo, entry.default_branch))
 
         deep_fetched = 0
-        for repo_name in to_deep_fetch:
-            if self._budget_remaining() < 3:
+        for repo_name, default_branch in to_deep_fetch:
+            if self._budget_remaining() < self._per_repo_reservation():
                 _log.warning("Budget exhausted before deep-fetching %s", repo_name)
                 return SyncReport(
                     repos_listed=len(repos_listed),
@@ -166,7 +194,7 @@ class CatalogSync:
                     calls_used=self._calls_used,
                     budget_exhausted=True,
                 )
-            self._deep_fetch(repo_name)
+            self._deep_fetch(repo_name, default_branch)
             deep_fetched += 1
 
         return SyncReport(
@@ -177,7 +205,7 @@ class CatalogSync:
             budget_exhausted=False,
         )
 
-    def _deep_fetch(self, repo: str) -> None:
+    def _deep_fetch(self, repo: str, default_branch: str | None = None) -> None:
         from foundry.db.models import FoundryRepoCatalogEntry
 
         readme_head: str | None = None
@@ -223,6 +251,10 @@ class CatalogSync:
                         contributor_counts[login] += 1
         top_contributors = [login for login, _ in contributor_counts.most_common(10)]
 
+        code_facts: dict[str, Any] | None = None
+        if self._fetch_code_facts:
+            code_facts = self._fetch_repo_code_facts(repo, default_branch)
+
         with self._session_factory() as session:
             entry = session.get(FoundryRepoCatalogEntry, repo)
             if entry is not None:
@@ -230,8 +262,87 @@ class CatalogSync:
                 entry.top_dirs = json.dumps(top_dirs)
                 entry.recent_pr_titles = json.dumps(recent_pr_titles)
                 entry.top_contributors = json.dumps(top_contributors)
+                if code_facts is not None:
+                    entry.tree_paths = json.dumps(code_facts["tree_paths"])
+                    entry.tree_truncated = code_facts["tree_truncated"]
+                    entry.test_layout = json.dumps(code_facts["test_layout"])
+                    entry.codeowners = json.dumps(code_facts["codeowners"])
+                    entry.manifests = json.dumps(code_facts["manifests"])
+                    entry.languages = json.dumps(code_facts["languages"])
                 entry.synced_at = self._now()
             session.commit()
+
+    def _fetch_repo_code_facts(
+        self, repo: str, default_branch: str | None
+    ) -> dict[str, Any]:
+        """One Git Trees call plus targeted content fetches; degrades to empty.
+
+        A failed tree fetch (404 on an empty repo, transient 5xx after retries)
+        must not fail the repo's sync - the metadata facts are still valuable.
+        """
+        empty: dict[str, Any] = {
+            "tree_paths": [],
+            "tree_truncated": False,
+            "test_layout": [],
+            "codeowners": [],
+            "manifests": [],
+            "languages": {},
+        }
+
+        ref = default_branch or "HEAD"
+        status, _, data = self._call("GET", f"/repos/{repo}/git/trees/{ref}?recursive=1")
+        if status != 200 or not isinstance(data, dict):
+            _log.info("Tree fetch for %s failed (HTTP %s); storing empty code facts", repo, status)
+            return empty
+
+        paths = [
+            item["path"]
+            for item in data.get("tree", [])
+            if isinstance(item, dict) and item.get("type") == "blob" and item.get("path")
+        ]
+        truncated = bool(data.get("truncated", False))
+
+        # Derive from the full path list, then cap what we store. Conventions
+        # are not stored: their markers are root-level (or .github/) paths that
+        # always survive the shallowest-first cap, so the enricher re-derives
+        # them from tree_paths.
+        test_layout = derive_test_layout(paths)
+        languages = derive_languages(paths)
+        stored_paths, was_capped = cap_tree_paths(paths, self._tree_max_paths)
+
+        codeowners: list[dict[str, Any]] = []
+        codeowners_path = find_codeowners_path(paths)
+        if codeowners_path is not None:
+            text = self._fetch_file_text(repo, codeowners_path)
+            if text is not None:
+                codeowners = parse_codeowners(text)
+
+        manifests: list[dict[str, Any]] = []
+        for manifest_path in find_manifest_paths(paths):
+            text = self._fetch_file_text(repo, manifest_path)
+            if text is not None:
+                manifests.append(parse_manifest(manifest_path, text))
+
+        return {
+            "tree_paths": stored_paths,
+            "tree_truncated": truncated or was_capped,
+            "test_layout": test_layout,
+            "codeowners": codeowners,
+            "manifests": manifests,
+            "languages": languages,
+        }
+
+    def _fetch_file_text(self, repo: str, path: str) -> str | None:
+        """Fetch one file via the contents API; 404 is normal, never a warning."""
+        status, _, data = self._call("GET", f"/repos/{repo}/contents/{path}")
+        if status != 200 or not isinstance(data, dict):
+            return None
+        try:
+            return base64.b64decode(data.get("content", "")).decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:
+            return None
 
 
 def _parse_iso(value: str | None) -> datetime | None:

@@ -179,7 +179,7 @@ Secrets via env:
 | `FOUNDRY_AGENT_WEBHOOK_URL` / `..._SECRET` | Needed when the provider is `webhook`; the secret HMAC-signs the job payload. |
 | `OPENAI_API_KEY` | Needed when the analyzer provider is `openai`. |
 | `TEMPORAL_ADDRESS` | The Temporal server, for durable runs. |
-| `FOUNDRY_CONTEXT_PROVIDER` | Overrides `context.provider` (`static` or `catalog`). |
+| `FOUNDRY_CONTEXT_PROVIDER` | Overrides `context.provider` (`static`, `catalog` or `code`). |
 | `FOUNDRY_CONTEXT_ORG` | GitHub org for `foundry-catalog sync`; overrides `context.org`. |
 
 The same code runs on a laptop (SQLite, heuristics, no keys) and in production (Postgres, GPT-5.5, live Linear and GitHub) with nothing changing but config. That's the point.
@@ -217,6 +217,14 @@ foundry-catalog sync --org <your-github-org> --bootstrap
 
 Run this on a schedule (e.g. daily cron or a Temporal workflow) so the catalog stays current.
 The sync is stateful and budget-aware: interrupted sweeps resume automatically on the next run.
+
+The code-aware enricher (`context.provider: code`) goes further: the sync also records each
+repo's file tree (one Git Trees API call), test layout, CODEOWNERS rules and root dependency
+manifests — `foundry-catalog sync --code-facts`, implied when the provider is `code`. Routing
+then matches tickets against actual code paths, reason strings cite concrete files and owners
+("Code evidence: src/billing/invoice.py; owners: @org/payments"), and the context bundle carries
+candidate files, the test layout and inferred test commands for the plan. Worst case the sync
+spends 9 API calls per repo instead of 3; the same budget and resume semantics apply.
 
 Optional extras, install what you need:
 

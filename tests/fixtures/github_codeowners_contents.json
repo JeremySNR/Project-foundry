@@ -1,0 +1,9 @@
+{
+  "name": "CODEOWNERS",
+  "path": ".github/CODEOWNERS",
+  "sha": "0000000000000000000000000000000000000000",
+  "size": 150,
+  "type": "file",
+  "encoding": "base64",
+  "content": "IyBEZWZhdWx0IG93bmVycyBmb3IgdGhlIHdob2xlIHJlcG8KKiBAb3JnL3BsYXRmb3JtCgojIFBheW1lbnRzIGNvZGUgaXMgb3duZWQgYnkgdGhlIHBheW1lbnRzIHRlYW0Kc3JjL2JpbGxpbmcvIEBvcmcvcGF5bWVudHMgQGFsaWNlCgpkb2NzLyBAb3JnL2RvY3MK"
+}

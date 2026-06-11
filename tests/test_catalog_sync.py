@@ -6,6 +6,7 @@ import base64
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -380,3 +381,169 @@ def test_budget_exhaustion_stops_cleanly_and_resumes() -> None:
     with sf() as session:
         entries = session.query(FoundryRepoCatalogEntry).all()
         assert all(e.synced_at is not None for e in entries)
+
+
+# ---------------------------------------------------------------------------
+# 8. Code facts: fetched, derived, and stored when enabled
+# ---------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _fixture(name: str) -> dict:
+    return json.loads((_FIXTURES / name).read_text())
+
+
+def _code_facts_transport(calls: list[str], tree_fixture: str = "github_tree_recursive.json"):
+    """Fake transport serving the recorded tree + contents fixtures."""
+
+    def transport(method: str, path: str):
+        calls.append(path)
+        if "/orgs/org/repos" in path:
+            return 200, {}, [_repo("org/billing")] if _page_num(path) == 1 else []
+        if "/readme" in path:
+            return 200, {}, _readme_response()
+        if "/git/trees/" in path:
+            return 200, {}, _fixture(tree_fixture)
+        if path.endswith("/contents/"):
+            return 200, {}, [{"name": "src"}, {"name": "tests"}]
+        if "/contents/.github/CODEOWNERS" in path:
+            return 200, {}, _fixture("github_codeowners_contents.json")
+        if "/contents/pyproject.toml" in path:
+            return 200, {}, _fixture("github_pyproject_contents.json")
+        if "/contents/package.json" in path:
+            return 200, {}, _fixture("github_package_json_contents.json")
+        if "/pulls" in path:
+            return 200, {}, []
+        return 404, {}, None
+
+    return transport
+
+
+def test_code_facts_fetched_and_stored() -> None:
+    _, sf = _engine_and_sf()
+    calls: list[str] = []
+    sync = CatalogSync(sf, _code_facts_transport(calls), call_budget=3000, fetch_code_facts=True)
+    report = sync.sync("org", bootstrap=True)
+
+    assert report.budget_exhausted is False
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/billing")
+        assert entry is not None
+        paths = json.loads(entry.tree_paths)
+        assert "src/billing/invoice.py" in paths
+        assert all("/" not in p or True for p in paths)  # blobs only, dirs excluded
+        assert ".github" not in paths  # tree-type entries are not stored
+        assert entry.tree_truncated is False
+        assert "tests/" in json.loads(entry.test_layout)
+        rules = json.loads(entry.codeowners)
+        assert {"pattern": "src/billing/", "owners": ["@org/payments", "@alice"]} in rules
+        manifests = json.loads(entry.manifests)
+        kinds = {m["kind"] for m in manifests}
+        assert {"pyproject", "package_json"} <= kinds
+        assert json.loads(entry.languages)["py"] >= 4
+
+
+def test_code_facts_disabled_keeps_three_calls_per_repo() -> None:
+    _, sf = _engine_and_sf()
+    calls: list[str] = []
+    sync = CatalogSync(sf, _code_facts_transport(calls), call_budget=3000)
+    sync.sync("org", bootstrap=True)
+
+    deep_calls = [c for c in calls if "/orgs/" not in c]
+    assert len(deep_calls) == 3  # readme + contents + pulls, no tree fetch
+    assert not any("/git/trees/" in c for c in deep_calls)
+
+
+def test_truncated_tree_sets_flag_and_still_derives() -> None:
+    _, sf = _engine_and_sf()
+    calls: list[str] = []
+    sync = CatalogSync(
+        sf,
+        _code_facts_transport(calls, tree_fixture="github_tree_truncated.json"),
+        call_budget=3000,
+        fetch_code_facts=True,
+    )
+    sync.sync("org", bootstrap=True)
+
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/billing")
+        assert entry.tree_truncated is True
+        assert "tests/" in json.loads(entry.test_layout)
+
+
+def test_tree_fetch_failure_still_syncs_repo() -> None:
+    _, sf = _engine_and_sf()
+
+    def transport(method: str, path: str):
+        if "/orgs/org/repos" in path:
+            return 200, {}, [_repo("org/empty")] if _page_num(path) == 1 else []
+        if "/readme" in path:
+            return 200, {}, _readme_response()
+        if "/git/trees/" in path:
+            return 404, {}, None
+        if path.endswith("/contents/"):
+            return 200, {}, []
+        if "/pulls" in path:
+            return 200, {}, []
+        return 404, {}, None
+
+    sync = CatalogSync(sf, transport, call_budget=3000, fetch_code_facts=True)
+    sync.sync("org", bootstrap=True)
+
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/empty")
+        assert entry.synced_at is not None
+        assert json.loads(entry.tree_paths) == []
+        assert json.loads(entry.codeowners) == []
+
+
+def test_no_codeowners_means_no_contents_call() -> None:
+    _, sf = _engine_and_sf()
+    calls: list[str] = []
+
+    def transport(method: str, path: str):
+        calls.append(path)
+        if "/orgs/org/repos" in path:
+            return 200, {}, [_repo("org/bare")] if _page_num(path) == 1 else []
+        if "/readme" in path:
+            return 200, {}, _readme_response()
+        if "/git/trees/" in path:
+            return 200, {}, {"sha": "x", "tree": [
+                {"path": "main.go", "type": "blob"},
+            ], "truncated": False}
+        if path.endswith("/contents/"):
+            return 200, {}, []
+        if "/pulls" in path:
+            return 200, {}, []
+        return 404, {}, None
+
+    sync = CatalogSync(sf, transport, call_budget=3000, fetch_code_facts=True)
+    sync.sync("org", bootstrap=True)
+
+    assert not any("CODEOWNERS" in c for c in calls)
+
+
+def test_code_facts_budget_reservation_resumes() -> None:
+    """A budget too small for a code-facts repo stops before starting it."""
+    _, sf = _engine_and_sf()
+    calls: list[str] = []
+    # Listing costs 1; reservation with code facts is 9, so budget 5 stops
+    # before the first repo is touched.
+    sync = CatalogSync(sf, _code_facts_transport(calls), call_budget=5, fetch_code_facts=True)
+    report = sync.sync("org", bootstrap=True)
+
+    assert report.budget_exhausted is True
+    assert report.deep_fetched == 0
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/billing")
+        assert entry.synced_at is None
+
+    # A second run with ample budget completes the repo.
+    sync2 = CatalogSync(sf, _code_facts_transport(calls), call_budget=3000, fetch_code_facts=True)
+    report2 = sync2.sync("org")
+    assert report2.deep_fetched == 1
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/billing")
+        assert entry.synced_at is not None
+        assert json.loads(entry.tree_paths)

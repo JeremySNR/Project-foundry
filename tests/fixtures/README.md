@@ -16,3 +16,13 @@ exposes a mapping bug:
 The fixtures below were written from the providers' webhook documentation;
 payloads captured from live traffic are strictly better and welcome as
 replacements.
+
+## Recorded GitHub REST responses (catalog code facts)
+
+`github_tree_recursive.json` / `github_tree_truncated.json` mirror the Git
+Trees API (`GET /repos/{repo}/git/trees/{ref}?recursive=1`), and the
+`github_*_contents.json` files mirror the contents API (base64 payloads) for
+CODEOWNERS and root manifests. They pin the code-facts phase of
+`foundry-catalog sync` in `tests/test_catalog_sync.py` and the code-aware
+enricher in `tests/test_code_enricher.py` - same rule: no network in tests,
+recorded payloads only.
