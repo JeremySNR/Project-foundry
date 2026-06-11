@@ -16,6 +16,10 @@ policy-gated, capped, budgeted, and fully audited. It deliberately **stops at a
 reviewed PR**: no auto-merge, no deploys, no migrations. The safety gates are the
 product, not overhead. Canonical product statement: `VISION.md`.
 
+**Looking for work, or about to start some?** `ROADMAP.md` is the prioritized
+backlog with per-item status tracking — claim an item there and keep its status
+current in the same PR as the work.
+
 ## The run lifecycle (what the orchestrator does)
 
 ```
