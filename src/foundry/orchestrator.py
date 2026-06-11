@@ -154,6 +154,11 @@ class FoundryOrchestrator:
         self._diff_risk = diff_risk_classifier or GlobDiffRiskClassifier(
             self._sensitive_path_globs
         )
+        # The default glob classifier never reads the ticket; skip the artifact
+        # load on every PR event in that (common) case.
+        self._diff_risk_needs_ticket = not isinstance(
+            self._diff_risk, GlobDiffRiskClassifier
+        )
         self._max_agent_retries = max_agent_retries
         self._retry_on = frozenset(retry_on)
         self._max_cost_per_run = max_cost_per_run
@@ -928,12 +933,12 @@ class FoundryOrchestrator:
         had no human look at it, so it escalates the run. Returns the unexpected
         areas plus the classifier's cited evidence for them.
         """
-        try:
-            ticket: RawTicket | None = self._load(
-                session, run_id, ArtifactType.TICKET_SNAPSHOT
-            )
-        except OrchestratorError:
-            ticket = None
+        ticket: RawTicket | None = None
+        if self._diff_risk_needs_ticket:
+            try:
+                ticket = self._load(session, run_id, ArtifactType.TICKET_SNAPSHOT)
+            except OrchestratorError:
+                ticket = None
         findings = self._diff_risk.classify_diff(files, ticket)
         if not findings.areas:
             return {}, []

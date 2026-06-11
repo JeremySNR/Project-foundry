@@ -15,7 +15,7 @@ the assessment rather than failing the run.
 
 from __future__ import annotations
 
-from typing import Literal, Mapping
+from typing import Literal, Mapping, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -153,14 +153,17 @@ def _feedback(error: Exception | None) -> str:
     )
 
 
+_M = TypeVar("_M", bound=BaseModel)
+
+
 def _generate(
     llm: StructuredLLM,
-    model_cls: type[BaseModel],
+    model_cls: type[_M],
     *,
     system: str,
     user: str,
     max_attempts: int,
-) -> BaseModel:
+) -> _M:
     schema = model_cls.model_json_schema()
     schema_name = model_cls.__name__
     last_error: Exception | None = None
@@ -209,7 +212,6 @@ class LlmRiskClassifier:
             )
         except LLMError as exc:
             return self._degraded(baseline, exc)
-        assert isinstance(output, LlmRiskOutput)  # noqa: S101
         return self._combine(baseline, output, context)
 
     @staticmethod
@@ -302,7 +304,6 @@ class LlmDiffRiskClassifier:
             )
         except LLMError:
             return base
-        assert isinstance(output, LlmDiffRiskOutput)  # noqa: S101
 
         areas = dict(base.areas)
         evidence = list(base.evidence)
