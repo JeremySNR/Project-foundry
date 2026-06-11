@@ -126,11 +126,16 @@ class Settings:
     approvers: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     # --- context enrichment (behaviour: yaml) ---
-    context_provider: str = "static"          # "static" | "catalog"
+    context_provider: str = "static"          # "static" | "catalog" | "code"
     context_org: str | None = None            # GitHub org for foundry-catalog sync
     context_repo_keywords: tuple[tuple[str, tuple[str, ...]], ...] = ()
     context_max_catalog_age_days: int = 7
     context_sync_call_budget: int = 3000
+    # Gather code facts (file tree, CODEOWNERS, manifests) during catalog sync.
+    # Implied by context_provider == "code"; costs up to 9 API calls per repo
+    # instead of 3.
+    context_sync_code_facts: bool = False
+    context_tree_max_paths: int = 2000        # stored tree paths per repo (capped)
 
     # --- delivery memory (behaviour: yaml) ---
     # Historical routing priors mined from finished runs ("14 of 16 of this
@@ -181,9 +186,10 @@ class Settings:
             raise ValueError(
                 f"max_cost_per_run must be positive, got {self.max_cost_per_run}"
             )
-        if self.context_provider not in ("static", "catalog"):
+        if self.context_provider not in ("static", "catalog", "code"):
             raise ValueError(
-                f"context_provider must be 'static' or 'catalog', got {self.context_provider!r}"
+                "context_provider must be 'static', 'catalog' or 'code', "
+                f"got {self.context_provider!r}"
             )
         if self.context_max_catalog_age_days < 1:
             raise ValueError(
@@ -192,6 +198,10 @@ class Settings:
         if self.context_sync_call_budget < 1:
             raise ValueError(
                 f"context_sync_call_budget must be >= 1, got {self.context_sync_call_budget}"
+            )
+        if self.context_tree_max_paths < 100:
+            raise ValueError(
+                f"context_tree_max_paths must be >= 100, got {self.context_tree_max_paths}"
             )
         if self.memory_min_samples < 1:
             raise ValueError(
@@ -326,6 +336,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["context_max_catalog_age_days"] = int(context["max_catalog_age_days"])
     if "sync_call_budget" in context:
         out["context_sync_call_budget"] = int(context["sync_call_budget"])
+    if "sync_code_facts" in context:
+        out["context_sync_code_facts"] = _bool(context["sync_code_facts"])
+    if "tree_max_paths" in context:
+        out["context_tree_max_paths"] = int(context["tree_max_paths"])
     if "repo_keywords" in context:
         out["context_repo_keywords"] = tuple(
             (str(repo), tuple(kws))

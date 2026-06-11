@@ -37,6 +37,15 @@ def main() -> None:
         default=None,
         help="Maximum number of GitHub API calls (overrides config default).",
     )
+    sync_p.add_argument(
+        "--code-facts",
+        action="store_true",
+        default=False,
+        help=(
+            "Also fetch code facts per repo (file tree, CODEOWNERS, manifests). "
+            "Implied by context.provider=code or context.sync_code_facts in config."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -69,13 +78,24 @@ def _run_sync(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     call_budget = args.budget if args.budget is not None else settings.context_sync_call_budget
+    fetch_code_facts = (
+        args.code_facts
+        or settings.context_sync_code_facts
+        or settings.context_provider == "code"
+    )
 
     engine = make_engine(settings.database_url)
     create_all(engine)
     session_factory = make_session_factory(engine)
     transport = github_rest_transport(token)
 
-    sync = CatalogSync(session_factory, transport, call_budget=call_budget)
+    sync = CatalogSync(
+        session_factory,
+        transport,
+        call_budget=call_budget,
+        fetch_code_facts=fetch_code_facts,
+        tree_max_paths=settings.context_tree_max_paths,
+    )
     try:
         report = sync.sync(org, bootstrap=args.bootstrap)
     except CatalogSyncError as exc:

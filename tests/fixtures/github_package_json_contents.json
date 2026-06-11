@@ -1,0 +1,9 @@
+{
+  "name": "package.json",
+  "path": "package.json",
+  "sha": "0000000000000000000000000000000000000000",
+  "size": 199,
+  "type": "file",
+  "encoding": "base64",
+  "content": "ewogICJuYW1lIjogImJpbGxpbmctZGFzaGJvYXJkIiwKICAidmVyc2lvbiI6ICIxLjAuMCIsCiAgInNjcmlwdHMiOiB7CiAgICAidGVzdCI6ICJ2aXRlc3QgcnVuIiwKICAgICJidWlsZCI6ICJ2aXRlIGJ1aWxkIgogIH0sCiAgImRlcGVuZGVuY2llcyI6IHsKICAgICJyZWFjdCI6ICJeMTguMi4wIiwKICAgICJheGlvcyI6ICJeMS42LjAiCiAgfQp9Cg=="
+}

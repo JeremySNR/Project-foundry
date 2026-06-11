@@ -95,6 +95,10 @@ context:
   # Which enricher decides the target repository for each ticket:
   #   static  - keyword lists only (default, no DB required)
   #   catalog - scores against GitHub org metadata synced by 'foundry-catalog sync'
+  #   code    - catalog scoring plus code facts (file tree, test layout,
+  #             CODEOWNERS, manifests) gathered by 'foundry-catalog sync
+  #             --code-facts'; reasons cite concrete paths and owners, and
+  #             plans/risk get structured code context
   # Override with FOUNDRY_CONTEXT_PROVIDER.
   provider: static
   # GitHub org to sync with 'foundry-catalog sync'. Override with FOUNDRY_CONTEXT_ORG.
@@ -103,14 +107,21 @@ context:
   max_catalog_age_days: 7
   # Maximum GitHub API calls per sync sweep (default: 3000).
   sync_call_budget: 3000
-  # Optional manual keyword hints, merged with catalog scoring (catalog provider only).
+  # Gather code facts during sync even when provider is not "code" (the code
+  # provider implies this). Raises the worst-case sync cost from 3 to 9 API
+  # calls per repo (tree + CODEOWNERS + up to 4 root manifests).
+  sync_code_facts: false
+  # How many file-tree paths to store per repo (shallowest kept first; trees
+  # beyond the cap are marked truncated). Minimum 100.
+  tree_max_paths: 2000
+  # Optional manual keyword hints, merged with catalog scoring (catalog/code providers only).
   # repo_keywords:
   #   acme/billing-service: ["invoice", "stripe"]
 
 memory:
   # Delivery memory: routing priors mined from this org's own finished runs
-  # ("14 of 16 of this team's tickets merged in billing-service"). Catalog
-  # context provider only; inert until min_samples routed outcomes exist.
+  # ("14 of 16 of this team's tickets merged in billing-service"). Catalog/code
+  # context providers only; inert until min_samples routed outcomes exist.
   # Backfill historical runs with 'foundry-memory backfill'.
   priors_enabled: true
   # Routed runs required before history influences routing (default: 3).

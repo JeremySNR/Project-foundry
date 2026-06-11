@@ -24,7 +24,14 @@ from .common import (
     RunStatus,
     WorkType,
 )
-from .context import CandidateFile, CandidateRepository, ContextBundle
+from .context import (
+    CandidateFile,
+    CandidateRepository,
+    CodeOwnersRule,
+    ContextBundle,
+    ManifestFacts,
+    RepoCodeFacts,
+)
 from .plan import DeliveryPlan, ImplementationStep, TestPlan
 from .pr import PullRequestState
 from .risk import RiskAssessment, SensitiveAreas
@@ -51,6 +58,9 @@ __all__ = [
     "ContextBundle",
     "CandidateRepository",
     "CandidateFile",
+    "CodeOwnersRule",
+    "ManifestFacts",
+    "RepoCodeFacts",
     # risk
     "RiskAssessment",
     "SensitiveAreas",

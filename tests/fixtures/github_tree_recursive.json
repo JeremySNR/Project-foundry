@@ -1,0 +1,177 @@
+{
+  "sha": "1111111111111111111111111111111111111111",
+  "url": "https://api.github.com/repos/org/billing/git/trees/1111111111111111111111111111111111111111",
+  "tree": [
+    {
+      "path": ".github",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": ".github/workflows",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "src",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "src/billing",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "tests",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "docs",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "pyproject.toml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "package.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "Dockerfile",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "Makefile",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": ".pre-commit-config.yaml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": ".github/CODEOWNERS",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "src/billing/__init__.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "src/billing/invoice.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "src/billing/stripe_client.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "src/billing/reconciliation.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "tests/conftest.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "tests/test_invoice.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "tests/test_reconciliation.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    },
+    {
+      "path": "docs/architecture.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0000000000000000000000000000000000000000",
+      "size": 100,
+      "url": "https://api.github.com/..."
+    }
+  ],
+  "truncated": false
+}

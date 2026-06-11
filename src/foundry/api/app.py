@@ -875,7 +875,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         raise ValueError(f"unknown tracker.provider: {settings.tracker_provider!r}")
 
     repo_keywords = {repo: list(kws) for repo, kws in settings.context_repo_keywords}
-    if settings.context_provider == "catalog":
+    if settings.context_provider in ("catalog", "code"):
         priors = None
         if settings.memory_priors_enabled:
             from foundry.memory.priors import DeliveryMemoryPriors
@@ -885,7 +885,13 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
                 min_samples=settings.memory_min_samples,
                 confidence_cap=settings.memory_confidence_cap,
             )
-        enricher = CatalogContextEnricher(
+        if settings.context_provider == "code":
+            from foundry.engines.code_context import CodeContextEnricher
+
+            enricher_cls = CodeContextEnricher
+        else:
+            enricher_cls = CatalogContextEnricher
+        enricher = enricher_cls(
             session_factory,
             repo_keywords=repo_keywords,
             max_catalog_age_days=settings.context_max_catalog_age_days,

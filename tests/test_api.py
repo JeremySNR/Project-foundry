@@ -602,6 +602,23 @@ def test_build_orchestrator_catalog_uses_catalog_enricher() -> None:
     assert isinstance(orch._enricher, CatalogContextEnricher)
 
 
+def test_build_orchestrator_code_uses_code_enricher() -> None:
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.engines.code_context import CodeContextEnricher
+    from foundry.db import create_all, make_engine, make_session_factory
+    from dataclasses import replace
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+    base = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"})
+    settings = replace(base, context_provider="code")
+
+    orch = build_orchestrator(settings, sf)
+    assert isinstance(orch._enricher, CodeContextEnricher)
+
+
 def test_build_orchestrator_static_carries_yaml_keywords() -> None:
     """Keywords from context.repo_keywords are wired into StaticContextEnricher."""
     from foundry.api.app import build_orchestrator

@@ -42,7 +42,7 @@ Know what is smart and what is deliberately dumb before you "improve" anything:
 | Ticket readiness / AC extraction | Regex + structure heuristics (default) **or** OpenAI structured output (`analyzer.provider: openai`) | `engines/analyzer.py`, `engines/openai_analyzer.py` |
 | Work-type classification | Keyword-hit counting | `engines/analyzer.py` |
 | Risk classification | Hardcoded keyword lists on ticket text; `fnmatch` globs on PR diff paths | `engines/risk.py` |
-| Repo routing | Tiered: explicit ticket association (conf 90) > delivery-memory priors (capped 89) > catalog IDF-token scoring (stale-capped 65) > legacy YAML keywords. **Lexical, not semantic; no code is read** — the catalog is repo metadata only (topics, README head, top-level dirs, PR titles). | `engines/enrichment.py`, `catalog/`, `memory/priors.py` |
+| Repo routing | Tiered: explicit ticket association (conf 90) > delivery-memory priors (capped 89) > catalog IDF-token scoring (stale-capped 65) > legacy YAML keywords. Lexical, not semantic. With `context.provider: code`, the synced file tree becomes a scored field and the bundle carries `RepoCodeFacts` (test layout, CODEOWNERS, manifests) + candidate files + inferred test commands; reasons cite concrete paths. Same confidence tiers/caps — code evidence never adds a tier. | `engines/enrichment.py`, `engines/code_context.py`, `catalog/`, `memory/priors.py` |
 | Planning | Template rendering — steps are "Satisfy acceptance criterion: X". No file-level analysis. | `engines/planner.py` |
 | Delivery memory | Outcomes derived purely from the audit trail; Beta-smoothed routing priors (min 3 samples, >50% success); ROI metrics API | `memory/` |
 
@@ -62,7 +62,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | `workflows/` | Temporal version (durable waits for approval/PR). Exists, signal-driven, **not yet battle-tested against a real server** |
 | `agents/` | Provider abstraction: `manual`, fake, `cursor_cloud`, `cursor_via_linear`, `claude_code` (GitHub Actions `workflow_dispatch`), `webhook` (HMAC-signed). All go through one `create_job` path with a secret-leak scan |
 | `connectors/` | Trackers: Linear, GitHub Issues, Jira. SCMs: GitHub, GitLab. `transport.py` is the HTTP seam (fakes in tests) |
-| `catalog/` | `foundry-catalog sync` — GitHub org metadata sweep feeding the catalog enricher (stateful, budget-aware, resumable) |
+| `catalog/` | `foundry-catalog sync` — GitHub org metadata sweep feeding the catalog enricher (stateful, budget-aware, resumable). `--code-facts` (implied by `context.provider: code`) adds per-repo code facts: file tree via the Git Trees API, CODEOWNERS, root manifests; derivation logic is pure functions in `catalog/code_facts.py` |
 | `memory/` | Run outcomes, routing priors, delivery metrics; `foundry-memory backfill / show-priors` |
 | `api/` | FastAPI: signed webhooks (Linear/GitHub/Jira/GitLab), REST approvals, run timeline, `GET /metrics/delivery`, and a zero-build HTML dashboard at `/dashboard`. Everything token-gated, **fail-closed** (no `FOUNDRY_API_TOKEN` = endpoints disabled) |
 | `db/models.py` | SQLAlchemy: runs, artifacts, audit events, policy decisions, agent jobs, repo catalog, run outcomes. **Single-tenant** — no org/tenant columns |
@@ -106,8 +106,11 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
 
 ## Known limitations (so you don't rediscover them)
 
-- Context/routing is metadata-lexical; no code, AST, or test discovery.
-- Plans are templated; agents receive no file-level context.
+- Context/routing is lexical (token overlap), not semantic — no AST or embeddings.
+  The `code` provider reads file trees/CODEOWNERS/manifests, but `static`/`catalog`
+  still read no code, and code facts only exist after a `--code-facts` sync.
+- Plans are templated; the bundle now carries candidate files and code facts, but
+  the planner does not yet use them for file-level steps (roadmap #3).
 - Risk-from-ticket is keyword matching (risk-from-diff globs are precise).
 - Single-tenant DB; approvers are static config (no SSO/SCIM); no rate limiting.
 - No DB-level idempotency on intake — simultaneous webhooks for one issue can race.

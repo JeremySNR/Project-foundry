@@ -282,9 +282,11 @@ class FoundryRunOutcome(Base):
 class FoundryRepoCatalogEntry(Base):
     """One row per repository in the org: the metadata the enricher scores against.
 
-    Metadata only - never file contents beyond the README head. ``synced_at`` is
-    when we last deep-fetched; ``pushed_at`` is GitHub's last-push time refreshed
-    on every sweep. ``pushed_at > synced_at`` means the entry is stale.
+    Metadata plus, when code-facts sync is enabled, narrowly-scoped code facts:
+    tree paths (capped), CODEOWNERS rules, and root dependency manifests - never
+    a clone, never arbitrary file contents. ``synced_at`` is when we last
+    deep-fetched; ``pushed_at`` is GitHub's last-push time refreshed on every
+    sweep. ``pushed_at > synced_at`` means the entry is stale.
     """
 
     __tablename__ = "foundry_repo_catalog"
@@ -299,6 +301,13 @@ class FoundryRepoCatalogEntry(Base):
     top_dirs: Mapped[str] = mapped_column(Text, default="[]")          # JSON list[str]
     recent_pr_titles: Mapped[str] = mapped_column(Text, default="[]")  # JSON list[str]
     top_contributors: Mapped[str] = mapped_column(Text, default="[]")  # JSON list[str] of logins
+    # Code facts (populated only when sync runs with code facts enabled).
+    tree_paths: Mapped[str] = mapped_column(Text, default="[]")        # JSON list[str], capped
+    tree_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    test_layout: Mapped[str] = mapped_column(Text, default="[]")       # JSON list[str]
+    codeowners: Mapped[str] = mapped_column(Text, default="[]")        # JSON list[{pattern, owners}]
+    manifests: Mapped[str] = mapped_column(Text, default="[]")         # JSON list[ManifestFacts-shaped]
+    languages: Mapped[str] = mapped_column(Text, default="{}")         # JSON dict ext -> file count
     pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     etag: Mapped[str | None] = mapped_column(String(128), nullable=True)  # reserved, unused
     synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
