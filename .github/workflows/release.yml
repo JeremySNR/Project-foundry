@@ -1,4 +1,9 @@
-# Release pipeline: tag vX.Y.Z -> GHCR image + GitHub release.
+# Release pipeline: GHCR image + GitHub release.
+#
+# Two ways to trigger:
+#   - push a tag vX.Y.Z (the original flow), or
+#   - run it from the Actions tab (workflow_dispatch) with a version input -
+#     the release step then creates the tag on the dispatched commit itself.
 #
 # GHCR uses the built-in GITHUB_TOKEN.
 
@@ -7,6 +12,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v1.2.0 (tag is created if it does not exist)"
+        required: true
 
 permissions:
   contents: read
@@ -35,6 +45,14 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v5
+      - name: Resolve version
+        id: version
+        env:
+          RAW: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          BARE="${RAW#v}"
+          echo "bare=${BARE}" >> "$GITHUB_OUTPUT"
+          echo "minor=${BARE%.*}" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -45,8 +63,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.bare }}
+            type=raw,value=${{ steps.version.outputs.minor }}
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
@@ -66,4 +84,7 @@ jobs:
       - name: Create release with generated notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        # --target creates the tag at the dispatched commit when it does not
+        # exist yet; it is ignored when the workflow ran from a tag push.
+        run: gh release create "$VERSION" --target "$GITHUB_SHA" --generate-notes
