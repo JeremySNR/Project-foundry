@@ -68,6 +68,7 @@ from foundry.policy.engine import (
 )
 from foundry.schemas.agent import CodingAgentJob, CodingAgentJobInput, JobConstraints
 from foundry.schemas.analysis import TicketAnalysis
+from foundry.memory.outcomes import record_outcome
 from foundry.schemas.common import (
     ACTIVE_RUN_STATUSES,
     AgentMode,
@@ -78,6 +79,7 @@ from foundry.schemas.common import (
     PRStatus,
     ReviewStatus,
     RunStatus,
+    TERMINAL_RUN_STATUSES,
 )
 from foundry.schemas.context import ContextBundle
 from foundry.schemas.plan import DeliveryPlan
@@ -238,8 +240,10 @@ class FoundryOrchestrator:
                         run_id=run_id,
                         event_type=AuditEventType.RUN_BLOCKED,
                         actor_type="foundry",
+                        metadata={"category": "unroutable"},
                     )
                 )
+            self._record_outcome_if_terminal(session, run)
             session.commit()
 
         # Mirror the outcome back to the tracker (Linear) if one is configured.
@@ -362,9 +366,15 @@ class FoundryOrchestrator:
                     event_type=event_type,
                     actor_type="human",
                     actor_id=user,
+                    metadata=(
+                        {"category": "human_stopped"}
+                        if event_type is AuditEventType.RUN_BLOCKED
+                        else None
+                    ),
                 )
             )
             issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
             session.commit()
         self._notify_state(issue_id, status)
 
@@ -484,9 +494,11 @@ class FoundryOrchestrator:
                         event_type=AuditEventType.RUN_BLOCKED,
                         actor_type="foundry",
                         output_content=decision,
+                        metadata={"category": "policy_denied"},
                     )
                 )
                 blocked_issue = run.linear_issue_id
+                self._record_outcome_if_terminal(session, run)
                 session.commit()
                 self._notify_state(blocked_issue, RunStatus.BLOCKED)
                 raise OrchestratorError(
@@ -550,6 +562,7 @@ class FoundryOrchestrator:
                 job.error = reason
                 job.completed_at = datetime.now(timezone.utc)
             issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
             session.commit()
         self._notify_state(issue_id, RunStatus.EXECUTION_FAILED)
 
@@ -626,6 +639,7 @@ class FoundryOrchestrator:
             run.current_step = run.status.value
             issue_id = run.linear_issue_id
             result_status = run.status
+            self._record_outcome_if_terminal(session, run)
             session.commit()
         self._notify_state(issue_id, result_status)
 
@@ -771,6 +785,24 @@ class FoundryOrchestrator:
         self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
         return RunStatus.AGENT_RUNNING
 
+    def _record_outcome_if_terminal(self, session, run: FoundryRun) -> None:
+        """Distill a finished run into its delivery-memory outcome row.
+
+        Called inside the caller's session just before commit at every site
+        that sets a terminal status. Best-effort: memory must never break the
+        governance path that called it, and ``foundry-memory backfill`` can
+        rebuild anything this misses.
+        """
+        if run.status not in TERMINAL_RUN_STATUSES:
+            return
+        try:
+            # The session does not autoflush; make the terminal audit event
+            # just added by the caller visible to the derivation queries.
+            session.flush()
+            record_outcome(session, run)
+        except Exception:
+            _log.exception("outcome recording failed for run %s", run.id)
+
     def _refresh_job_costs(self, session, run_id: str) -> None:
         """Pull provider-reported spend onto the job rows, best-effort.
 
@@ -823,7 +855,11 @@ class FoundryOrchestrator:
                     run_id=run_id,
                     event_type=AuditEventType.RUN_BLOCKED,
                     actor_type="foundry",
-                    metadata={"reason": "PR closed without merge", "pr": pr_state.url},
+                    metadata={
+                        "category": "pr_closed_unmerged",
+                        "reason": "PR closed without merge",
+                        "pr": pr_state.url,
+                    },
                 )
             )
             return RunStatus.BLOCKED
@@ -844,7 +880,10 @@ class FoundryOrchestrator:
                     run_id=run_id,
                     event_type=AuditEventType.RUN_BLOCKED,
                     actor_type="foundry",
-                    metadata={"forbidden_files": violations},
+                    metadata={
+                        "category": "forbidden_paths",
+                        "forbidden_files": violations,
+                    },
                 )
             )
             return RunStatus.BLOCKED

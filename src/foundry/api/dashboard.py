@@ -1,8 +1,9 @@
 """The Foundry dashboard: one static page, zero build step, zero new deps.
 
-Read-only visibility over the audit data that already exists: the run list and,
-per run, the full decision timeline (artifacts, audit events, policy decisions,
-agent jobs). All data comes from ``GET /runs`` and ``GET /runs/{id}/timeline``;
+Read-only visibility over the audit data that already exists: the delivery
+metrics strip, the run list and, per run, the full decision timeline
+(artifacts, audit events, policy decisions, agent jobs). All data comes from
+``GET /runs``, ``GET /metrics/delivery`` and ``GET /runs/{id}/timeline``;
 the timeline call carries the bearer token the user pastes once (kept in
 localStorage, never sent anywhere but this API).
 
@@ -86,6 +87,22 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
+  #metrics {
+    display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
+    background: var(--panel); font-size: 13px;
+  }
+  #metrics .stat { margin-right: 18px; white-space: nowrap; }
+  #metrics .stat b { font-size: 15px; }
+  #metrics .stat.good b { color: var(--green); }
+  #metrics .stat.bad b { color: var(--red); }
+  #metrics table {
+    border-collapse: collapse; margin: 8px 0 2px; font-size: 12px;
+  }
+  #metrics th, #metrics td {
+    border: 1px solid var(--border); padding: 3px 10px; text-align: left;
+    color: var(--muted);
+  }
+  #metrics th { color: var(--text); }
 </style>
 </head>
 <body>
@@ -95,6 +112,7 @@ DASHBOARD_HTML = """<!doctype html>
   <input id="token" type="password" placeholder="API token (stored locally)">
   <button id="save">Connect</button>
 </header>
+<div id="metrics"></div>
 <main>
   <div id="runs"></div>
   <div id="detail"><div class="empty">Select a run to see its full decision timeline.</div></div>
@@ -248,14 +266,58 @@ function renderReasons(d) {
   return `<ul class="reasons">${reasons.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`;
 }
 
+function dur(seconds) {
+  if (seconds == null) return "-";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m";
+  if (seconds < 86400) return (seconds / 3600).toFixed(1) + "h";
+  return (seconds / 86400).toFixed(1) + "d";
+}
+
+async function loadMetrics() {
+  const el = $("#metrics");
+  if (!localStorage.getItem("foundry_token")) {
+    el.style.display = "none";  // no token: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/delivery?days=90", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const ttm = m.time_to_merge_seconds || {};
+    const bands = (m.precision_by_confidence_band || []).map((b) => `
+      <tr><td>${esc(b.band)}</td><td>${b.routed}</td><td>${b.merged}</td>
+        <td>${Math.round(b.precision * 100)}%</td></tr>`).join("");
+    const priors = (m.top_priors || []).map((p) => `
+      <tr><td>${esc(p.issue_key_prefix)}</td><td>${esc(p.work_type || "-")}</td>
+        <td>${esc(p.repo)}</td><td>${p.merged} of ${p.routed} merged</td></tr>`).join("");
+    el.innerHTML = `
+      <span class="stat good"><b>${m.prs_shipped}</b> PRs shipped (${m.days}d)</span>
+      <span class="stat bad"><b>${m.blocked}</b> blocked</span>
+      <span class="stat"><b>${m.retries_consumed}</b> retries</span>
+      <span class="stat"><b>${m.escalations}</b> escalations</span>
+      <span class="stat"><b>${dur(ttm.median)}</b> median to merge</span>
+      <span class="stat"><b>${dur(ttm.p90)}</b> p90</span>
+      <span class="stat"><b>${m.total_cost_usd == null ? "-" : "$" + m.total_cost_usd}</b> agent spend</span>
+      ${bands || priors ? `<details><summary>routing accuracy &amp; delivery memory</summary>
+        ${bands ? `<table><tr><th>confidence band</th><th>routed</th><th>merged</th><th>precision</th></tr>${bands}</table>` : ""}
+        ${priors ? `<table><tr><th>team</th><th>work type</th><th>repository</th><th>history</th></tr>${priors}</table>` : ""}
+      </details>` : ""}`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 $("#save").addEventListener("click", () => {
   localStorage.setItem("foundry_token", tokenInput.value.trim());
   loadRuns();
+  loadMetrics();
   $("#detail").innerHTML = '<div class="empty">Select a run to see its full decision timeline.</div>';
 });
 
 loadRuns();
-setInterval(loadRuns, 15000);
+loadMetrics();
+setInterval(() => { loadRuns(); loadMetrics(); }, 15000);
 </script>
 </body>
 </html>

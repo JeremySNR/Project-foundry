@@ -233,3 +233,35 @@ def test_context_invalid_age_and_budget_rejected(tmp_path) -> None:
         path.write_text(content)
         with pytest.raises(ValueError):
             Settings.load(path, env={})
+
+
+def test_memory_defaults_and_yaml(tmp_path) -> None:
+    s = Settings.from_env({})
+    assert s.memory_priors_enabled is True
+    assert s.memory_min_samples == 3
+    assert s.memory_confidence_cap == 89
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "memory:\n"
+        "  priors_enabled: false\n"
+        "  min_samples: 5\n"
+        "  confidence_cap: 80\n"
+    )
+    s = Settings.load(path, env={})
+    assert s.memory_priors_enabled is False
+    assert s.memory_min_samples == 5
+    assert s.memory_confidence_cap == 80
+
+
+def test_memory_validation(tmp_path) -> None:
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text("memory:\n  min_samples: 0\n")
+    with pytest.raises(ValueError, match="memory_min_samples"):
+        Settings.load(path, env={})
+
+    path.write_text("memory:\n  confidence_cap: 101\n")
+    with pytest.raises(ValueError, match="memory_confidence_cap"):
+        Settings.load(path, env={})

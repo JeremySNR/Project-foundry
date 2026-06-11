@@ -129,6 +129,19 @@ ACTIVE_RUN_STATUSES = frozenset(
     }
 )
 
+# Run states that are finished. A run in one of these states never re-enters an
+# active state (a fresh trigger starts a *new* run), which is what makes a
+# single recorded outcome per run sound.
+TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.NEEDS_CLARIFICATION,
+        RunStatus.COMPLETE,
+        RunStatus.BLOCKED,
+        RunStatus.EXECUTION_FAILED,
+        RunStatus.REJECTED,
+    }
+)
+
 # Confidence threshold (0-100) below which a repository match cannot be trusted
 # to start autonomous work. Sourced from the build plan's minimum policy rules.
 REPO_CONFIDENCE_THRESHOLD = 70
