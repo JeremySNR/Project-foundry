@@ -41,7 +41,7 @@ Know what is smart and what is deliberately dumb before you "improve" anything:
 | --- | --- | --- |
 | Ticket readiness / AC extraction | Regex + structure heuristics (default) **or** OpenAI structured output (`analyzer.provider: openai`) | `engines/analyzer.py`, `engines/openai_analyzer.py` |
 | Work-type classification | Keyword-hit counting | `engines/analyzer.py` |
-| Risk classification | Hardcoded keyword lists on ticket text; `fnmatch` globs on PR diff paths | `engines/risk.py` |
+| Risk classification | Hardcoded keyword lists on ticket text + `fnmatch` globs on PR diff paths (default) **or** an LLM pass with cited evidence (`risk.provider: llm`). The heuristics are a hard floor: the LLM may only escalate (add areas, raise the level), never downgrade — enforced in the classifier before the policy gate, so the policy engine/Rego are untouched. Evidence lands in the `RiskAssessment` artifact and `risk.escalated` event metadata. LLM failures degrade to the floor, recorded in the artifact. | `engines/risk.py`, `engines/llm_risk.py` |
 | Repo routing | Tiered: explicit ticket association (conf 90) > delivery-memory priors (capped 89) > catalog IDF-token scoring (stale-capped 65) > legacy YAML keywords. Lexical, not semantic. With `context.provider: code`, the synced file tree becomes a scored field and the bundle carries `RepoCodeFacts` (test layout, CODEOWNERS, manifests) + candidate files + inferred test commands; reasons cite concrete paths. Same confidence tiers/caps — code evidence never adds a tier. | `engines/enrichment.py`, `engines/code_context.py`, `catalog/`, `memory/priors.py` |
 | Planning | Template rendering — steps are "Satisfy acceptance criterion: X". No file-level analysis. | `engines/planner.py` |
 | Delivery memory | Outcomes derived purely from the audit trail; Beta-smoothed routing priors (min 3 samples, >50% success); ROI metrics API | `memory/` |
@@ -54,7 +54,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | Path | What it is |
 | --- | --- |
 | `schemas/` | Pydantic contracts for every artifact a run produces (`extra="forbid"` — changes here are API changes; update consumers in the same PR) |
-| `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam |
+| `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam + `llm_risk.py` escalate-only LLM risk classifiers |
 | `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, forbidden globs, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally) |
 | `policy/foundry.rego` | OPA mirror of the Python engine — **must change in lock-step**, tests on both sides |
 | `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows |
@@ -111,7 +111,8 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   still read no code, and code facts only exist after a `--code-facts` sync.
 - Plans are templated; the bundle now carries candidate files and code facts, but
   the planner does not yet use them for file-level steps (roadmap #3).
-- Risk-from-ticket is keyword matching (risk-from-diff globs are precise).
+- Risk-from-ticket is keyword matching by default (risk-from-diff globs are
+  precise); `risk.provider: llm` adds judgment + cited evidence, escalate-only.
 - Single-tenant DB; approvers are static config (no SSO/SCIM); no rate limiting.
 - No DB-level idempotency on intake — simultaneous webhooks for one issue can race.
 - Temporal driver unproven against a live server; inline driver is production path.

@@ -24,7 +24,7 @@ Status values: `not started` | `in progress (branch, who/what)` | `blocked (why)
 
 ## 1. Code-aware context engine
 
-**Status:** in progress (`claude/roadmap-top-item-plan-qxbema`, Claude Code)
+**Status:** done (merged as commit `2fc27ba`)
 
 The highest-leverage build: it upgrades routing, risk, planning, and the policy
 gate at once. At enrichment time, gather real code facts for candidate repos —
@@ -42,7 +42,7 @@ README's "which files, what tests" claim is unmet. Plugs into the existing
 
 ## 2. LLM-backed risk classification with cited evidence
 
-**Status:** not started
+**Status:** done (`claude/roadmap-research-plan-3bu7vc`, Claude Code)
 
 Replace `_SENSITIVE_KEYWORDS` substring matching (`engines/risk.py`) with a
 model pass that writes its reasoning into the audit trail ("touches session
@@ -50,11 +50,11 @@ issuance in `auth/tokens.py`"). The keyword heuristic stays as a deterministic
 floor: the LLM may only escalate risk, never downgrade it. The gate is the
 product; its judgment must be better than `"stripe" in text`.
 
-- [ ] `LlmRiskClassifier` behind the existing engine seam, mirroring the `OpenAITicketAnalyzer` pattern (structured output, validation retry, fake for tests)
-- [ ] Heuristic floor enforced: combined risk = max(heuristic, LLM)
-- [ ] Risk artifacts carry evidence strings into the audit trail and dashboard timeline
-- [ ] Works on both ticket-stage and diff-stage classification
-- [ ] Config: `risk.provider: heuristic | llm` with heuristic default
+- [x] `LlmRiskClassifier` behind the existing engine seam, mirroring the `OpenAITicketAnalyzer` pattern (structured output, validation retry, fake for tests)
+- [x] Heuristic floor enforced: combined risk = max(heuristic, LLM)
+- [x] Risk artifacts carry evidence strings into the audit trail and dashboard timeline (`RiskAssessment.evidence`, `risk.escalated` metadata)
+- [x] Works on both ticket-stage and diff-stage classification (`LlmRiskClassifier`, `LlmDiffRiskClassifier` behind the new `DiffRiskClassifier` seam)
+- [x] Config: `risk.provider: heuristic | llm` with heuristic default
 
 ## 3. Real planning (file-level, convention-aware)
 

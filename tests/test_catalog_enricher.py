@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRepoCatalogEntry
 from foundry.engines import HeuristicAnalyzer
 from foundry.engines.enrichment import CatalogContextEnricher
-from foundry.schemas.ticket import LinkedResource, RawTicket
+from foundry.schemas.context import ContextBundle
+from foundry.schemas.ticket import RawTicket
 
 
 def _engine_and_sf():
@@ -71,7 +71,7 @@ def _ticket(title: str = "", description: str = "", known: list[str] | None = No
     )
 
 
-def _enrich(sf, ticket: RawTicket, **kwargs) -> "ContextBundle":
+def _enrich(sf, ticket: RawTicket, **kwargs) -> ContextBundle:
     analysis = HeuristicAnalyzer().analyse(ticket)
     enricher = CatalogContextEnricher(sf, now=lambda: _NOW, **kwargs)
     return enricher.enrich(ticket, analysis)

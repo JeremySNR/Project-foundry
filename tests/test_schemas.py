@@ -111,3 +111,19 @@ def test_delivery_plan_step_must_be_positive() -> None:
                 ],
             }
         )
+
+
+def test_risk_assessment_without_evidence_field_still_validates() -> None:
+    """Artifacts recorded before the evidence field existed must load back."""
+    from foundry.schemas.risk import RiskAssessment
+
+    legacy = {
+        "overall_risk": "high",
+        "risk_reasons": ["Ticket text suggests it touches 'auth'."],
+        "sensitive_areas": {"auth": True},
+        "allowed_agent_mode": "human_only",
+        "required_approvals": ["engineering"],
+        "policy_decision_id": None,
+    }
+    risk = RiskAssessment.model_validate(legacy)
+    assert risk.evidence == []

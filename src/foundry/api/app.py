@@ -841,6 +841,17 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         if settings.use_openai_analyzer
         else None
     )
+    risk_classifier = None
+    diff_risk_classifier = None
+    if settings.risk_provider == "llm":
+        from foundry.engines.llm import OpenAIStructuredLLM
+        from foundry.engines.llm_risk import LlmDiffRiskClassifier, LlmRiskClassifier
+
+        risk_llm = OpenAIStructuredLLM(model=settings.risk_model)
+        risk_classifier = LlmRiskClassifier(risk_llm)
+        diff_risk_classifier = LlmDiffRiskClassifier(
+            risk_llm, settings.sensitive_globs_map
+        )
     tracker = None
     if settings.tracker_provider == "github_issues":
         if not settings.github_api_token:
@@ -903,6 +914,8 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
     return FoundryOrchestrator(
         session_factory,
         analyzer=analyzer,
+        risk_classifier=risk_classifier,
+        diff_risk_classifier=diff_risk_classifier,
         enricher=enricher,
         issue_tracker=tracker,
         provider=build_provider(settings, tracker),
