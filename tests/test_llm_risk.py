@@ -169,6 +169,31 @@ def test_persistent_llm_failure_degrades_to_floor_loudly() -> None:
     )
 
 
+class _RaisingClient:
+    """Fake OpenAI client surface whose API call raises a raw SDK-style error."""
+
+    class chat:  # noqa: N801 - mimics the SDK attribute path
+        class completions:  # noqa: N801
+            @staticmethod
+            def create(**kwargs):
+                raise RuntimeError("429 Too Many Requests (simulated SDK error)")
+
+
+def test_raw_sdk_exception_degrades_ticket_classifier_to_floor() -> None:
+    # Issue #12: openai.RateLimitError etc. used to propagate raw past the
+    # LLMError catch and crash intake. Through the wrapped OpenAIStructuredLLM
+    # seam they now degrade to the heuristic floor like any other LLM failure.
+    from foundry.engines.llm import OpenAIStructuredLLM
+
+    ticket = _ready_ticket()
+    analysis, context = _analysed(ticket)
+    llm = OpenAIStructuredLLM(client=_RaisingClient())
+    risk = LlmRiskClassifier(llm).classify(ticket, analysis, context)
+    baseline = HeuristicRiskClassifier().classify(ticket, analysis, context)
+    assert risk.overall_risk is baseline.overall_risk
+    assert any("unavailable" in r for r in risk.risk_reasons)
+
+
 # -- ticket stage: prompt hygiene --------------------------------------------------
 
 
@@ -244,6 +269,82 @@ def test_diff_llm_failure_falls_back_to_globs() -> None:
         ["billing/charge.py"]
     )
     assert findings.areas == {"payments": ["billing/charge.py"]}
+
+
+def test_diff_raw_sdk_exception_falls_back_to_globs() -> None:
+    from foundry.engines.llm import OpenAIStructuredLLM
+
+    llm = OpenAIStructuredLLM(client=_RaisingClient())
+    findings = LlmDiffRiskClassifier(llm, _GLOBS).classify_diff(
+        ["billing/charge.py", "src/ui/button.tsx"]
+    )
+    assert findings.areas == {"payments": ["billing/charge.py"]}
+
+
+def test_raw_sdk_exception_never_breaks_record_pr() -> None:
+    # Issue #12's worst consequence: an OpenAI rate limit inside record_pr ->
+    # _unexpected_sensitive_areas aborted the whole PR webhook event and lost
+    # its audit rows. The wrapped seam keeps PR-event processing alive.
+    from foundry.agents.manual import InMemoryFakeProvider
+    from foundry.engines.llm import OpenAIStructuredLLM
+    from foundry.schemas.common import PRStatus, RunStatus
+    from foundry.schemas.pr import PullRequestState
+
+    provider = InMemoryFakeProvider()
+    orch = FoundryOrchestrator(
+        _session_factory(),
+        provider=provider,
+        diff_risk_classifier=LlmDiffRiskClassifier(
+            OpenAIStructuredLLM(client=_RaisingClient()), _GLOBS
+        ),
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    final = provider.run(job.job_id)
+    pr = PullRequestState(
+        repo="customer-web",
+        pr_number=1,
+        url=final.pr_url,
+        branch=final.branch,
+        status=PRStatus.OPEN,
+        files_changed=["src/features/favourites/index.ts"],
+    )
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
+
+
+# -- the floor when it is a custom classifier ----------------------------------------
+
+
+class _CustomFloor:
+    """A floor whose risk is NOT encoded in sensitive-area flags - e.g. fed by
+    an external scanner. _combine must not undercut it (issue #12, latent)."""
+
+    def classify(self, ticket, analysis, context):
+        from foundry.schemas.risk import RiskAssessment, SensitiveAreas
+
+        return RiskAssessment(
+            overall_risk=OverallRisk.HIGH,
+            risk_reasons=["external scanner flagged this ticket"],
+            sensitive_areas=SensitiveAreas(),
+            allowed_agent_mode=AgentMode.HUMAN_ONLY,
+            required_approvals=[ApprovalRole.SECURITY],
+            evidence=[],
+        )
+
+
+def test_custom_floor_risk_approvals_and_mode_survive_combine() -> None:
+    ticket = _ready_ticket()
+    analysis, context = _analysed(ticket)
+    # The LLM sees nothing; the combined area flags are all false, so before
+    # the fix the recompute-from-flags dropped the floor's HIGH/SECURITY/mode.
+    llm = FakeStructuredLLM([_llm_response(overall_risk="low")])
+    risk = LlmRiskClassifier(llm, floor=_CustomFloor()).classify(
+        ticket, analysis, context
+    )
+    assert risk.overall_risk is OverallRisk.HIGH
+    assert ApprovalRole.SECURITY in risk.required_approvals
+    assert risk.allowed_agent_mode is AgentMode.HUMAN_ONLY
 
 
 # -- orchestrator drop-in -----------------------------------------------------------
