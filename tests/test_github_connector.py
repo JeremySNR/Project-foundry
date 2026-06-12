@@ -40,13 +40,50 @@ def test_draft_and_merged_status() -> None:
 def test_files_enriched_via_transport() -> None:
     def transport(method: str, path: str):
         assert method == "GET"
-        assert path == "/repos/o/customer-web/pulls/7/files"
+        assert path == "/repos/o/customer-web/pulls/7/files?per_page=100&page=1"
         return [{"filename": "src/a.ts"}, {"filename": "migrations/x.sql"}]
 
     state = GitHubConnector(transport=transport).pr_state_from_event(
         "pull_request", _pr_payload()
     )
     assert state.files_changed == ["src/a.ts", "migrations/x.sql"]
+
+
+def test_list_pr_files_paginates_until_short_page() -> None:
+    """A forbidden file beyond the first page must still reach the gate."""
+    pages = {
+        1: [{"filename": f"src/file_{i}.py"} for i in range(100)],
+        2: [{"filename": f"src/more_{i}.py"} for i in range(49)]
+        + [{"filename": "migrations/0042.py"}],
+    }
+    requested: list[str] = []
+
+    def transport(method: str, path: str):
+        requested.append(path)
+        page = int(path.rsplit("page=", 1)[1])
+        return pages[page]
+
+    files = GitHubConnector(transport=transport).list_pr_files("o/customer-web", 7)
+    assert len(files) == 150
+    assert "migrations/0042.py" in files
+    assert requested == [
+        "/repos/o/customer-web/pulls/7/files?per_page=100&page=1",
+        "/repos/o/customer-web/pulls/7/files?per_page=100&page=2",
+    ]
+
+
+def test_list_pr_files_stops_after_exact_page_boundary() -> None:
+    """Exactly 100 files: one follow-up request returning empty, then stop."""
+    pages = {
+        1: [{"filename": f"src/file_{i}.py"} for i in range(100)],
+        2: [],
+    }
+
+    def transport(method: str, path: str):
+        return pages[int(path.rsplit("page=", 1)[1])]
+
+    files = GitHubConnector(transport=transport).list_pr_files("o/customer-web", 7)
+    assert len(files) == 100
 
 
 def test_bot_review_maps_to_bot_reviewed() -> None:
@@ -83,7 +120,9 @@ def test_unhandled_event_returns_none() -> None:
 
 def test_failing_check_summaries_collects_failures() -> None:
     def transport(method, path):
-        assert path == "/repos/o/customer-web/check-suites/99/check-runs"
+        assert path == (
+            "/repos/o/customer-web/check-suites/99/check-runs?per_page=100&page=1"
+        )
         return {
             "check_runs": [
                 {
@@ -131,3 +170,38 @@ def test_check_suite_failure_attaches_summaries_via_transport() -> None:
 
 def test_failing_check_summaries_empty_without_transport() -> None:
     assert GitHubConnector().failing_check_summaries("o/r", 1) == ""
+
+
+def test_failing_check_summaries_paginates_until_short_page() -> None:
+    """A failing check beyond the first page still reaches remediation context."""
+    pages = {
+        1: {
+            "check_runs": [
+                {"name": f"check-{i}", "conclusion": "success", "output": {}}
+                for i in range(100)
+            ]
+        },
+        2: {
+            "check_runs": [
+                {
+                    "name": "slow suite",
+                    "conclusion": "failure",
+                    "output": {"summary": "3 tests failed"},
+                }
+            ]
+        },
+    }
+    requested: list[str] = []
+
+    def transport(method, path):
+        requested.append(path)
+        return pages[int(path.rsplit("page=", 1)[1])]
+
+    summary = GitHubConnector(transport=transport).failing_check_summaries(
+        "o/customer-web", 99
+    )
+    assert "slow suite: 3 tests failed" in summary
+    assert requested == [
+        "/repos/o/customer-web/check-suites/99/check-runs?per_page=100&page=1",
+        "/repos/o/customer-web/check-suites/99/check-runs?per_page=100&page=2",
+    ]
