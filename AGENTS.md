@@ -16,9 +16,13 @@ policy-gated, capped, budgeted, and fully audited. It deliberately **stops at a
 reviewed PR**: no auto-merge, no deploys, no migrations. The safety gates are the
 product, not overhead. Canonical product statement: `VISION.md`.
 
-**Looking for work, or about to start some?** `ROADMAP.md` is the prioritized
-backlog with per-item status tracking — claim an item there and keep its status
-current in the same PR as the work.
+**Looking for work, or about to start some?** The backlog lives in
+[GitHub Issues](https://github.com/JeremySNR/Project-foundry/issues): bugs and
+hardening are labelled `bug`, the strategic roadmap items `enhancement`. Assign
+yourself (or comment) before starting, work one issue — or one clearly-scoped
+slice of one — per PR, and split slices into sub-issues rather than new
+top-level items. New top-level roadmap items need a human decision, not an
+agent's.
 
 ## The run lifecycle (what the orchestrator does)
 
@@ -110,7 +114,7 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   The `code` provider reads file trees/CODEOWNERS/manifests, but `static`/`catalog`
   still read no code, and code facts only exist after a `--code-facts` sync.
 - Plans are templated; the bundle now carries candidate files and code facts, but
-  the planner does not yet use them for file-level steps (roadmap #3).
+  the planner does not yet use them for file-level steps (issue #30).
 - Risk-from-ticket is keyword matching by default (risk-from-diff globs are
   precise); `risk.provider: llm` adds judgment + cited evidence, escalate-only.
 - Single-tenant DB; approvers are static config (no SSO/SCIM); no rate limiting.
