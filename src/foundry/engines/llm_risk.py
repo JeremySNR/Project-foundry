@@ -20,7 +20,7 @@ from typing import Literal, Mapping, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from foundry.schemas.analysis import TicketAnalysis
-from foundry.schemas.common import SENSITIVE_AREA_KEYS, OverallRisk
+from foundry.schemas.common import SENSITIVE_AREA_KEYS, AgentMode, ApprovalRole, OverallRisk
 from foundry.schemas.context import ContextBundle
 from foundry.schemas.risk import (
     DiffRiskFindings,
@@ -38,6 +38,13 @@ _RISK_RANK = {
     OverallRisk.MEDIUM: 1,
     OverallRisk.HIGH: 2,
     OverallRisk.BLOCKED: 3,
+}
+
+# Restrictiveness order: DRAFT_PR grants the most autonomy, HUMAN_ONLY none.
+_MODE_RANK = {
+    AgentMode.DRAFT_PR: 0,
+    AgentMode.ANALYSIS_ONLY: 1,
+    AgentMode.HUMAN_ONLY: 2,
 }
 
 # Mirrors SENSITIVE_AREA_KEYS so the JSON schema sent to the model enumerates
@@ -230,10 +237,18 @@ class LlmRiskClassifier:
         # same level/approvals/mode mapping the heuristic enforces - and so a
         # low LLM verdict can never undercut the floor (max of the two). The
         # BLOCKED routing-confidence check re-emerges from _overall_risk here
-        # no matter what the model said.
+        # no matter what the model said. baseline.overall_risk joins the max
+        # because the constructor accepts any floor: a custom classifier may
+        # carry risk that isn't encoded in its area flags, and recomputing
+        # from flags alone would silently undercut it.
         floor_overall = HeuristicRiskClassifier._overall_risk(combined, context)
         llm_overall = OverallRisk(output.overall_risk)
-        overall = max(floor_overall, llm_overall, key=_RISK_RANK.__getitem__)
+        overall = max(
+            floor_overall,
+            llm_overall,
+            baseline.overall_risk,
+            key=_RISK_RANK.__getitem__,
+        )
 
         reasons = list(baseline.risk_reasons)
         evidence = list(baseline.evidence)
@@ -247,12 +262,27 @@ class LlmRiskClassifier:
                 RiskEvidence(area="overall", detail=output.summary, source="llm")
             )
 
+        # Same floor discipline for approvals and agent mode: union the
+        # baseline's required approvals (preserving order, de-duplicated) and
+        # never grant more autonomy than the baseline allowed.
+        required: list[ApprovalRole] = HeuristicRiskClassifier._required_approvals(
+            combined
+        )
+        for role in baseline.required_approvals:
+            if role not in required:
+                required.append(role)
+        mode = max(
+            HeuristicRiskClassifier._agent_mode(overall, combined),
+            baseline.allowed_agent_mode,
+            key=_MODE_RANK.__getitem__,
+        )
+
         return RiskAssessment(
             overall_risk=overall,
             risk_reasons=reasons,
             sensitive_areas=combined,
-            allowed_agent_mode=HeuristicRiskClassifier._agent_mode(overall, combined),
-            required_approvals=HeuristicRiskClassifier._required_approvals(combined),
+            allowed_agent_mode=mode,
+            required_approvals=required,
             evidence=evidence,
         )
 

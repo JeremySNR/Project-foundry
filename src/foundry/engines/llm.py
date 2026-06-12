@@ -76,23 +76,29 @@ class OpenAIStructuredLLM:
 
     def generate(
         self, *, system: str, user: str, schema: dict[str, Any], schema_name: str
-    ) -> dict[str, Any]:  # pragma: no cover - exercised against the live API
+    ) -> dict[str, Any]:
         client = self._ensure_client()
-        response = client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "schema": schema,
-                    "strict": self._strict,
+        try:
+            response = client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "schema": schema,
+                        "strict": self._strict,
+                    },
                 },
-            },
-        )
+            )
+        except Exception as exc:
+            # Callers' degrade-to-floor contracts catch LLMError only; a raw
+            # RateLimitError/APITimeoutError/connection error must not leak
+            # past this seam (it would abort intake or PR-event processing).
+            raise LLMError(f"OpenAI API call failed: {exc}") from exc
         content = response.choices[0].message.content
         if not content:
             raise LLMError("OpenAI returned an empty response")
