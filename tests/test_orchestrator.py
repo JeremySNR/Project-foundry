@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from foundry.agents.manual import InMemoryFakeProvider
-from foundry.connectors import InMemoryIssueTracker
+from foundry.connectors import GitHubConnector, InMemoryIssueTracker
 from foundry.db import (
     FoundryAgentJob,
     FoundryArtifact,
@@ -132,6 +132,46 @@ def test_forbidden_file_blocks_run(session_factory) -> None:
         files_changed=["migrations/0002_add_table.sql"],
     )
     assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+
+
+def test_forbidden_file_on_second_page_blocks_run(session_factory) -> None:
+    """A forbidden file at position 101+ in a large PR still hard-blocks.
+
+    Regression for the unpaginated file listing: the connector must fetch every
+    page of the PR's files so the forbidden-path gate sees the full diff.
+    """
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+
+    pages = {
+        1: [{"filename": f"src/file_{i}.ts"} for i in range(100)],
+        2: [{"filename": "migrations/0042_drop_users.sql"}],
+    }
+
+    def transport(method: str, path: str):
+        return pages[int(path.rsplit("page=", 1)[1])]
+
+    payload = {
+        "pull_request": {
+            "number": 2,
+            "html_url": "https://github.com/example/customer-web/pull/2",
+            "head": {"ref": "foundry/lin-123"},
+            "state": "open",
+            "draft": False,
+            "merged": False,
+        },
+        "repository": {"full_name": "customer-web"},
+    }
+    state = GitHubConnector(transport=transport).pr_state_from_event(
+        "pull_request", payload
+    )
+    assert state is not None
+    assert "migrations/0042_drop_users.sql" in state.files_changed
+    assert orch.record_pr(run_id, state) is RunStatus.BLOCKED
 
 
 def test_oversized_pr_requires_review(session_factory) -> None:

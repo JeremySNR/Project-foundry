@@ -39,6 +39,11 @@ _REVIEW_STATE = {
     "changes_requested": ReviewStatus.CHANGES_REQUESTED,
 }
 
+# GitHub defaults to 30 items per page; the file list feeds the forbidden-path
+# hard block, so truncation would let files beyond the first page bypass the
+# gate. Page at the API maximum and loop until a short page.
+_PER_PAGE = 100
+
 
 class GitHubConnector:
     def __init__(self, *, transport: Transport | None = None) -> None:
@@ -47,8 +52,19 @@ class GitHubConnector:
     def list_pr_files(self, repo: str, number: int) -> list[str]:
         if self._transport is None:
             return []
-        data = self._transport("GET", f"/repos/{repo}/pulls/{number}/files")
-        return [f["filename"] for f in data if f.get("filename")]
+        files: list[str] = []
+        page = 1
+        while True:
+            data = self._transport(
+                "GET",
+                f"/repos/{repo}/pulls/{number}/files"
+                f"?per_page={_PER_PAGE}&page={page}",
+            )
+            batch = data or []
+            files.extend(f["filename"] for f in batch if f.get("filename"))
+            if len(batch) < _PER_PAGE:
+                return files
+            page += 1
 
     def failing_check_summaries(self, repo: str, suite_id: int) -> str:
         """Names + output summaries of failed check runs, for remediation context.
@@ -58,22 +74,29 @@ class GitHubConnector:
         """
         if self._transport is None or not suite_id:
             return ""
-        data = self._transport(
-            "GET", f"/repos/{repo}/check-suites/{suite_id}/check-runs"
-        )
         lines: list[str] = []
-        for check in data.get("check_runs", []) or []:
-            if (check.get("conclusion") or "").lower() not in {
-                "failure",
-                "timed_out",
-                "cancelled",
-            }:
-                continue
-            name = check.get("name", "unnamed check")
-            output = check.get("output") or {}
-            summary = (output.get("summary") or output.get("title") or "").strip()
-            lines.append(f"- {name}: {summary}" if summary else f"- {name}")
-        return "\n".join(lines)
+        page = 1
+        while True:
+            data = self._transport(
+                "GET",
+                f"/repos/{repo}/check-suites/{suite_id}/check-runs"
+                f"?per_page={_PER_PAGE}&page={page}",
+            )
+            batch = (data or {}).get("check_runs") or []
+            for check in batch:
+                if (check.get("conclusion") or "").lower() not in {
+                    "failure",
+                    "timed_out",
+                    "cancelled",
+                }:
+                    continue
+                name = check.get("name", "unnamed check")
+                output = check.get("output") or {}
+                summary = (output.get("summary") or output.get("title") or "").strip()
+                lines.append(f"- {name}: {summary}" if summary else f"- {name}")
+            if len(batch) < _PER_PAGE:
+                return "\n".join(lines)
+            page += 1
 
     def pr_state_from_event(
         self, event: str, payload: dict[str, Any]
