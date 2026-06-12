@@ -368,6 +368,7 @@ class FoundryOrchestrator:
     ) -> None:
         with self._sf() as session:
             run = self._require_run(session, run_id)
+            self._refuse_if_terminal(run)
             run.status = status
             run.current_step = status.value
             session.add(
@@ -551,6 +552,7 @@ class FoundryOrchestrator:
         """Mark a run as failed when the agent crashes without creating a PR."""
         with self._sf() as session:
             run = self._require_run(session, run_id)
+            self._refuse_if_terminal(run)
             run.status = RunStatus.EXECUTION_FAILED
             run.current_step = "failed"
             session.add(
@@ -1036,6 +1038,16 @@ class FoundryOrchestrator:
         if run is None:
             raise OrchestratorError(f"run {run_id} not found")
         return run
+
+    @staticmethod
+    def _refuse_if_terminal(run: FoundryRun) -> None:
+        """Terminal runs never re-enter any state (schemas/common.py): allowing a
+        second termination would overwrite the single recorded outcome and poison
+        the routing priors."""
+        if run.status in TERMINAL_RUN_STATUSES:
+            raise OrchestratorError(
+                f"run {run.id} is already terminal ('{run.status.value}')"
+            )
 
     def _latest_artifact(
         self, session, run_id: str, artifact_type: ArtifactType

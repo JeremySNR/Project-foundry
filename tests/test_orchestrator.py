@@ -15,7 +15,7 @@ from foundry.db import (
     make_engine,
     make_session_factory,
 )
-from foundry.db.models import ArtifactType
+from foundry.db.models import ArtifactType, FoundryRunOutcome
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.schemas.common import (
     ApprovalRole,
@@ -617,3 +617,75 @@ def test_injected_diff_risk_classifier_escalates_with_evidence(session_factory) 
                 "source": "llm",
             }
         ]
+
+
+# -- terminal-state guards: finished history is immutable -----------------------
+
+
+def _merged_run(session_factory) -> tuple:
+    orch, run_id = _dispatched_run(session_factory)
+    orch.record_pr(run_id, _pr(status=PRStatus.MERGED))
+    assert _status(session_factory, run_id) is RunStatus.COMPLETE
+    return orch, run_id
+
+
+def _outcome_value(session_factory, run_id: str) -> str:
+    with session_factory() as s:
+        return s.get(FoundryRunOutcome, run_id).outcome
+
+
+def test_stop_on_complete_run_is_refused(session_factory) -> None:
+    orch, run_id = _merged_run(session_factory)
+    with pytest.raises(OrchestratorError, match="already terminal"):
+        orch.stop(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.COMPLETE
+    assert _outcome_value(session_factory, run_id) == "merged"
+
+
+def test_reject_on_complete_run_is_refused(session_factory) -> None:
+    orch, run_id = _merged_run(session_factory)
+    with pytest.raises(OrchestratorError, match="already terminal"):
+        orch.reject(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.COMPLETE
+    assert _outcome_value(session_factory, run_id) == "merged"
+
+
+def test_mark_agent_failed_on_complete_run_is_refused(session_factory) -> None:
+    orch, run_id = _merged_run(session_factory)
+    with pytest.raises(OrchestratorError, match="already terminal"):
+        orch.mark_agent_failed(run_id, reason="late crash report")
+    assert _status(session_factory, run_id) is RunStatus.COMPLETE
+    assert _outcome_value(session_factory, run_id) == "merged"
+
+
+def test_stop_on_already_stopped_run_is_refused(session_factory) -> None:
+    orch, run_id = _dispatched_run(session_factory)
+    orch.stop(run_id, user="lead@example.com")
+    with pytest.raises(OrchestratorError, match="already terminal"):
+        orch.stop(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _outcome_value(session_factory, run_id) == "blocked"
+
+
+def test_mark_agent_failed_on_rejected_run_is_refused(session_factory) -> None:
+    orch = _orch(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.reject(run_id, user="lead@example.com")
+    with pytest.raises(OrchestratorError, match="already terminal"):
+        orch.mark_agent_failed(run_id)
+    assert _status(session_factory, run_id) is RunStatus.REJECTED
+    assert _outcome_value(session_factory, run_id) == "rejected"
+
+
+def test_stop_on_active_run_still_blocks_it(session_factory) -> None:
+    orch, run_id = _dispatched_run(session_factory)
+    orch.stop(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _outcome_value(session_factory, run_id) == "blocked"
+
+
+def test_mark_agent_failed_on_running_run_still_fails_it(session_factory) -> None:
+    orch, run_id = _dispatched_run(session_factory)
+    orch.mark_agent_failed(run_id, reason="agent crashed")
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    assert _outcome_value(session_factory, run_id) == "failed"
