@@ -150,3 +150,22 @@ memory:
   # Confidence ceiling for priors (default: 89) - keeps history below an
   # explicit repo association on the ticket (90).
   confidence_cap: 89
+
+compliance:
+  # Compliance evidence packs map a run's recorded chain onto named controls,
+  # exported one-click via 'GET /runs/{id}/evidence' (JSON, or ?format=html).
+  # This is config, not code: uncomment to override the built-in defaults
+  # (SOC 2 CC8.1, ISO/IEC 27001:2022 A.8.32, EU AI Act Article 14). A control
+  # is "satisfied" for a run when every evidence section it names is present.
+  # Valid section names: ticket, analysis, context, plan, risk_assessment,
+  # approvals, policy_decisions, agent_jobs, pr, final_summary, audit_trail,
+  # integrity. An unknown section name is rejected at startup.
+  # control_mappings:
+  #   - framework: "SOC 2"
+  #     control_id: "CC8.1"
+  #     title: "Change management"
+  #     evidence: [ticket, plan, risk_assessment, approvals, policy_decisions, pr, audit_trail]
+  #   - framework: "EU AI Act"
+  #     control_id: "Article 14"
+  #     title: "Human oversight"
+  #     evidence: [risk_assessment, approvals, policy_decisions]

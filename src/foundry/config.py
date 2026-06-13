@@ -21,6 +21,13 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
+from foundry.compliance.controls import (
+    DEFAULT_CONTROL_MAPPINGS,
+    KNOWN_EVIDENCE_SECTIONS,
+    ControlMapping,
+    mappings_from_config,
+)
+
 _TRUE = {"1", "true", "yes", "on"}
 
 DEFAULT_FORBIDDEN_GLOBS = ("infra/**", "migrations/**", "**/.env*", "**/secrets/**")
@@ -135,6 +142,12 @@ class Settings:
     # ordinary work but cannot satisfy sensitive-area approval requirements.
     approvers: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
+    # --- compliance evidence packs (behaviour: yaml) ---
+    # Which evidence sections satisfy which compliance control. Config, not
+    # code: override wholesale via ``compliance.control_mappings``. Section
+    # names are validated against the fixed evidence vocabulary at load time.
+    compliance_control_mappings: tuple[ControlMapping, ...] = DEFAULT_CONTROL_MAPPINGS
+
     # --- context enrichment (behaviour: yaml) ---
     context_provider: str = "static"          # "static" | "catalog" | "code"
     context_org: str | None = None            # GitHub org for foundry-catalog sync
@@ -225,6 +238,14 @@ class Settings:
             raise ValueError(
                 f"memory_confidence_cap must be 0-100, got {self.memory_confidence_cap}"
             )
+        for mapping in self.compliance_control_mappings:
+            unknown_sections = set(mapping.evidence) - KNOWN_EVIDENCE_SECTIONS
+            if unknown_sections:
+                raise ValueError(
+                    f"compliance control {mapping.control_id!r} references unknown "
+                    f"evidence section(s): {sorted(unknown_sections)}; valid sections "
+                    f"are {sorted(KNOWN_EVIDENCE_SECTIONS)}"
+                )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -331,6 +352,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         # Legacy form: a flat list of emails, no role grants.
         out["approvers"] = tuple(
             (email, ()) for email in approval["authorised_approvers"]
+        )
+
+    compliance = data.get("compliance", {}) or {}
+    if "control_mappings" in compliance:
+        out["compliance_control_mappings"] = mappings_from_config(
+            compliance["control_mappings"]
         )
 
     memory = data.get("memory", {}) or {}

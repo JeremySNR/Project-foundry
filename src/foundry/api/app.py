@@ -29,6 +29,12 @@ from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func
 
+from foundry.compliance import (
+    DEFAULT_CONTROL_MAPPINGS,
+    ControlMapping,
+    build_evidence_pack,
+    render_evidence_html,
+)
 from foundry.config import Settings
 from foundry.connectors.github import GitHubConnector
 from foundry.connectors.gitlab import GitLabConnector
@@ -132,6 +138,7 @@ def create_app(
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
+    control_mappings: tuple[ControlMapping, ...] | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -165,6 +172,10 @@ def create_app(
     app.state.gitlab_connector = gitlab_connector or GitLabConnector()
     app.state.trigger_label = trigger_label
     app.state.trigger_status = trigger_status
+    # Control mappings for compliance evidence packs (config, never payload).
+    app.state.control_mappings = (
+        DEFAULT_CONTROL_MAPPINGS if control_mappings is None else tuple(control_mappings)
+    )
     # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
     app.state.processed_events = set()
 
@@ -481,6 +492,35 @@ def create_app(
                     for j in jobs
                 ],
             }
+
+    @app.get("/runs/{run_id}/evidence")
+    def run_evidence(
+        run_id: str, request: Request, format: str = "json"
+    ) -> Any:
+        """One-click compliance evidence pack for a run: the full chain (ticket,
+        plan, approvals with identities, policy decisions, diff-risk checks, PR),
+        an integrity verification (recomputed artifact hashes + audit-sequence
+        continuity), and the run's evidence mapped onto configured controls
+        (SOC 2 / ISO 27001 / EU AI Act).
+
+        ``?format=html`` renders a standalone page; the default is JSON. Token-
+        gated like the timeline - the pack contains everything the timeline does.
+        """
+        _require_api_token(app, request)
+        if format not in ("json", "html"):
+            raise HTTPException(
+                status_code=422, detail="format must be 'json' or 'html'"
+            )
+        with app.state.session_factory() as session:
+            run = session.get(FoundryRun, run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            pack = build_evidence_pack(
+                session, run, control_mappings=app.state.control_mappings
+            )
+        if format == "html":
+            return HTMLResponse(render_evidence_html(pack))
+        return pack
 
     @app.get("/metrics/delivery")
     def metrics_delivery(request: Request, days: int = 90) -> dict[str, Any]:
@@ -986,6 +1026,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         gitlab_connector=gitlab_connector,
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
+        control_mappings=settings.compliance_control_mappings,
     )
 
 

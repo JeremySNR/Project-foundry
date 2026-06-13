@@ -79,7 +79,7 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
 | `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, **Cursor** two ways, **Claude Code** via GitHub Actions, or *any* agent behind a signed webhook (see below). |
 | `foundry.connectors` | Adapters for the tools Foundry talks to. Trackers: **Linear**, **GitHub Issues**, **Jira**. SCMs: **GitHub** and **GitLab** (watch the PR/MR, pull failing check summaries). |
-| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, approval commands, run status, the per-run decision timeline, and the dashboard. |
+| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, approval commands, run status, the per-run decision timeline, compliance evidence packs (`GET /runs/{id}/evidence`), and the dashboard. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
 ### The Cursor handoff (the nice bit)
@@ -114,6 +114,10 @@ A PR that opens and then fails CI used to be where automation stalled. Now: a fa
 ### The dashboard
 
 `GET /dashboard` serves a zero-build, read-only page over the audit data: every run with status badges, and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`).
+
+### Compliance evidence packs
+
+`GET /runs/{id}/evidence` (token-gated, `?format=html` for a rendered page) exports a single run's full chain - ticket, plan, risk assessment, approvals *with identities and granted roles*, every policy decision, agent jobs and the PR - as a one-click procurement artifact. It bundles an **integrity check**: each artifact's content hash is recomputed from its stored payload and the append-only audit sequence is checked for gaps, so an auditor can confirm nothing was altered after the fact (it's content-addressed verification, not a cross-row linked hash chain - we don't oversell it). The run's evidence is mapped onto named controls (SOC 2 CC8.1, ISO/IEC 27001:2022 A.8.32, EU AI Act Article 14 by default), each marked satisfied or showing exactly which evidence section is missing. The mappings are **config, not code** - override them under `compliance.control_mappings` in `foundry.yaml`. (Follow-ups tracked on the issue: a PDF renderer and an org-wide date-range export.)
 
 ### Delivery memory
 
@@ -182,7 +186,7 @@ Secrets via env:
 | `FOUNDRY_JIRA_BASE_URL` / `..._EMAIL` / `..._API_TOKEN` | Jira Cloud credentials when the tracker is `jira`. |
 | `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
 | `FOUNDRY_GITLAB_API_TOKEN` / `..._BASE` | Fetches MR diffs so GitLab MRs run the same file-based gates as GitHub PRs (without it, MRs are diff-blind). `..._BASE` overrides the API root for self-managed GitLab. |
-| `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
+| `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API, the compliance evidence-pack endpoint and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
 | `FOUNDRY_AGENT_WEBHOOK_URL` / `..._SECRET` | Needed when the provider is `webhook`; the secret HMAC-signs the job payload. |
