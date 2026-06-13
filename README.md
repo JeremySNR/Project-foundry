@@ -141,7 +141,7 @@ risk:
 policy:
   repo_confidence_threshold: 70   # block work we can't confidently place in a repo
   max_files_changed: 12           # bigger PRs go to a human
-  forbidden_globs: ["infra/**", "migrations/**", "**/.env*", "**/secrets/**"]
+  forbidden_globs: ["infra/**", "**/infra/**", "migrations/**", "**/migrations/**", "**/.env*", "**/secrets/**"]
   sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
     auth: ["**/auth/**", "**/login/**", "**/sso/**"]
     payments: ["**/billing/**", "**/stripe/**"]

@@ -193,7 +193,21 @@ class FoundryOrchestrator:
         payload = self._policy_input(PolicyAction.START_AGENT, analysis, context, risk)
         decision = self._policy.evaluate(payload)
 
-        status = self._post_plan_status(analysis, risk, decision.allowed)
+        # Distinguish "denied, but a human approval would unlock dispatch" from
+        # "denied no matter who approves" (e.g. DB migrations / prod deploys are
+        # blocked in this version regardless of approvals). Only the latter should
+        # park at BLOCKED; the former is the normal road to WAITING_APPROVAL. We
+        # learn which by re-running the gate with every required approval granted.
+        permanently_blocked = False
+        if not decision.allowed:
+            with_approvals = payload.model_copy(
+                update={
+                    "approval": {role.value: True for role in decision.required_approvals}
+                }
+            )
+            permanently_blocked = not self._policy.evaluate(with_approvals).allowed
+
+        status = self._post_plan_status(analysis, risk, permanently_blocked)
 
         try:
             with self._sf() as session:
@@ -254,14 +268,29 @@ class FoundryOrchestrator:
                         )
                     )
                 elif status is RunStatus.BLOCKED:
-                    session.add(
-                        build_audit_event(
-                            run_id=run_id,
-                            event_type=AuditEventType.RUN_BLOCKED,
-                            actor_type="foundry",
-                            metadata={"category": "unroutable"},
+                    # Two routes to BLOCKED at intake: the work couldn't be scoped
+                    # to a repo (unroutable), or the policy gate denies it no matter
+                    # who approves (policy_denied). Record the decision in the latter
+                    # case so the trail shows *why* approval was never offered.
+                    if risk.overall_risk is OverallRisk.BLOCKED:
+                        session.add(
+                            build_audit_event(
+                                run_id=run_id,
+                                event_type=AuditEventType.RUN_BLOCKED,
+                                actor_type="foundry",
+                                metadata={"category": "unroutable"},
+                            )
                         )
-                    )
+                    else:
+                        session.add(
+                            build_audit_event(
+                                run_id=run_id,
+                                event_type=AuditEventType.RUN_BLOCKED,
+                                actor_type="foundry",
+                                output_content=decision,
+                                metadata={"category": "policy_denied"},
+                            )
+                        )
                 self._record_outcome_if_terminal(session, run)
                 session.commit()
         except IntegrityError:
@@ -317,7 +346,9 @@ class FoundryOrchestrator:
 
     @staticmethod
     def _post_plan_status(
-        analysis: TicketAnalysis, risk: RiskAssessment, policy_allowed: bool
+        analysis: TicketAnalysis,
+        risk: RiskAssessment,
+        policy_permanently_blocked: bool,
     ) -> RunStatus:
         # Readiness first: an unclear ticket should be clarified before we worry
         # about anything downstream (it usually also lacks a resolvable repo).
@@ -325,6 +356,11 @@ class FoundryOrchestrator:
             return RunStatus.NEEDS_CLARIFICATION
         # The ticket is clear, but the work still can't be scoped to a repo.
         if risk.overall_risk is OverallRisk.BLOCKED:
+            return RunStatus.BLOCKED
+        # The plan is ready and scoped, but the policy gate will refuse dispatch
+        # no matter who approves it. Park at BLOCKED rather than inviting an
+        # approval that dispatch would only convert to BLOCKED anyway.
+        if policy_permanently_blocked:
             return RunStatus.BLOCKED
         # A ready, scoped plan awaits human approval before any agent runs.
         return RunStatus.WAITING_APPROVAL
@@ -503,13 +539,22 @@ class FoundryOrchestrator:
             return run.id if run else None
 
     def find_run_id_for_branch(self, branch: str) -> str | None:
-        """Associate an observed PR back to its run via the agent job's branch."""
+        """Associate an observed PR back to its run via the agent job's branch.
+
+        Only runs in a PR-observable state match, mirroring the issue-key
+        fallback in :meth:`correlate_pr`: a stale or terminal run that once used
+        this branch must not be revived by a late webhook (``record_pr`` would
+        reject it anyway, but filtering here keeps the contract honest and lets
+        the issue-key fallback still find a live run on the same branch name).
+        """
         if not branch:
             return None
         with self._sf() as session:
             job = (
                 session.query(FoundryAgentJob)
+                .join(FoundryRun, FoundryRun.id == FoundryAgentJob.run_id)
                 .filter(FoundryAgentJob.branch == branch)
+                .filter(FoundryRun.status.in_(_PR_OBSERVABLE_STATUSES))
                 .order_by(FoundryAgentJob.started_at.desc())
                 .first()
             )
@@ -693,7 +738,20 @@ class FoundryOrchestrator:
                     f"run {run_id} is '{run.status.value}'; PR events are only "
                     "recorded for runs with a dispatched agent"
                 )
-            first_observation = run.status is RunStatus.AGENT_RUNNING
+            # The first time we ever see a PR for this run emits PR_OPENED; every
+            # later event (including pushes during remediation, when the status is
+            # AGENT_RUNNING again) emits PR_UPDATED. Keying off the status alone
+            # mis-fired PR_OPENED on each remediation push, so key off whether a
+            # PR_STATE artifact already exists.
+            first_observation = (
+                session.query(FoundryArtifact.id)
+                .filter(
+                    FoundryArtifact.run_id == run_id,
+                    FoundryArtifact.artifact_type == ArtifactType.PR_STATE,
+                )
+                .first()
+                is None
+            )
             self._add(session, run_id, ArtifactType.PR_STATE, pr_state)
             session.add(
                 build_audit_event(

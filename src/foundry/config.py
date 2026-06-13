@@ -23,7 +23,19 @@ from typing import Any, Mapping
 
 _TRUE = {"1", "true", "yes", "on"}
 
-DEFAULT_FORBIDDEN_GLOBS = ("infra/**", "migrations/**", "**/.env*", "**/secrets/**")
+# Root-anchored *and* depth-agnostic variants: `migrations/**` only matches a
+# top-level dir, so the `**/...` siblings ensure a nested `services/api/migrations/`
+# is caught by the sticky forbidden-path block too (not just the softer
+# sensitive-area escalation). `**/.env*` and `**/secrets/**` already match at any
+# depth via the `**/` prefix handling in `glob_match`.
+DEFAULT_FORBIDDEN_GLOBS = (
+    "infra/**",
+    "**/infra/**",
+    "migrations/**",
+    "**/migrations/**",
+    "**/.env*",
+    "**/secrets/**",
+)
 DEFAULT_TRIGGER_LABEL = "foundry:candidate"
 DEFAULT_TRIGGER_STATUS = "Ready for AI Analysis"
 
