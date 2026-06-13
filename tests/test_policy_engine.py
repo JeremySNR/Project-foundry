@@ -242,3 +242,147 @@ def test_production_deploy_action_denied_unconditionally() -> None:
         )
     )
     assert decision.allowed is False
+
+
+# -- boundary values: the gate's comparisons are off-by-one sensitive ----------
+
+
+def _start(**risk_repo) -> PolicyInput:
+    base = {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+    }
+    base.update(risk_repo)
+    return PolicyInput.model_validate(base)
+
+
+def test_repo_confidence_exactly_at_threshold_is_allowed() -> None:
+    """The rule is ``confidence < threshold`` (default 70), so exactly 70 passes
+    and 69 fails - the boundary the deny message references."""
+    at = _engine().evaluate(_start(repo={"confidence": 70}))
+    assert at.allowed is True
+    below = _engine().evaluate(_start(repo={"confidence": 69}))
+    assert below.allowed is False
+    assert any("confidence" in r for r in below.reasons)
+
+
+def test_budget_cost_exactly_at_cap_denies() -> None:
+    """``cost_usd >= max_cost_usd`` means reaching the cap (not just exceeding it)
+    denies the retry - the equality case the inline comment relies on."""
+    base = {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+    }
+    at_cap = _engine().evaluate(
+        PolicyInput.model_validate(
+            {**base, "budget": {"cost_usd": 5.0, "max_cost_usd": 5.0}}
+        )
+    )
+    assert at_cap.allowed is False
+    assert any("budget cap" in r for r in at_cap.reasons)
+    # A cent under the cap is still allowed.
+    under = _engine().evaluate(
+        PolicyInput.model_validate(
+            {**base, "budget": {"cost_usd": 4.99, "max_cost_usd": 5.0}}
+        )
+    )
+    assert under.allowed is True
+
+
+def test_retry_attempt_exactly_at_zero_cap_denies() -> None:
+    """With the retry cap set to 0, the very first re-dispatch (attempt 1) is
+    over the cap; attempt 0 (never produced by the orchestrator) is the boundary
+    that is still allowed."""
+    base = {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+    }
+    first_retry = _engine().evaluate(
+        PolicyInput.model_validate(
+            {**base, "retry": {"attempt": 1, "max_attempts": 0}}
+        )
+    )
+    assert first_retry.allowed is False
+    assert any("exceeds the maximum" in r for r in first_retry.reasons)
+    at_boundary = _engine().evaluate(
+        PolicyInput.model_validate(
+            {**base, "retry": {"attempt": 0, "max_attempts": 0}}
+        )
+    )
+    assert at_boundary.allowed is True
+
+
+def test_multi_area_work_requires_every_derived_role() -> None:
+    """auth -> engineering and payments -> security; a run touching both needs
+    *both* roles. A single approval is not enough; both together unlock it."""
+    both_areas = {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "high", "auth": True, "payments": True},
+        "repo": {"confidence": 90},
+    }
+    none = _engine().evaluate(
+        PolicyInput.model_validate({**both_areas, "approval": {}})
+    )
+    assert none.allowed is False
+    assert ApprovalRole.ENGINEERING in none.required_approvals
+    assert ApprovalRole.SECURITY in none.required_approvals
+
+    partial = _engine().evaluate(
+        PolicyInput.model_validate({**both_areas, "approval": {"engineering": True}})
+    )
+    assert partial.allowed is False
+    assert any("security" in r for r in partial.reasons)
+
+    both = _engine().evaluate(
+        PolicyInput.model_validate(
+            {**both_areas, "approval": {"engineering": True, "security": True}}
+        )
+    )
+    assert both.allowed is True
+
+
+# -- autonomous-action coverage: branch/PR/complete are governed, not free -----
+
+
+def test_branch_pr_and_complete_actions_are_governed_like_start_agent() -> None:
+    """``CREATE_BRANCH``/``OPEN_PR``/``MARK_COMPLETE`` are autonomous actions, so
+    the same hard blocks that gate ``START_AGENT`` apply - they are not advisory
+    free passes. (The orchestrator only ever evaluates START_AGENT/RETRY_AGENT
+    today; this pins that the gate would govern them if a path ever did.)"""
+    for action in ("create_branch", "open_pr", "mark_complete"):
+        # An unready, low-confidence ticket is denied for each.
+        denied = _engine().evaluate(
+            PolicyInput.model_validate(
+                {
+                    "action": action,
+                    "ticket": {"readiness": "needs_clarification"},
+                    "risk": {"overall_risk": "low"},
+                    "repo": {"confidence": 10},
+                    "approval": {},
+                }
+            )
+        )
+        assert denied.allowed is False, action
+        # A ready, confident, low-risk ticket passes the same gate.
+        allowed = _engine().evaluate(
+            PolicyInput.model_validate(
+                {
+                    "action": action,
+                    "ticket": {"readiness": "ready"},
+                    "risk": {"overall_risk": "low"},
+                    "repo": {"confidence": 90},
+                    "approval": {},
+                }
+            )
+        )
+        assert allowed.allowed is True, action
