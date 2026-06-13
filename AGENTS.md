@@ -65,7 +65,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |
 | `workflows/` | Temporal version (durable waits for approval/PR). Exists, signal-driven, **not yet battle-tested against a real server** |
 | `agents/` | Provider abstraction: `manual`, fake, `cursor_cloud`, `cursor_via_linear`, `claude_code` (GitHub Actions `workflow_dispatch`), `webhook` (HMAC-signed). All go through one `create_job` path with a secret-leak scan |
-| `connectors/` | Trackers: Linear, GitHub Issues, Jira. SCMs: GitHub, GitLab. `transport.py` is the HTTP seam (fakes in tests) |
+| `connectors/` | Trackers: Linear, GitHub Issues, Jira. SCMs: GitHub, GitLab. Both fetch the changed-file list via an injected transport (`github_transport` / `gitlab_transport`, GitLab paging `/diffs`) so file-based gates see the full diff; **no token ⇒ diff-blind, gates skipped**. `transport.py` is the HTTP seam (fakes in tests) |
 | `catalog/` | `foundry-catalog sync` — GitHub org metadata sweep feeding the catalog enricher (stateful, budget-aware, resumable). `--code-facts` (implied by `context.provider: code`) adds per-repo code facts: file tree via the Git Trees API, CODEOWNERS, root manifests; derivation logic is pure functions in `catalog/code_facts.py` |
 | `memory/` | Run outcomes, routing priors, delivery metrics; `foundry-memory backfill / show-priors` |
 | `api/` | FastAPI: signed webhooks (Linear/GitHub/Jira/GitLab), REST approvals, run timeline, `GET /metrics/delivery`, and a zero-build HTML dashboard at `/dashboard`. Everything token-gated, **fail-closed** (no `FOUNDRY_API_TOKEN` = endpoints disabled) |

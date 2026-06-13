@@ -1,0 +1,16 @@
+[
+  {
+    "old_path": "src/features/favourites/index.ts",
+    "new_path": "src/features/favourites/index.ts",
+    "new_file": true,
+    "renamed_file": false,
+    "deleted_file": false
+  },
+  {
+    "old_path": "src/features/favourites/store.ts",
+    "new_path": "src/features/favourites/store.ts",
+    "new_file": false,
+    "renamed_file": false,
+    "deleted_file": false
+  }
+]

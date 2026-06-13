@@ -8,12 +8,13 @@ import json
 import httpx
 import pytest
 
-from foundry.connectors import GitHubConnector, LinearConnector
+from foundry.connectors import GitHubConnector, GitLabConnector, LinearConnector
 from foundry.connectors import transport as transport_mod
 from foundry.connectors.transport import (
     TransportError,
     github_rest_transport,
     github_transport,
+    gitlab_transport,
     jira_transport,
     linear_transport,
 )
@@ -109,6 +110,46 @@ def test_github_transport_raises_on_http_error() -> None:
         transport("GET", "/repos/o/r/pulls/1/files")
 
 
+# -- GitLab -------------------------------------------------------------------
+
+
+def test_gitlab_transport_drives_connector() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        # The project path must stay percent-encoded on the wire as a single
+        # path segment (httpx decodes .path, so assert on the raw URL).
+        assert "/projects/acme%2Fcustomer-web/merge_requests/87/diffs" in str(request.url)
+        assert request.headers["private-token"] == "gl_token"
+        return httpx.Response(
+            200,
+            json=[{"new_path": "src/a.ts", "old_path": "src/a.ts"}],
+        )
+
+    transport = gitlab_transport("gl_token", client=_client(handler))
+    files = GitLabConnector(transport=transport).list_mr_files("acme/customer-web", 87)
+    assert files == ["src/a.ts"]
+
+
+def test_gitlab_transport_honours_self_managed_base() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith("https://gitlab.example.com/api/v4/")
+        return httpx.Response(200, json=[])
+
+    transport = gitlab_transport(
+        "t", client=_client(handler), base="https://gitlab.example.com/api/v4"
+    )
+    assert transport("GET", "/projects/1/merge_requests/2/diffs") == []
+
+
+def test_gitlab_transport_raises_on_http_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "404 Not found"})
+
+    transport = gitlab_transport("t", client=_client(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        transport("GET", "/projects/1/merge_requests/2/diffs")
+
+
 def test_github_rest_transport_returns_404_and_409_as_values() -> None:
     """Missing resources (404) and empty repos (409 on the trees API) are
     answers, not errors - the catalog sync must see them, not an exception."""
@@ -150,6 +191,16 @@ def test_github_post_is_not_retried_on_transient_error() -> None:
     with pytest.raises(httpx.HTTPStatusError):
         transport("POST", "/repos/o/r/issues/1/comments", {"body": "hi"})
     assert len(calls) == 1  # no replay of a non-idempotent write
+
+
+def test_gitlab_get_retries_transient_then_succeeds() -> None:
+    """MR-diff reads are GETs, so a transient 502 is safely retried."""
+    handler, calls = _counting(
+        [httpx.Response(502, text="bad gateway"), httpx.Response(200, json=[{"x": 1}])]
+    )
+    transport = gitlab_transport("t", client=_client(handler))
+    assert transport("GET", "/projects/1/merge_requests/2/diffs") == [{"x": 1}]
+    assert len(calls) == 2  # retried once
 
 
 def test_github_post_network_error_is_not_retried() -> None:
