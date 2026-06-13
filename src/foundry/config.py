@@ -104,6 +104,14 @@ class Settings:
     # same heuristic floor (needs OPENAI_API_KEY).
     risk_provider: str = "heuristic"
     risk_model: str = "gpt-5.5"
+    # Delivery planner backend. "template" renders deterministic
+    # "Satisfy acceptance criterion: X" steps (the no-key default); "llm" adds
+    # an LLM pass that produces file-level steps, test locations and verify
+    # commands from the code-aware context (needs OPENAI_API_KEY, best paired
+    # with context.provider: code). Safety guardrails stay deterministic and an
+    # LLM failure degrades to the template plan.
+    planner_provider: str = "template"
+    planner_model: str = "gpt-5.5"
 
     # --- policy / safety knobs (behaviour: yaml) ---
     repo_confidence_threshold: int = 70
@@ -200,6 +208,11 @@ class Settings:
             raise ValueError(
                 f"risk_provider must be 'heuristic' or 'llm', got {self.risk_provider!r}"
             )
+        if self.planner_provider not in ("template", "llm"):
+            raise ValueError(
+                "planner_provider must be 'template' or 'llm', got "
+                f"{self.planner_provider!r}"
+            )
         if self.context_provider not in ("static", "catalog", "code"):
             raise ValueError(
                 "context_provider must be 'static', 'catalog' or 'code', "
@@ -278,6 +291,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["risk_provider"] = risk["provider"]
     if "model" in risk:
         out["risk_model"] = risk["model"]
+
+    planner = data.get("planner", {}) or {}
+    if "provider" in planner:
+        out["planner_provider"] = planner["provider"]
+    if "model" in planner:
+        out["planner_model"] = planner["model"]
 
     agent = data.get("agent", {}) or {}
     if "provider" in agent:
@@ -394,6 +413,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_OPENAI_MODEL": "openai_model",
         "FOUNDRY_RISK_PROVIDER": "risk_provider",
         "FOUNDRY_RISK_MODEL": "risk_model",
+        "FOUNDRY_PLANNER_PROVIDER": "planner_provider",
+        "FOUNDRY_PLANNER_MODEL": "planner_model",
         "TEMPORAL_ADDRESS": "temporal_address",
         "FOUNDRY_TASK_QUEUE": "task_queue",
         "FOUNDRY_CONTEXT_PROVIDER": "context_provider",

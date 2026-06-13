@@ -876,6 +876,11 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         diff_risk_classifier = LlmDiffRiskClassifier(
             risk_llm, settings.sensitive_globs_map
         )
+    planner = None
+    if settings.planner_provider == "llm":
+        from foundry.engines.llm_planner import build_llm_planner
+
+        planner = build_llm_planner(model=settings.planner_model)
     tracker = None
     if settings.tracker_provider == "github_issues":
         if not settings.github_api_token:
@@ -940,6 +945,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         analyzer=analyzer,
         risk_classifier=risk_classifier,
         diff_risk_classifier=diff_risk_classifier,
+        planner=planner,
         enricher=enricher,
         issue_tracker=tracker,
         provider=build_provider(settings, tracker),
