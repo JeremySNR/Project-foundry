@@ -111,6 +111,15 @@ def test_legacy_authorised_approvers_yaml_still_loads(tmp_path) -> None:
     assert s.roles_for("lead@example.com") == set()
 
 
+def test_jira_allow_query_token_defaults_off_and_parses_from_yaml(tmp_path) -> None:
+    # Default posture: the Jira webhook token is header-only.
+    assert Settings.load("/no/such/file.yaml", env={}).jira_allow_query_token is False
+    path = tmp_path / "foundry.yaml"
+    path.write_text("tracker:\n  provider: jira\n  jira_allow_query_token: true\n")
+    s = Settings.load(path, env={})
+    assert s.jira_allow_query_token is True
+
+
 def test_api_token_from_env() -> None:
     s = Settings.from_env({"FOUNDRY_API_TOKEN": "tok"})
     assert s.api_token == "tok"
