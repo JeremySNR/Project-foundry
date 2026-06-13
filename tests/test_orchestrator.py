@@ -229,6 +229,97 @@ def test_dispatch_requires_approval_first(session_factory) -> None:
         orch.dispatch_agent(run_id)
 
 
+def _infra_ticket(**overrides) -> RawTicket:
+    """Infrastructure work: requires ENGINEERING approval but is medium-risk, so
+    (unlike auth) it is dispatchable as a draft PR once approved with the role."""
+    base = dict(
+        issue_id="i-infra",
+        issue_key="LIN-INF",
+        title="Update the terraform deployment config",
+        description=(
+            "Acceptance Criteria:\n"
+            "- terraform plan runs clean\n"
+            "- the deployment config applies\n"
+        ),
+        known_repositories=["customer-web"],
+    )
+    base.update(overrides)
+    return RawTicket(**base)
+
+
+def _has_artifact(session_factory, run_id, artifact_type) -> bool:
+    with session_factory() as s:
+        return (
+            s.query(FoundryArtifact)
+            .filter_by(run_id=run_id, artifact_type=artifact_type)
+            .count()
+            > 0
+        )
+
+
+def test_approve_without_required_role_is_refused_and_records_nothing(
+    session_factory,
+) -> None:
+    """Issue #18: an approver lacking a role this run requires is refused *before*
+    anything is written - no void APPROVAL_GRANTED, no flip to APPROVED. Previously
+    the approval was recorded and only blocked at dispatch (approve->blocked
+    whiplash with a misleading audit trail)."""
+    from foundry.db.models import AuditEventType
+
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_infra_ticket(), trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    # Infra work requires ENGINEERING; approving with no roles must be refused.
+    with pytest.raises(OrchestratorError, match="approval refused"):
+        orch.approve(run_id, user="lead@example.com")
+
+    # The run is untouched: still awaiting approval, no approver recorded.
+    with session_factory() as s:
+        run = s.get(FoundryRun, run_id)
+        assert run.status is RunStatus.WAITING_APPROVAL
+        assert run.approved_by is None
+    # No phantom approval artifact or audit event on the trail.
+    assert not _has_artifact(session_factory, run_id, ArtifactType.APPROVAL_RECORD)
+    assert (
+        _events_of_type(session_factory, run_id, AuditEventType.APPROVAL_GRANTED) == []
+    )
+
+
+def test_approve_with_partial_roles_is_refused(session_factory) -> None:
+    """A run needing SECURITY (customer PII) is not unlocked by an ENGINEERING-only
+    sign-off; the refusal names the missing role."""
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    ticket = _ready_ticket(
+        title="Export customer data with GDPR fields",
+        description=(
+            "Acceptance Criteria:\n"
+            "- personal data is exportable\n"
+            "- gdpr fields included\n"
+        ),
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    with pytest.raises(OrchestratorError, match="security"):
+        orch.approve(
+            run_id, user="lead@example.com", granted_roles={ApprovalRole.ENGINEERING}
+        )
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+
+def test_approve_with_required_role_records_and_dispatches(session_factory) -> None:
+    """The same infra run, approved *with* the required ENGINEERING role, records
+    the approval and dispatches (medium risk -> draft PR, not human-only)."""
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_infra_ticket(), trigger_type="label")
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.ENGINEERING}
+    )
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+    assert _has_artifact(session_factory, run_id, ArtifactType.APPROVAL_RECORD)
+    orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+
 def test_tracker_receives_comment_and_state_on_intake(session_factory) -> None:
     tracker = InMemoryIssueTracker()
     orch = _orch(session_factory, issue_tracker=tracker)

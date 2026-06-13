@@ -61,7 +61,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam + `llm_risk.py` escalate-only LLM risk classifiers |
 | `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, forbidden globs, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally) |
 | `policy/foundry.rego` | OPA mirror of the Python engine — **must change in lock-step**, tests on both sides |
-| `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows |
+| `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows. `approve()` pre-validates the approver's roles against the run's required approvals (derived from risk) and refuses *before* recording, so a void approval can't land on the trail and be blocked only at dispatch |
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |
 | `workflows/` | Temporal version (durable waits for approval/PR). Exists, signal-driven, **not yet battle-tested against a real server** |
 | `agents/` | Provider abstraction: `manual`, fake, `cursor_cloud`, `cursor_via_linear`, `claude_code` (GitHub Actions `workflow_dispatch`), `webhook` (HMAC-signed). All go through one `create_job` path with a secret-leak scan, and expose `cancel_job` — a human `stop`/`reject` best-effort cancels the in-flight job (Cursor cancel API; no-op for `manual`/`webhook`/`claude_code`) so a stopped run stops spending, recorded as an `AGENT_CANCELLED` audit event |

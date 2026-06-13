@@ -16,7 +16,7 @@ from foundry.db.models import (
 )
 from foundry.memory import outcomes as outcomes_module
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
-from foundry.schemas.common import CIStatus, PRStatus, RunStatus
+from foundry.schemas.common import ApprovalRole, CIStatus, PRStatus, RunStatus
 from foundry.schemas.pr import PullRequestState
 from foundry.schemas.ticket import RawTicket
 
@@ -278,7 +278,12 @@ def test_dispatch_policy_block_records_policy_denied(session_factory) -> None:
         ),
         trigger_type="label",
     )
-    orch.approve(run_id, user="lead@example.com")
+    # Approve *with* the engineering role the auth area requires (so the approval
+    # is recorded, not refused up front) - the point here is the dispatch-time
+    # HUMAN_ONLY block, which holds regardless of who approved.
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.ENGINEERING}
+    )
     with pytest.raises(OrchestratorError):
         orch.dispatch_agent(run_id)
     row = _outcome(session_factory, run_id)
