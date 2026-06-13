@@ -31,9 +31,14 @@ from sqlalchemy import func
 
 from foundry.config import Settings
 from foundry.connectors.github import GitHubConnector
+from foundry.connectors.gitlab import GitLabConnector
 from foundry.drivers import InlineDriver, RunDriver
 from foundry.connectors.linear import LinearConnector
-from foundry.connectors.transport import github_transport, linear_transport
+from foundry.connectors.transport import (
+    github_transport,
+    gitlab_transport,
+    linear_transport,
+)
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import (
     FoundryAgentJob,
@@ -123,6 +128,7 @@ def create_app(
     github_connector: GitHubConnector | None = None,
     jira_webhook_secret: str | None = None,
     gitlab_webhook_secret: str | None = None,
+    gitlab_connector: GitLabConnector | None = None,
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
@@ -154,6 +160,9 @@ def create_app(
     # Jira/GitLab endpoints are fail-closed: no secret => endpoint disabled.
     app.state.jira_webhook_secret = jira_webhook_secret
     app.state.gitlab_webhook_secret = gitlab_webhook_secret
+    # Without a transport the connector is diff-blind (file gates skipped),
+    # mirroring GitHubConnector with no transport.
+    app.state.gitlab_connector = gitlab_connector or GitLabConnector()
     app.state.trigger_label = trigger_label
     app.state.trigger_status = trigger_status
     # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
@@ -324,10 +333,9 @@ def create_app(
         if not hmac.compare_digest(app.state.gitlab_webhook_secret, token or ""):
             raise HTTPException(status_code=401, detail="invalid webhook token")
 
-        from foundry.connectors.gitlab import GitLabConnector
-
+        connector: GitLabConnector = app.state.gitlab_connector
         payload = await request.json()
-        pr_state = GitLabConnector().pr_state_from_event(event or "", payload)
+        pr_state = connector.pr_state_from_event(event or "", payload)
         if pr_state is None:
             return {"status": "ignored", "reason": f"event '{event}' not handled"}
         return _observe_pr(pr_state)
@@ -940,6 +948,15 @@ def app_from_settings(settings: Settings) -> FastAPI:
         if settings.github_api_token
         else None
     )
+    gitlab_connector = (
+        GitLabConnector(
+            transport=gitlab_transport(
+                settings.gitlab_api_token, base=settings.gitlab_api_base
+            )
+        )
+        if settings.gitlab_api_token
+        else None
+    )
     return create_app(
         webhook_secret=settings.linear_webhook_secret,
         session_factory=session_factory,
@@ -950,6 +967,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         github_connector=github_connector,
         jira_webhook_secret=settings.jira_webhook_secret,
         gitlab_webhook_secret=settings.gitlab_webhook_secret,
+        gitlab_connector=gitlab_connector,
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
     )

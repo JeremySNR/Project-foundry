@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 GITHUB_API_BASE = "https://api.github.com"
+GITLAB_API_BASE = "https://gitlab.com/api/v4"
 
 _log = logging.getLogger(__name__)
 
@@ -178,6 +179,55 @@ def github_rest_transport(
                     f"GitHub request failed after {_MAX_RETRIES} retries"
                 ) from exc
         raise TransportError("GitHub request failed") from last_exc  # pragma: no cover
+
+    return transport
+
+
+def gitlab_transport(
+    token: str,
+    *,
+    client: Any | None = None,
+    base: str = GITLAB_API_BASE,
+) -> Callable[..., Any]:
+    """Build the ``transport(method, path) -> json`` for the GitLab REST API.
+
+    Used to fetch MR diffs so the changed-file list feeds the same forbidden-path
+    and oversize gates GitHub PRs already get. Personal/project access tokens go
+    in ``PRIVATE-TOKEN``; ``base`` is the API root (override for self-managed,
+    e.g. ``https://gitlab.example.com/api/v4``).
+    """
+
+    def transport(method: str, path: str) -> Any:
+        http = client or _new_client()
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = http.request(
+                    method,
+                    f"{base}{path}",
+                    headers={
+                        "PRIVATE-TOKEN": token,
+                        "Accept": "application/json",
+                    },
+                )
+                if response.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+                    retry_after = _parse_retry_after(response)
+                    _retry_sleep(attempt, retry_after)
+                    continue
+                response.raise_for_status()
+                if response.status_code == 204 or not response.content:
+                    return None
+                return response.json()
+            except Exception as exc:
+                # Non-retryable HTTP errors (4xx) propagate immediately.
+                if _is_client_error(exc):
+                    raise
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    _retry_sleep(attempt, None)
+                    continue
+                raise TransportError(f"GitLab request failed after {_MAX_RETRIES} retries") from exc
+        raise TransportError("GitLab request failed") from last_exc  # pragma: no cover
 
     return transport
 

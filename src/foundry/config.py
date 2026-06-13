@@ -74,6 +74,11 @@ class Settings:
     # --- GitLab SCM (secret: env); None => endpoint disabled ---
     # GitLab webhooks send the shared secret verbatim in X-Gitlab-Token.
     gitlab_webhook_secret: str | None = None
+    # Outbound API token to fetch MR diffs so GitLab MRs run the same
+    # file-based gates as GitHub PRs. None => MRs are diff-blind (gates skipped).
+    gitlab_api_token: str | None = None
+    # API root; override for self-managed GitLab (e.g. https://gitlab.example.com/api/v4).
+    gitlab_api_base: str = "https://gitlab.com/api/v4"
 
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
@@ -378,6 +383,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_JIRA_EMAIL": "jira_email",
         "FOUNDRY_JIRA_API_TOKEN": "jira_api_token",
         "FOUNDRY_GITLAB_WEBHOOK_SECRET": "gitlab_webhook_secret",
+        "FOUNDRY_GITLAB_API_TOKEN": "gitlab_api_token",
+        "FOUNDRY_GITLAB_API_BASE": "gitlab_api_base",
         "FOUNDRY_API_TOKEN": "api_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
         "FOUNDRY_TRACKER_PROVIDER": "tracker_provider",

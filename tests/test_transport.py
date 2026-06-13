@@ -7,11 +7,12 @@ import json
 import httpx
 import pytest
 
-from foundry.connectors import GitHubConnector, LinearConnector
+from foundry.connectors import GitHubConnector, GitLabConnector, LinearConnector
 from foundry.connectors.transport import (
     TransportError,
     github_rest_transport,
     github_transport,
+    gitlab_transport,
     linear_transport,
 )
 
@@ -82,6 +83,46 @@ def test_github_transport_raises_on_http_error() -> None:
     transport = github_transport("t", client=_client(handler))
     with pytest.raises(httpx.HTTPStatusError):
         transport("GET", "/repos/o/r/pulls/1/files")
+
+
+# -- GitLab -------------------------------------------------------------------
+
+
+def test_gitlab_transport_drives_connector() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        # The project path must stay percent-encoded on the wire as a single
+        # path segment (httpx decodes .path, so assert on the raw URL).
+        assert "/projects/acme%2Fcustomer-web/merge_requests/87/diffs" in str(request.url)
+        assert request.headers["private-token"] == "gl_token"
+        return httpx.Response(
+            200,
+            json=[{"new_path": "src/a.ts", "old_path": "src/a.ts"}],
+        )
+
+    transport = gitlab_transport("gl_token", client=_client(handler))
+    files = GitLabConnector(transport=transport).list_mr_files("acme/customer-web", 87)
+    assert files == ["src/a.ts"]
+
+
+def test_gitlab_transport_honours_self_managed_base() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith("https://gitlab.example.com/api/v4/")
+        return httpx.Response(200, json=[])
+
+    transport = gitlab_transport(
+        "t", client=_client(handler), base="https://gitlab.example.com/api/v4"
+    )
+    assert transport("GET", "/projects/1/merge_requests/2/diffs") == []
+
+
+def test_gitlab_transport_raises_on_http_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "404 Not found"})
+
+    transport = gitlab_transport("t", client=_client(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        transport("GET", "/projects/1/merge_requests/2/diffs")
 
 
 def test_github_rest_transport_returns_404_and_409_as_values() -> None:

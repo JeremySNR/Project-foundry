@@ -78,6 +78,16 @@ tracker:
   provider: linear
   # jira_base_url: "https://yourcompany.atlassian.net"
 
+# Source control (watching the PR/MR the agent opens):
+#   GitHub - set FOUNDRY_GITHUB_API_TOKEN to enrich the changed-file list that
+#            feeds the forbidden-path / oversize gates (and FOUNDRY_GITHUB_WEBHOOK_SECRET).
+#   GitLab - set FOUNDRY_GITLAB_WEBHOOK_SECRET to enable /webhooks/gitlab, and
+#            FOUNDRY_GITLAB_API_TOKEN so MR diffs are fetched and the SAME file
+#            gates apply. Without the API token, GitLab MRs are diff-blind:
+#            forbidden-path/oversize/sensitive-area gates cannot fire. For
+#            self-managed GitLab set FOUNDRY_GITLAB_API_BASE (default
+#            https://gitlab.com/api/v4).
+
 triggers:
   # A run starts only on an explicit opt-in, never for every new issue.
   label: "foundry:candidate"
