@@ -560,7 +560,19 @@ class FoundryOrchestrator:
 
     @traced("foundry.dispatch_agent")
     def dispatch_agent(self, run_id: str) -> CodingAgentJob:
-        """Re-check policy with the recorded approvals, then launch the provider."""
+        """Re-check policy with the recorded approvals, then launch the provider.
+
+        The dispatch is split into three phases so the audit trail can never be
+        out of step with reality (issue #13):
+
+        1. evaluate the gate and **commit** the policy decision *before* any
+           provider side effect — a recorded authorisation must not be able to
+           vanish just because the provider call later fails;
+        2. call the provider; a failure here is captured as an ``AGENT_FAILED``
+           event in its own transaction rather than silently rolling back;
+        3. record the now-live job and flip the run to ``AGENT_RUNNING``.
+        """
+        # -- phase 1: gate decision, durably recorded ------------------------
         with self._sf() as session:
             run = self._require_run(session, run_id)
             if run.status is not RunStatus.APPROVED:
@@ -604,8 +616,21 @@ class FoundryOrchestrator:
                 )
 
             job_input = self._build_job_input(run_id, ticket, plan, context)
-            job = self._provider.create_job(job_input)
+            issue_id = run.linear_issue_id
+            # Commit the allow decision now; the provider call in phase 2 is a
+            # side effect that must not be able to erase the recorded gate row.
+            session.commit()
 
+        # -- phase 2: the external side effect -------------------------------
+        # A dispatch that never even starts the agent ends the run (failed runs
+        # are re-triggerable by a fresh intake).
+        job = self._dispatch_to_provider(
+            run_id, job_input, failure_status=RunStatus.EXECUTION_FAILED
+        )
+
+        # -- phase 3: record the running job ---------------------------------
+        with self._sf() as session:
+            run = self._require_run(session, run_id)
             session.add(
                 FoundryAgentJob(
                     id=new_id("job"),
@@ -628,10 +653,69 @@ class FoundryOrchestrator:
             )
             run.status = RunStatus.AGENT_RUNNING
             run.current_step = "agent_running"
-            issue_id = run.linear_issue_id
-            session.commit()
+            try:
+                session.commit()
+            except Exception:
+                # The provider job is already live; surface the orphan loudly so
+                # it is discoverable for reconciliation (issue #13).
+                _log.exception(
+                    "dispatch of run %s created provider job %s (%s) but the "
+                    "job/audit commit failed; the agent is running without a "
+                    "DB record",
+                    run_id,
+                    job.job_id,
+                    job.provider,
+                )
+                raise
         self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
         return job
+
+    def _dispatch_to_provider(
+        self,
+        run_id: str,
+        job_input: CodingAgentJobInput,
+        *,
+        failure_status: RunStatus,
+    ) -> CodingAgentJob:
+        """Call the provider, recording an ``AGENT_FAILED`` event if it raises.
+
+        The provider call is the one external side effect of a dispatch. Wrapping
+        it here guarantees a provider exception leaves an audit trail and moves
+        the run to a definite status, instead of rolling back the surrounding
+        transaction and stranding the run with a recorded gate decision but no
+        agent and no failure event (issue #13). The original exception is
+        re-raised so callers see the failure unchanged.
+        """
+        try:
+            return self._provider.create_job(job_input)
+        except Exception as exc:
+            self._record_dispatch_failure(run_id, failure_status, reason=str(exc))
+            raise
+
+    def _record_dispatch_failure(
+        self, run_id: str, failure_status: RunStatus, *, reason: str
+    ) -> None:
+        """Persist an ``AGENT_FAILED`` event for a provider dispatch that raised.
+
+        Runs in its own transaction so the record survives the exception the
+        caller is about to re-raise.
+        """
+        with self._sf() as session:
+            run = self._require_run(session, run_id)
+            run.status = failure_status
+            run.current_step = "dispatch_failed"
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.AGENT_FAILED,
+                    actor_type="foundry",
+                    metadata={"reason": "provider dispatch failed", "error": reason},
+                )
+            )
+            issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
+            session.commit()
+        self._notify_state(issue_id, failure_status)
 
     # -- PR monitoring --------------------------------------------------------
 
@@ -850,7 +934,19 @@ class FoundryOrchestrator:
                 branch=pr_state.branch or None,
                 extra_instructions=self._remediation_instructions(reason, pr_state),
             )
-            job = self._provider.create_job(job_input)
+            issue_id = run.linear_issue_id
+            # Commit the allow decision before the provider side effect so the
+            # recorded gate row survives even if create_job raises (issue #13).
+            session.commit()
+
+        # The PR already exists, so a failed re-dispatch hands the PR back to a
+        # human (REVIEW_REQUIRED) rather than ending the run.
+        job = self._dispatch_to_provider(
+            run_id, job_input, failure_status=RunStatus.REVIEW_REQUIRED
+        )
+
+        with self._sf() as session:
+            run = self._require_run(session, run_id)
             session.add(
                 FoundryAgentJob(
                     id=new_id("job"),
@@ -879,8 +975,18 @@ class FoundryOrchestrator:
             )
             run.status = RunStatus.AGENT_RUNNING
             run.current_step = "remediating"
-            issue_id = run.linear_issue_id
-            session.commit()
+            try:
+                session.commit()
+            except Exception:
+                _log.exception(
+                    "remediation of run %s created provider job %s (%s) but the "
+                    "job/audit commit failed; the agent is running without a "
+                    "DB record",
+                    run_id,
+                    job.job_id,
+                    job.provider,
+                )
+                raise
         self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
         return RunStatus.AGENT_RUNNING
 
