@@ -336,7 +336,7 @@ class FoundryOrchestrator:
     ) -> None:
         granted_roles = granted_roles or set()
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             if run.status is not RunStatus.WAITING_APPROVAL:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}', not awaiting approval"
@@ -392,7 +392,7 @@ class FoundryOrchestrator:
         event_type: AuditEventType,
     ) -> None:
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             self._refuse_if_terminal(run)
             run.status = status
             run.current_step = status.value
@@ -475,6 +475,29 @@ class FoundryOrchestrator:
                 metadata=metadata,
             )
         )
+
+    def _cancel_superseded_job(self, run_id: str, job: CodingAgentJob, job_row) -> None:
+        """Cancel a job we launched for a run that has since left our control.
+
+        A (re)dispatch commits its gate decision, calls the provider, then
+        records the job in a third transaction. If a human ``stop``/``reject``
+        wins the run's row lock in that window, the agent is live but unwanted.
+        Best-effort cancel it (failure-isolated like :meth:`_cancel_active_job`)
+        and reflect the outcome on the freshly-recorded ``job_row`` so the trail
+        is honest about what ran and what we did about it."""
+        if job.provider != self._provider.name or not job.job_id:
+            return
+        try:
+            self._provider.cancel_job(job.job_id)
+            job_row.status = AgentJobStatus.CANCELLED
+            job_row.completed_at = datetime.now(timezone.utc)
+        except Exception as exc:  # never let cancellation break the commit
+            job_row.error = str(exc) or exc.__class__.__name__
+            _log.exception(
+                "cancel of superseded job %s (run %s) failed; it may keep running",
+                job.job_id,
+                run_id,
+            )
 
     # -- read helpers (used by the API) ---------------------------------------
 
@@ -574,7 +597,7 @@ class FoundryOrchestrator:
         """
         # -- phase 1: gate decision, durably recorded ------------------------
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             if run.status is not RunStatus.APPROVED:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}', not approved"
@@ -630,19 +653,18 @@ class FoundryOrchestrator:
 
         # -- phase 3: record the running job ---------------------------------
         with self._sf() as session:
-            run = self._require_run(session, run_id)
-            session.add(
-                FoundryAgentJob(
-                    id=new_id("job"),
-                    run_id=run_id,
-                    provider=job.provider,
-                    provider_job_id=job.job_id,
-                    status=AgentJobStatus.RUNNING,
-                    repo=job_input.repo,
-                    branch=job_input.branch_name,
-                    started_at=datetime.now(timezone.utc),
-                )
+            run = self._require_run(session, run_id, lock=True)
+            job_row = FoundryAgentJob(
+                id=new_id("job"),
+                run_id=run_id,
+                provider=job.provider,
+                provider_job_id=job.job_id,
+                status=AgentJobStatus.RUNNING,
+                repo=job_input.repo,
+                branch=job_input.branch_name,
+                started_at=datetime.now(timezone.utc),
             )
+            session.add(job_row)
             session.add(
                 build_audit_event(
                     run_id=run_id,
@@ -651,8 +673,25 @@ class FoundryOrchestrator:
                     metadata={"provider": job.provider, "job_id": job.job_id},
                 )
             )
-            run.status = RunStatus.AGENT_RUNNING
-            run.current_step = "agent_running"
+            # A human stop()/reject() can win the row lock between phase 1's
+            # commit and here. The provider job is already live, but the run is
+            # no longer ours to advance: record the job for the audit/cost trail,
+            # cancel it so a stopped run stops spending, and never overwrite the
+            # new status ("blocked stays blocked", issue #10).
+            if run.status is RunStatus.APPROVED:
+                run.status = RunStatus.AGENT_RUNNING
+                run.current_step = "agent_running"
+                final_status = RunStatus.AGENT_RUNNING
+            else:
+                self._cancel_superseded_job(run_id, job, job_row)
+                final_status = run.status
+                _log.warning(
+                    "dispatch of run %s launched job %s but the run is now '%s'; "
+                    "leaving the status unchanged and cancelling the job",
+                    run_id,
+                    job.job_id,
+                    run.status.value,
+                )
             try:
                 session.commit()
             except Exception:
@@ -667,7 +706,7 @@ class FoundryOrchestrator:
                     job.provider,
                 )
                 raise
-        self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
+        self._notify_state(issue_id, final_status)
         return job
 
     def _dispatch_to_provider(
@@ -701,7 +740,7 @@ class FoundryOrchestrator:
         caller is about to re-raise.
         """
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             run.status = failure_status
             run.current_step = "dispatch_failed"
             session.add(
@@ -722,7 +761,7 @@ class FoundryOrchestrator:
     def mark_agent_failed(self, run_id: str, *, reason: str = "agent error") -> None:
         """Mark a run as failed when the agent crashes without creating a PR."""
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             self._refuse_if_terminal(run)
             run.status = RunStatus.EXECUTION_FAILED
             run.current_step = "failed"
@@ -771,7 +810,7 @@ class FoundryOrchestrator:
         state without weakening a prior file-based decision.
         """
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             if run.status not in _PR_OBSERVABLE_STATUSES:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}'; PR events are only "
@@ -855,7 +894,16 @@ class FoundryOrchestrator:
             return RunStatus.PR_OPEN
 
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
+            # record_pr committed PR_OPEN in a *separate* transaction before
+            # calling us, so the run may have moved since: a human stop(), a
+            # closed PR, or a concurrent delivery's remediation that already
+            # advanced it. Re-read under the row lock and bail unless it is
+            # genuinely still an open PR awaiting remediation — counting jobs and
+            # re-dispatching off a stale PR_OPEN is exactly the double-dispatch /
+            # retry-cap-undercount / revive-a-stopped-run bug (issue #10).
+            if run.status is not RunStatus.PR_OPEN:
+                return run.status
             ticket = self._load(session, run_id, ArtifactType.TICKET_SNAPSHOT)
             analysis = self._load(session, run_id, ArtifactType.TICKET_ANALYSIS)
             context = self._load(session, run_id, ArtifactType.CONTEXT_BUNDLE)
@@ -935,8 +983,16 @@ class FoundryOrchestrator:
                 extra_instructions=self._remediation_instructions(reason, pr_state),
             )
             issue_id = run.linear_issue_id
-            # Commit the allow decision before the provider side effect so the
-            # recorded gate row survives even if create_job raises (issue #13).
+            # Claim the run for this remediation *under the row lock*, before the
+            # provider call. A concurrent delivery's remediation then re-reads a
+            # non-PR_OPEN status at the top of this method and bails, so duplicate
+            # CI-failure events can neither double-dispatch nor undercount the
+            # retry cap by both counting the same prior_jobs (issue #10).
+            run.status = RunStatus.AGENT_RUNNING
+            run.current_step = "remediating"
+            # Commit the allow decision (and the claim) before the provider side
+            # effect so the recorded gate row survives even if create_job raises
+            # (issue #13).
             session.commit()
 
         # The PR already exists, so a failed re-dispatch hands the PR back to a
@@ -946,19 +1002,18 @@ class FoundryOrchestrator:
         )
 
         with self._sf() as session:
-            run = self._require_run(session, run_id)
-            session.add(
-                FoundryAgentJob(
-                    id=new_id("job"),
-                    run_id=run_id,
-                    provider=job.provider,
-                    provider_job_id=job.job_id,
-                    status=AgentJobStatus.RUNNING,
-                    repo=job_input.repo,
-                    branch=job_input.branch_name,
-                    started_at=datetime.now(timezone.utc),
-                )
+            run = self._require_run(session, run_id, lock=True)
+            job_row = FoundryAgentJob(
+                id=new_id("job"),
+                run_id=run_id,
+                provider=job.provider,
+                provider_job_id=job.job_id,
+                status=AgentJobStatus.RUNNING,
+                repo=job_input.repo,
+                branch=job_input.branch_name,
+                started_at=datetime.now(timezone.utc),
             )
+            session.add(job_row)
             session.add(
                 build_audit_event(
                     run_id=run_id,
@@ -973,8 +1028,23 @@ class FoundryOrchestrator:
                     },
                 )
             )
-            run.status = RunStatus.AGENT_RUNNING
-            run.current_step = "remediating"
+            # phase 1 already flipped the run to AGENT_RUNNING under the lock. If
+            # it is no longer AGENT_RUNNING, a human stop()/reject() won the race
+            # while the provider call was in flight: keep the new status, cancel
+            # the now-unwanted job, and never revert it (issue #10).
+            if run.status is RunStatus.AGENT_RUNNING:
+                run.current_step = "remediating"
+                final_status = RunStatus.AGENT_RUNNING
+            else:
+                self._cancel_superseded_job(run_id, job, job_row)
+                final_status = run.status
+                _log.warning(
+                    "remediation of run %s launched job %s but the run is now "
+                    "'%s'; leaving the status unchanged and cancelling the job",
+                    run_id,
+                    job.job_id,
+                    run.status.value,
+                )
             try:
                 session.commit()
             except Exception:
@@ -987,8 +1057,8 @@ class FoundryOrchestrator:
                     job.provider,
                 )
                 raise
-        self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
-        return RunStatus.AGENT_RUNNING
+        self._notify_state(issue_id, final_status)
+        return final_status
 
     def _record_outcome_if_terminal(self, session, run: FoundryRun) -> None:
         """Distill a finished run into its delivery-memory outcome row.
@@ -1226,8 +1296,16 @@ class FoundryOrchestrator:
         )
 
     @staticmethod
-    def _require_run(session, run_id: str) -> FoundryRun:
-        run = session.get(FoundryRun, run_id)
+    def _require_run(session, run_id: str, *, lock: bool = False) -> FoundryRun:
+        """Load the run row, optionally taking a ``SELECT ... FOR UPDATE`` lock.
+
+        Every method that does a check-then-write on run status passes
+        ``lock=True`` so concurrent transitions serialise on the row instead of
+        racing (issue #10). The lock is held until the surrounding session
+        commits. On SQLite the dialect ignores ``FOR UPDATE``, which is correct:
+        the dev DB is single-connection, the production guarantee is Postgres's.
+        """
+        run = session.get(FoundryRun, run_id, with_for_update=lock)
         if run is None:
             raise OrchestratorError(f"run {run_id} not found")
         return run

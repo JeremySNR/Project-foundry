@@ -90,7 +90,13 @@ mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
 5. **Approver roles live in committed YAML / config**, never in request payloads.
 6. **Secrets never reach agent prompts** — job inputs pass the leak scan in
    `agents/provider.py`.
-7. **Forbidden-path blocks are never retried.** Blocked stays blocked.
+7. **Forbidden-path blocks are never retried.** Blocked stays blocked — and that
+   must hold under concurrency too: every run state-transition reads the run row
+   with `_require_run(..., lock=True)` (`SELECT … FOR UPDATE`, no-op on SQLite,
+   real on Postgres) and re-verifies status under that lock before writing. A
+   (re)dispatch that finds the run already terminal (e.g. a human `stop` won the
+   race) records the launched job, cancels it, and never reverts the status. The
+   `(run_id, sequence)` audit index is unique so a duplicate sequence fails loud.
 8. New config goes in `foundry.example.yaml` with a comment; secrets are env vars.
 
 ## Dev commands

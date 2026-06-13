@@ -16,7 +16,7 @@ from foundry.db import (
     make_engine,
     make_session_factory,
 )
-from foundry.db.models import ArtifactType, FoundryRunOutcome
+from foundry.db.models import AgentJobStatus, ArtifactType, FoundryRunOutcome
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.schemas.common import (
     ApprovalRole,
@@ -1025,3 +1025,128 @@ def test_merged_pr_completes_with_no_mark_complete_policy_decision(session_facto
     assert "mark_complete" not in actions
     assert "open_pr" not in actions
     assert "create_branch" not in actions
+
+
+# -- locked state transitions: "blocked stays blocked" under races (issue #10) ----
+
+
+class _StopDuringDispatchProvider(InMemoryFakeProvider):
+    """Simulates a human ``stop()`` landing between a dispatch's phase-1 commit
+    and its phase-3 job record by stopping the run from *inside* ``create_job``.
+
+    The provider call is the one moment a (re)dispatch holds no row lock, so it
+    is exactly where a concurrent terminal transition can slip in (issue #10).
+    Arm it (``armed = True``) immediately before the dispatch under test.
+    """
+
+    def __init__(self, orch_box, run_box, *, user="lead@example.com") -> None:
+        super().__init__()
+        self._orch_box = orch_box
+        self._run_box = run_box
+        self._user = user
+        self.armed = False
+
+    def create_job(self, job_input):
+        if self.armed:
+            self.armed = False
+            self._orch_box[0].stop(self._run_box[0], user=self._user)
+        return super().create_job(job_input)
+
+
+def test_remediation_bails_when_run_no_longer_pr_open(session_factory) -> None:
+    """A run stopped after record_pr committed PR_OPEN must not be revived: the
+    remediation re-reads status under the row lock and bails (issue #10)."""
+    orch, run_id = _dispatched_run(session_factory)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+    orch.stop(run_id, user="lead@example.com")  # human ends the run out of band
+    before = _job_count(session_factory, run_id)
+
+    result = orch._attempt_remediation(
+        run_id, reason="ci_failed", pr_state=_pr(ci_status=CIStatus.FAILING)
+    )
+
+    assert result is RunStatus.BLOCKED
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _job_count(session_factory, run_id) == before  # no re-dispatch
+
+
+def test_duplicate_remediation_delivery_does_not_double_dispatch(session_factory) -> None:
+    """Once a remediation claims the run (phase 1 flips it to AGENT_RUNNING under
+    the lock), a duplicate CI-failure delivery re-reads a non-PR_OPEN status and
+    bails - no second job, no retry-cap undercount (issue #10)."""
+    orch, run_id = _dispatched_run(session_factory)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+    failing = _pr(ci_status=CIStatus.FAILING)
+    assert orch.record_pr(run_id, failing) is RunStatus.AGENT_RUNNING
+    after_first = _job_count(session_factory, run_id)  # original + 1 remediation
+
+    # A duplicate delivery of the same failure event arrives while the run is
+    # already AGENT_RUNNING from the first remediation.
+    result = orch._attempt_remediation(run_id, reason="ci_failed", pr_state=failing)
+
+    assert result is RunStatus.AGENT_RUNNING
+    assert _job_count(session_factory, run_id) == after_first  # no extra dispatch
+
+
+def test_stop_during_remediation_dispatch_is_not_reverted(session_factory) -> None:
+    """A human stop that wins the row lock while the remediation provider call is
+    in flight must stick: the run stays BLOCKED and the just-launched job is
+    cancelled so it stops spending (issue #10)."""
+    orch_box, run_box = [], []
+    provider = _StopDuringDispatchProvider(orch_box, run_box)
+    orch = _orch(session_factory, provider=provider, issue_tracker=InMemoryIssueTracker())
+    orch_box.append(orch)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    run_box.append(run_id)
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+    orch.record_pr(run_id, _pr())
+
+    provider.armed = True  # the remediation's create_job will stop the run
+    result = orch.record_pr(run_id, _pr(ci_status=CIStatus.FAILING))
+
+    assert result is RunStatus.BLOCKED
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    with session_factory() as s:
+        latest = (
+            s.query(FoundryAgentJob)
+            .filter_by(run_id=run_id)
+            .order_by(FoundryAgentJob.started_at)
+            .all()[-1]
+        )
+        assert latest.status is AgentJobStatus.CANCELLED
+
+
+def test_stop_during_initial_dispatch_is_not_reverted(session_factory) -> None:
+    """Same race on the first dispatch: a stop between phase 1 and phase 3 keeps
+    the run BLOCKED rather than flipping it to AGENT_RUNNING (issue #10)."""
+    orch_box, run_box = [], []
+    provider = _StopDuringDispatchProvider(orch_box, run_box)
+    orch = _orch(session_factory, provider=provider)
+    orch_box.append(orch)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    run_box.append(run_id)
+    orch.approve(run_id, user="lead@example.com")
+
+    provider.armed = True  # the dispatch's create_job will stop the run
+    orch.dispatch_agent(run_id)
+
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    with session_factory() as s:
+        row = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+        assert row.status is AgentJobStatus.CANCELLED
+
+
+def test_audit_events_unique_run_sequence_index_present(session_factory) -> None:
+    """The per-run sequence is the audit trail's guaranteed order; a unique index
+    makes a duplicate fail loudly instead of silently corrupting it (issue #10)."""
+    from sqlalchemy import inspect
+
+    with session_factory() as s:
+        indexes = inspect(s.get_bind()).get_indexes("foundry_audit_events")
+    unique_seq = [
+        i for i in indexes
+        if i["unique"] and set(i["column_names"]) == {"run_id", "sequence"}
+    ]
+    assert unique_seq, f"missing unique (run_id, sequence) index; have {indexes}"
