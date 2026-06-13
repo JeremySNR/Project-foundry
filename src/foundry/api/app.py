@@ -498,6 +498,22 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **delivery_metrics(session, since=since)}
 
+    @app.get("/metrics/agents")
+    def metrics_agents(request: Request, days: int = 90) -> dict[str, Any]:
+        """Per-provider agent scorecards: merge rate, retries and spend, broken
+        down by work type and repo. Token-gated like ``/metrics/delivery`` -
+        per-agent performance and cost are competitively sensitive. Reporting
+        only; acting on it (``agent.provider: auto``) is a separate gated change.
+        """
+        from foundry.memory.scorecards import agent_scorecards
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **agent_scorecards(session, since=since)}
+
     @app.post("/runs/{run_id}/approval")
     def approval(
         run_id: str,

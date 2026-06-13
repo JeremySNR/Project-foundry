@@ -87,7 +87,7 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #metrics {
+  #metrics, #agents {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
@@ -95,14 +95,15 @@ DASHBOARD_HTML = """<!doctype html>
   #metrics .stat b { font-size: 15px; }
   #metrics .stat.good b { color: var(--green); }
   #metrics .stat.bad b { color: var(--red); }
-  #metrics table {
+  #metrics table, #agents table {
     border-collapse: collapse; margin: 8px 0 2px; font-size: 12px;
   }
-  #metrics th, #metrics td {
+  #metrics th, #metrics td, #agents th, #agents td {
     border: 1px solid var(--border); padding: 3px 10px; text-align: left;
     color: var(--muted);
   }
-  #metrics th { color: var(--text); }
+  #metrics th, #agents th { color: var(--text); }
+  #agents summary { color: var(--text); cursor: pointer; }
 </style>
 </head>
 <body>
@@ -113,6 +114,7 @@ DASHBOARD_HTML = """<!doctype html>
   <button id="save">Connect</button>
 </header>
 <div id="metrics"></div>
+<div id="agents"></div>
 <main>
   <div id="runs"></div>
   <div id="detail"><div class="empty">Select a run to see its full decision timeline.</div></div>
@@ -308,16 +310,48 @@ async function loadMetrics() {
   }
 }
 
+async function loadAgents() {
+  const el = $("#agents");
+  if (!localStorage.getItem("foundry_token")) {
+    el.style.display = "none";  // no token: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/agents?days=90", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const providers = m.providers || [];
+    if (!providers.length) { el.style.display = "none"; return; }
+    const rows = providers.map((p) => {
+      const cost = p.total_cost_usd == null ? "-" : "$" + p.total_cost_usd;
+      const thin = p.meets_min_samples ? "" : " *";
+      return `<tr><td>${esc(p.provider)}${thin}</td>
+        <td>${p.merged} of ${p.runs} merged</td><td>${p.smoothed_success}</td>
+        <td>${p.retries_consumed}</td><td>${cost}</td></tr>`;
+    }).join("");
+    el.innerHTML = `<details><summary>agent scorecards (90d) &mdash; which agent ships, by the receipts</summary>
+      <table><tr><th>provider</th><th>merge rate</th><th>confidence</th>
+        <th>retries</th><th>spend</th></tr>${rows}</table>
+      <div class="kv">* below the ${m.min_samples}-run minimum sample floor</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 $("#save").addEventListener("click", () => {
   localStorage.setItem("foundry_token", tokenInput.value.trim());
   loadRuns();
   loadMetrics();
+  loadAgents();
   $("#detail").innerHTML = '<div class="empty">Select a run to see its full decision timeline.</div>';
 });
 
 loadRuns();
 loadMetrics();
-setInterval(() => { loadRuns(); loadMetrics(); }, 15000);
+loadAgents();
+setInterval(() => { loadRuns(); loadMetrics(); loadAgents(); }, 15000);
 </script>
 </body>
 </html>
