@@ -39,6 +39,13 @@ forbidden_actions := {
 	"production_deploy",
 }
 
+# Actions that launch a coding agent and so spend against the run budget. The
+# budget cap is enforced for these at every attempt, including first dispatch.
+spend_actions := {
+	"start_agent",
+	"retry_agent",
+}
+
 default is_autonomous := false
 
 is_autonomous if input.action in autonomous_actions
@@ -113,12 +120,14 @@ deny_reasons contains msg if {
 }
 
 deny_reasons contains msg if {
-	input.action == "retry_agent"
+	input.action in spend_actions
 	max_cost := object.get(input, ["budget", "max_cost_usd"], null)
 	max_cost != null
 	cost := object.get(input, ["budget", "cost_usd"], 0)
-	cost >= max_cost
-	msg := sprintf("run spend $%.2f has reached the budget cap of $%.2f", [cost, max_cost])
+	pending := object.get(input, ["budget", "pending_cost_usd"], 0)
+	projected := cost + pending
+	projected >= max_cost
+	msg := sprintf("projected run spend $%.2f would reach the budget cap of $%.2f", [projected, max_cost])
 }
 
 deny_reasons contains msg if {

@@ -528,6 +528,56 @@ def test_remediation_allowed_when_under_budget(session_factory) -> None:
     assert orch.record_pr(run_id, failing) is RunStatus.AGENT_RUNNING
 
 
+def test_budget_cap_blocks_first_dispatch_when_estimate_exceeds_cap(
+    session_factory,
+) -> None:
+    """A single dispatch whose estimated cost already exceeds the cap is
+    refused at ``start_agent`` (issue #29): no provider call, run BLOCKED."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        max_cost_per_run=5.0,
+        estimated_cost_per_dispatch=6.0,
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    with pytest.raises(OrchestratorError):
+        orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    # Phase 3 only records a job for an allowed dispatch, so nothing ran.
+    assert _job_count(session_factory, run_id) == 0
+
+
+def test_estimate_counts_unreported_cost_against_budget(session_factory) -> None:
+    """The fake provider reports no ``cost_usd``. With an estimate configured,
+    each dispatched attempt counts the estimate as a proxy so the cap still
+    binds on retry (issue #29) - the case claude_code / webhook / manual hit
+    in production where the provider never reports spend."""
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory, max_cost_per_run=5.0, estimated_cost_per_dispatch=3.0
+    )
+    orch.record_pr(run_id, _pr())
+    # One unreported job has run (estimate 3.0); a retry would project
+    # 3.0 + 3.0 = 6.0, past the 5.0 cap, so remediation is denied.
+    failing = _pr(ci_status=CIStatus.FAILING)
+    assert orch.record_pr(run_id, failing) is RunStatus.REVIEW_REQUIRED
+    assert _job_count(session_factory, run_id) == 1  # no re-dispatch
+
+
+def test_budget_snapshot_reports_consumed_and_cap(session_factory) -> None:
+    """``budget_snapshot`` surfaces spend vs cap for the timeline/dashboard,
+    using the estimate as a proxy for a provider that reports no cost."""
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory, max_cost_per_run=10.0, estimated_cost_per_dispatch=2.5
+    )
+    snap = orch.budget_snapshot(run_id)
+    assert snap["cap_usd"] == 10.0
+    assert snap["estimated_cost_per_dispatch"] == 2.5
+    # One unreported job -> the estimate stands in as consumed spend.
+    assert snap["consumed_usd"] == 2.5
+
+
 def test_no_remediation_for_forbidden_path_block(session_factory) -> None:
     """BLOCKED is sticky; remediation never resurrects a forbidden-path block."""
     orch, run_id, _provider = _dispatched_with_provider(session_factory)

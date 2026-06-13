@@ -121,9 +121,14 @@ class Settings:
     # more than max_agent_retries times per run.
     max_agent_retries: int = 2
     retry_on: tuple[str, ...] = ("ci_failed", "changes_requested")
-    # Deny further agent retries once a run's provider-reported spend reaches
-    # this many USD. None = no budget cap.
+    # Deny further agent dispatch once a run's spend reaches this many USD.
+    # Enforced at first dispatch and every retry. None = no budget cap.
     max_cost_per_run: float | None = None
+    # Fallback per-dispatch cost (USD) for providers that don't report spend
+    # (claude_code / webhook / manual). Provider-reported cost still wins where
+    # available; otherwise each dispatched attempt counts this estimate so the
+    # cap can trip. 0 = no estimate (the cap then needs reported cost to bind).
+    estimated_cost_per_dispatch: float = 0.0
 
     # --- triggers (behaviour: yaml) ---
     trigger_label: str = DEFAULT_TRIGGER_LABEL
@@ -195,6 +200,11 @@ class Settings:
         if self.max_cost_per_run is not None and self.max_cost_per_run <= 0:
             raise ValueError(
                 f"max_cost_per_run must be positive, got {self.max_cost_per_run}"
+            )
+        if self.estimated_cost_per_dispatch < 0:
+            raise ValueError(
+                "estimated_cost_per_dispatch must be >= 0, got "
+                f"{self.estimated_cost_per_dispatch}"
             )
         if self.risk_provider not in ("heuristic", "llm"):
             raise ValueError(
@@ -314,6 +324,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "max_cost_per_run" in budget:
         raw_cap = budget["max_cost_per_run"]
         out["max_cost_per_run"] = None if raw_cap is None else float(raw_cap)
+    if "estimated_cost_per_dispatch" in budget:
+        out["estimated_cost_per_dispatch"] = float(
+            budget["estimated_cost_per_dispatch"]
+        )
 
     triggers = data.get("triggers", {}) or {}
     if "label" in triggers:

@@ -106,7 +106,7 @@ The webhook payload shapes are pinned by recorded fixtures in `tests/fixtures/` 
 
 ### The feedback loop
 
-A PR that opens and then fails CI used to be where automation stalled. Now: a failing check suite or a changes-requested review re-dispatches the agent onto the *same branch* with the failure context (failing check names and summaries pulled from GitHub). Every retry passes the policy gate as `retry_agent` - approvals are re-checked, attempts are counted against `remediation.max_agent_retries`, and optional spend is checked against `budget.max_cost_per_run`. Past the cap, the run parks at *review required* with a comment saying a human is needed. Forbidden-path blocks are never retried - blocked stays blocked.
+A PR that opens and then fails CI used to be where automation stalled. Now: a failing check suite or a changes-requested review re-dispatches the agent onto the *same branch* with the failure context (failing check names and summaries pulled from GitHub). Every retry passes the policy gate as `retry_agent` - approvals are re-checked, attempts are counted against `remediation.max_agent_retries`, and projected spend is checked against `budget.max_cost_per_run`. The cap binds at first dispatch too, not just on retries; providers that don't report `cost_usd` count `budget.estimated_cost_per_dispatch` per attempt as a proxy. Past the cap, the run parks at *review required* with a comment saying a human is needed. Forbidden-path blocks are never retried - blocked stays blocked.
 
 ### The dashboard
 
@@ -150,7 +150,8 @@ remediation:
   max_agent_retries: 2            # CI-failure/review retries before a human takes over
   retry_on: ["ci_failed", "changes_requested"]
 budget:
-  max_cost_per_run: 25.0          # deny retries once provider-reported spend hits this
+  max_cost_per_run: 25.0          # deny dispatch (first + retries) once projected spend hits this
+  estimated_cost_per_dispatch: 0.0 # proxy cost for providers that don't report spend (0 = off)
 agent:
   provider: cursor_via_linear     # or cursor_cloud / claude_code / webhook / manual
 tracker:

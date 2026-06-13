@@ -229,6 +229,87 @@ def test_retry_over_budget_denied_under_budget_allowed() -> None:
     assert uncapped.allowed is True
 
 
+def test_start_agent_budget_enforced_at_first_dispatch() -> None:
+    """The budget cap binds on ``start_agent`` too (issue #29), not just
+    retries. With nothing spent yet, the projected cost is the pending
+    dispatch's estimate, so a single attempt over the cap is refused."""
+    base = {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+    }
+    over = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                **base,
+                "budget": {
+                    "cost_usd": 0.0,
+                    "pending_cost_usd": 5.0,
+                    "max_cost_usd": 5.0,
+                },
+            }
+        )
+    )
+    assert over.allowed is False
+    assert any("budget cap" in r for r in over.reasons)
+    under = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                **base,
+                "budget": {
+                    "cost_usd": 0.0,
+                    "pending_cost_usd": 4.0,
+                    "max_cost_usd": 5.0,
+                },
+            }
+        )
+    )
+    assert under.allowed is True
+
+
+def test_projected_spend_combines_recorded_and_pending() -> None:
+    """A retry is denied when recorded spend plus the next dispatch's estimate
+    reaches the cap, even though recorded spend alone is under it."""
+    decision = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                "action": "retry_agent",
+                "ticket": {"readiness": "ready"},
+                "risk": {"overall_risk": "low"},
+                "repo": {"confidence": 90},
+                "approval": {},
+                "budget": {
+                    "cost_usd": 4.0,
+                    "pending_cost_usd": 2.0,
+                    "max_cost_usd": 5.0,
+                },
+            }
+        )
+    )
+    assert decision.allowed is False
+    assert any("projected run spend $6.00" in r for r in decision.reasons)
+
+
+def test_budget_not_applied_to_non_spend_actions() -> None:
+    """The budget rule gates only the spending actions (start/retry). A
+    non-spend autonomous action like ``open_pr`` is not blocked on spend."""
+    decision = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                "action": "open_pr",
+                "ticket": {"readiness": "ready"},
+                "risk": {"overall_risk": "low"},
+                "repo": {"confidence": 90},
+                "approval": {},
+                "budget": {"cost_usd": 99.0, "max_cost_usd": 5.0},
+            }
+        )
+    )
+    assert decision.allowed is True
+
+
 def test_production_deploy_action_denied_unconditionally() -> None:
     decision = _engine().evaluate(
         PolicyInput.model_validate(

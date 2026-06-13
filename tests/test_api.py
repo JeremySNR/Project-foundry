@@ -817,6 +817,11 @@ def test_timeline_exposes_full_decision_record(client) -> None:
     assert timeline["agent_jobs"], "the dispatched agent job must be visible"
     assert timeline["agent_jobs"][0]["provider"] == "fake"
 
+    # Spend vs cap is surfaced so an approver sees budget before approving.
+    assert {"consumed_usd", "cap_usd", "estimated_cost_per_dispatch"} == set(
+        timeline["budget"]
+    )
+
 
 # -- dashboard -----------------------------------------------------------------
 

@@ -59,7 +59,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | --- | --- |
 | `schemas/` | Pydantic contracts for every artifact a run produces (`extra="forbid"` — changes here are API changes; update consumers in the same PR) |
 | `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam + `llm_risk.py` escalate-only LLM risk classifiers |
-| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, forbidden globs, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally) |
+| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, forbidden globs, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally). The budget cap binds on **every** spending action (first `start_agent` + each `retry_agent`), comparing *projected* spend — recorded cost plus the next dispatch's `estimated_cost_per_dispatch` proxy for providers that don't report `cost_usd`. |
 | `policy/foundry.rego` | OPA mirror of the Python engine — **must change in lock-step**, tests on both sides |
 | `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows |
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |

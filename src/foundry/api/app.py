@@ -429,6 +429,7 @@ def create_app(
             )
             return {
                 "run": _run_to_dict(run),
+                "budget": orch.budget_snapshot(run_id),
                 "artifacts": [
                     {
                         "id": a.id,
@@ -952,6 +953,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         max_agent_retries=settings.max_agent_retries,
         retry_on=settings.retry_on,
         max_cost_per_run=settings.max_cost_per_run,
+        estimated_cost_per_dispatch=settings.estimated_cost_per_dispatch,
     )
 
 
