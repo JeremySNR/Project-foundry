@@ -175,6 +175,17 @@ class FoundryArtifact(Base):
 
 class FoundryAuditEvent(Base):
     __tablename__ = "foundry_audit_events"
+    # The per-run sequence is the audit trail's guaranteed order. A unique
+    # constraint makes a duplicate sequence (e.g. two unlocked sessions both
+    # computing max(sequence)+1 under concurrency) fail loudly at insert rather
+    # than silently corrupting the order (issue #10). State transitions now take
+    # a row lock so this should never trip; if it does, that is a bug surfacing,
+    # not data to keep.
+    __table_args__ = (
+        Index(
+            "uq_audit_event_run_sequence", "run_id", "sequence", unique=True
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("foundry_runs.id"), index=True)
