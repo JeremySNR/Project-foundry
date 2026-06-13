@@ -10,6 +10,7 @@ import pytest
 from foundry.connectors import GitHubConnector, LinearConnector
 from foundry.connectors.transport import (
     TransportError,
+    github_rest_transport,
     github_transport,
     linear_transport,
 )
@@ -81,3 +82,21 @@ def test_github_transport_raises_on_http_error() -> None:
     transport = github_transport("t", client=_client(handler))
     with pytest.raises(httpx.HTTPStatusError):
         transport("GET", "/repos/o/r/pulls/1/files")
+
+
+def test_github_rest_transport_returns_404_and_409_as_values() -> None:
+    """Missing resources (404) and empty repos (409 on the trees API) are
+    answers, not errors - the catalog sync must see them, not an exception."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/git/trees/" in request.url.path:
+            return httpx.Response(409, json={"message": "Git Repository is empty."})
+        return httpx.Response(404, json={"message": "not found"})
+
+    transport = github_rest_transport("t", client=_client(handler))
+    status, _, data = transport("GET", "/repos/o/empty/git/trees/HEAD?recursive=1")
+    assert status == 409
+    assert data is None
+    status, _, data = transport("GET", "/repos/o/r/readme")
+    assert status == 404
+    assert data is None

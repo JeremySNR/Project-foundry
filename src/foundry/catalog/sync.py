@@ -157,10 +157,15 @@ class CatalogSync:
                     existing.pushed_at = pushed_at
             session.commit()
 
-            # Phase 2: deletion of repos no longer in listing
+            # Phase 2: deletion of repos no longer in listing. Scoped to the
+            # org being synced - rows from other orgs sharing this DB must
+            # survive a sweep that, by construction, never listed them.
+            org_prefix = f"{org}/".lower()
             all_entries = session.query(FoundryRepoCatalogEntry).all()
             deleted = 0
             for entry in all_entries:
+                if not entry.repo.lower().startswith(org_prefix):
+                    continue
                 if entry.repo not in listed_names:
                     session.delete(entry)
                     deleted += 1
@@ -252,8 +257,10 @@ class CatalogSync:
         top_contributors = [login for login, _ in contributor_counts.most_common(10)]
 
         code_facts: dict[str, Any] | None = None
+        code_facts_degraded = False
         if self._fetch_code_facts:
             code_facts = self._fetch_repo_code_facts(repo, default_branch)
+            code_facts_degraded = code_facts is None
 
         with self._session_factory() as session:
             entry = session.get(FoundryRepoCatalogEntry, repo)
@@ -269,16 +276,24 @@ class CatalogSync:
                     entry.codeowners = json.dumps(code_facts["codeowners"])
                     entry.manifests = json.dumps(code_facts["manifests"])
                     entry.languages = json.dumps(code_facts["languages"])
-                entry.synced_at = self._now()
+                if not code_facts_degraded:
+                    # A degraded code-facts fetch keeps synced_at (and any
+                    # previously-stored facts) untouched so the next sweep
+                    # retries instead of trusting stale-empty facts as fresh.
+                    entry.synced_at = self._now()
             session.commit()
 
     def _fetch_repo_code_facts(
         self, repo: str, default_branch: str | None
-    ) -> dict[str, Any]:
-        """One Git Trees call plus targeted content fetches; degrades to empty.
+    ) -> dict[str, Any] | None:
+        """One Git Trees call plus targeted content fetches.
 
-        A failed tree fetch (404 on an empty repo, transient 5xx after retries)
-        must not fail the repo's sync - the metadata facts are still valuable.
+        Returns empty facts when the repo is *definitively* empty (the trees
+        API answers 404/409 for empty repositories). Returns ``None`` when the
+        fetch *degraded* (transient 5xx after retries, transport error): the
+        caller then keeps any previously-stored facts and leaves ``synced_at``
+        unbumped so the repo is retried on the next sweep. Either way, one
+        repo's failure must never abort the whole sweep.
         """
         empty: dict[str, Any] = {
             "tree_paths": [],
@@ -290,10 +305,23 @@ class CatalogSync:
         }
 
         ref = default_branch or "HEAD"
-        status, _, data = self._call("GET", f"/repos/{repo}/git/trees/{ref}?recursive=1")
-        if status != 200 or not isinstance(data, dict):
-            _log.info("Tree fetch for %s failed (HTTP %s); storing empty code facts", repo, status)
+        try:
+            status, _, data = self._call(
+                "GET", f"/repos/{repo}/git/trees/{ref}?recursive=1"
+            )
+        except Exception:
+            _log.warning(
+                "Tree fetch for %s raised; degrading, will retry next sweep",
+                repo,
+                exc_info=True,
+            )
+            return None
+        if status in (404, 409):
+            _log.info("Repo %s is empty (HTTP %s); storing empty code facts", repo, status)
             return empty
+        if status != 200 or not isinstance(data, dict):
+            _log.info("Tree fetch for %s failed (HTTP %s); degrading, will retry next sweep", repo, status)
+            return None
 
         paths = [
             item["path"]
@@ -333,8 +361,16 @@ class CatalogSync:
         }
 
     def _fetch_file_text(self, repo: str, path: str) -> str | None:
-        """Fetch one file via the contents API; 404 is normal, never a warning."""
-        status, _, data = self._call("GET", f"/repos/{repo}/contents/{path}")
+        """Fetch one file via the contents API; 404 is normal, never a warning.
+
+        Transport failures degrade to ``None`` (facts without this file) so a
+        single flaky content fetch cannot abort the sweep.
+        """
+        try:
+            status, _, data = self._call("GET", f"/repos/{repo}/contents/{path}")
+        except Exception:
+            _log.warning("Content fetch for %s:%s raised; skipping file", repo, path, exc_info=True)
+            return None
         if status != 200 or not isinstance(data, dict):
             return None
         try:

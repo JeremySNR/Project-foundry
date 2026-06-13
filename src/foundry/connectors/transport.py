@@ -135,8 +135,9 @@ def github_rest_transport(
     """``transport(method, path) -> (status, headers, json|None)`` for the catalog sync.
 
     Unlike ``github_transport`` this exposes status and headers, because the sync
-    needs pagination metadata and (later) conditional requests. 404 is returned,
-    not raised - missing READMEs are normal.
+    needs pagination metadata and (later) conditional requests. 404 and 409 are
+    returned, not raised - missing READMEs are normal, and the Git Trees API
+    answers 409 for an empty repository.
     """
 
     def transport(method: str, path: str) -> tuple[int, dict[str, str], Any]:
@@ -157,9 +158,10 @@ def github_rest_transport(
                     retry_after = _parse_retry_after(response)
                     _retry_sleep(attempt, retry_after)
                     continue
-                # 404 is returned, not raised - missing resources are normal.
-                if response.status_code == 404:
-                    return (404, dict(response.headers), None)
+                # 404/409 are returned, not raised - missing resources are
+                # normal, and empty repositories answer 409 on the trees API.
+                if response.status_code in (404, 409):
+                    return (response.status_code, dict(response.headers), None)
                 response.raise_for_status()
                 headers = dict(response.headers)
                 if response.status_code == 204 or not response.content:
