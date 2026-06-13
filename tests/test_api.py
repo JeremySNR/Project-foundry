@@ -95,6 +95,45 @@ def test_unauthorised_webhook_rejected_no_run(client) -> None:
     assert client.get("/runs").json()["runs"] == []
 
 
+def test_webhook_with_no_signature_header_rejected_no_run(client) -> None:
+    """A completely *missing* signature header (not just a wrong one) must fail
+    closed - the absence of a header is not an authentication bypass."""
+    body = json.dumps(_basic_payload()).encode("utf-8")
+    resp = client.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": "d-nohdr", "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 401
+    assert client.get("/runs").json()["runs"] == []
+
+
+def test_github_webhook_with_no_signature_header_rejected(client) -> None:
+    body = json.dumps(_basic_payload()).encode("utf-8")
+    resp = client.post(
+        "/webhooks/github",
+        content=body,
+        headers={"X-GitHub-Event": "pull_request", "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 401
+
+
+def test_linear_webhook_fails_closed_without_configured_secret() -> None:
+    """No webhook secret configured ⇒ the endpoint authenticates nothing: even a
+    correctly-signed (under any key) delivery is refused and starts no run."""
+    c = _make_client(webhook_secret="")
+    body = json.dumps(_basic_payload()).encode("utf-8")
+    # Sign under the test secret; the server has no secret, so it must reject.
+    sig = "sha256=" + compute_signature(SECRET, body)
+    resp = c.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": "d-nosecret", "Linear-Signature": sig},
+    )
+    assert resp.status_code == 401
+    assert c.get("/runs").json()["runs"] == []
+
+
 def test_duplicate_delivery_creates_one_run(client) -> None:
     payload = _basic_payload()
     first = _post_webhook(client, payload, delivery="d-dup")
@@ -793,6 +832,22 @@ def test_dashboard_served_when_token_configured(client) -> None:
 def test_dashboard_disabled_without_token() -> None:
     client = _make_client(api_token=None)
     assert client.get("/dashboard").status_code == 403
+
+
+def test_dashboard_maps_every_run_status_to_a_badge() -> None:
+    """Drift guard: every RunStatus the API can emit must have an explicit badge
+    class in the dashboard, otherwise a real status (e.g. execution_failed) is
+    silently rendered with the muted fallback. The static HTML is the contract,
+    since the page renders client-side from /runs."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+    from foundry.schemas.common import RunStatus
+
+    # Extract the STATUS_BADGE object literal so a status value appearing
+    # elsewhere in the page cannot mask a missing mapping.
+    start = DASHBOARD_HTML.index("const STATUS_BADGE = {")
+    badge_block = DASHBOARD_HTML[start : DASHBOARD_HTML.index("};", start)]
+    for status in RunStatus:
+        assert f"{status.value}:" in badge_block, f"no dashboard badge for {status.value}"
 
 
 def test_build_orchestrator_llm_risk_provider_wires_both_classifiers() -> None:

@@ -953,3 +953,75 @@ def test_provider_failure_during_remediation_hands_pr_to_human(session_factory) 
     # The failed remediation is audited and no second job row was created.
     assert _events_of_type(session_factory, run_id, AuditEventType.AGENT_FAILED)
     assert _job_count(session_factory, run_id) == 1
+
+
+# -- custom forbidden_globs config is honoured end-to-end -----------------------
+
+
+def test_custom_forbidden_globs_block_a_matching_diff(session_factory) -> None:
+    """A configured (non-default) forbidden glob hard-blocks a matching PR."""
+    orch, run_id = _dispatched_run(
+        session_factory, orch_kwargs={"forbidden_globs": ("config/**",)}
+    )
+    pr = _pr(files_changed=["config/feature_flags.yaml"])
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+    # Sticky: a clean follow-up push cannot revive the forbidden-path block.
+    with pytest.raises(OrchestratorError):
+        orch.record_pr(run_id, _pr())
+
+
+def test_custom_forbidden_globs_replace_the_defaults(session_factory) -> None:
+    """Passing forbidden_globs overrides the defaults: a path that the default
+    list would hard-block (migrations/**) is no longer forbidden once a custom
+    list is supplied. (It may still escalate via the sensitive-area gate, but it
+    is not the sticky BLOCK the forbidden list promises.)"""
+    orch, run_id = _dispatched_run(
+        session_factory, orch_kwargs={"forbidden_globs": ("config/**",)}
+    )
+    pr = _pr(files_changed=["migrations/0001_add_table.sql"])
+    assert orch.record_pr(run_id, pr) is not RunStatus.BLOCKED
+
+
+# -- retry cap boundary: max_agent_retries == 0 ---------------------------------
+
+
+def test_zero_retry_cap_denies_first_remediation(session_factory) -> None:
+    """With the cap at 0, the very first CI-failure remediation is denied by the
+    gate (attempt 1 > cap 0): the run parks for a human and no agent re-dispatches."""
+    tracker = InMemoryIssueTracker()
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory, issue_tracker=tracker, max_agent_retries=0
+    )
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    failing = _pr(ci_status=CIStatus.FAILING, summary="pytest: 1 failed")
+    assert orch.record_pr(run_id, failing) is RunStatus.REVIEW_REQUIRED
+    assert _job_count(session_factory, run_id) == 1  # no re-dispatch
+    assert any("could not remediate" in c for c in tracker.comments["i-1"])
+
+
+# -- intent: a merged PR completes without a separate mark_complete gate --------
+
+
+def test_merged_pr_completes_with_no_mark_complete_policy_decision(session_factory) -> None:
+    """Completion is an orchestrator state transition governed by the upfront
+    START_AGENT gate, not a distinct MARK_COMPLETE/OPEN_PR policy evaluation.
+    This pins current intent: only START_AGENT (and RETRY_AGENT) decisions are
+    ever recorded, so a future change that adds a completion gate is deliberate.
+    """
+    import json
+
+    orch, run_id = _dispatched_run(session_factory)
+    orch.record_pr(run_id, _pr())
+    assert orch.record_pr(run_id, _pr(status=PRStatus.MERGED)) is RunStatus.COMPLETE
+
+    with session_factory() as s:
+        actions = {
+            json.loads(d.input_json)["action"]
+            for d in s.query(FoundryPolicyDecision).filter_by(run_id=run_id)
+        }
+    # Only the autonomous-work gate ran; no branch/PR/complete sub-gates.
+    assert actions == {"start_agent"}
+    assert "mark_complete" not in actions
+    assert "open_pr" not in actions
+    assert "create_branch" not in actions

@@ -127,8 +127,8 @@ const STATUS_BADGE = {
   complete: "b-green", pr_open: "b-blue", agent_running: "b-purple",
   waiting_approval: "b-amber", review_required: "b-amber",
   needs_clarification: "b-amber", approved: "b-blue", plan_ready: "b-blue",
-  analysing: "b-muted", blocked: "b-red", rejected: "b-red", failed: "b-red",
-  stopped: "b-muted",
+  analysing: "b-muted", blocked: "b-red", rejected: "b-red",
+  execution_failed: "b-red",
 };
 
 function authHeaders() {
