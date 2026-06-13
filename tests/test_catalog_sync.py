@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from foundry.catalog.sync import CatalogSync, CatalogSyncError
+from foundry.connectors.transport import TransportError
 from foundry.db.base import create_all, make_engine, make_session_factory
 from foundry.db.models import FoundryRepoCatalogEntry
 
@@ -29,6 +30,11 @@ def _page_num(path: str) -> int | None:
 
 def _b64(text: str) -> str:
     return base64.b64encode(text.encode()).decode()
+
+
+def _aware(dt: datetime) -> datetime:
+    """SQLite hands back naive datetimes; normalize for comparison."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _repo(name: str, pushed: str = "2026-01-01T00:00:00Z", archived: bool = False) -> dict:
@@ -521,6 +527,152 @@ def test_no_codeowners_means_no_contents_call() -> None:
     sync.sync("org", bootstrap=True)
 
     assert not any("CODEOWNERS" in c for c in calls)
+
+
+def test_empty_repo_409_does_not_abort_code_facts_sweep() -> None:
+    """The trees API answers 409 for an empty repo - it must not kill the sweep."""
+    _, sf = _engine_and_sf()
+
+    repos = [_repo("org/empty"), _repo("org/full")]
+
+    def transport(method: str, path: str):
+        if "/orgs/org/repos" in path:
+            return 200, {}, repos if _page_num(path) == 1 else []
+        if "/readme" in path:
+            return 200, {}, _readme_response()
+        if "/git/trees/" in path:
+            if "org/empty" in path:
+                return 409, {}, None
+            return 200, {}, {"sha": "x", "tree": [{"path": "main.py", "type": "blob"}], "truncated": False}
+        if path.endswith("/contents/"):
+            return 200, {}, []
+        if "/pulls" in path:
+            return 200, {}, []
+        return 404, {}, None
+
+    sync = CatalogSync(sf, transport, call_budget=3000, fetch_code_facts=True)
+    report = sync.sync("org", bootstrap=True)
+
+    assert report.deep_fetched == 2
+    with sf() as session:
+        empty = session.get(FoundryRepoCatalogEntry, "org/empty")
+        assert empty.synced_at is not None  # definitively empty: synced, not retried
+        assert json.loads(empty.tree_paths) == []
+        full = session.get(FoundryRepoCatalogEntry, "org/full")
+        assert full.synced_at is not None
+        assert json.loads(full.tree_paths) == ["main.py"]
+
+
+def test_deletion_is_scoped_to_the_synced_org() -> None:
+    """Syncing one org must never delete another org's catalog rows."""
+    _, sf = _engine_and_sf()
+
+    with sf() as session:
+        session.add(FoundryRepoCatalogEntry(repo="other-org/keeper"))
+        session.add(FoundryRepoCatalogEntry(repo="org/goner"))
+        session.commit()
+
+    def transport(method: str, path: str):
+        if "/orgs/org/repos" in path:
+            return 200, {}, [_repo("org/mine")] if _page_num(path) == 1 else []
+        if "/readme" in path:
+            return 200, {}, _readme_response()
+        if "/contents/" in path:
+            return 200, {}, []
+        if "/pulls" in path:
+            return 200, {}, []
+        return 404, {}, None
+
+    report = CatalogSync(sf, transport, call_budget=3000).sync("org", bootstrap=True)
+
+    assert report.deleted == 1  # org/goner only - never other-org/keeper
+    with sf() as session:
+        assert session.get(FoundryRepoCatalogEntry, "other-org/keeper") is not None
+        assert session.get(FoundryRepoCatalogEntry, "org/goner") is None
+        assert session.get(FoundryRepoCatalogEntry, "org/mine") is not None
+
+
+def _tree_failing_transport(repos: list[dict], fail: bool):
+    """Code-facts transport whose tree fetch raises (simulating 5xx after retries)."""
+
+    def transport(method: str, path: str):
+        if "/orgs/org/repos" in path:
+            return 200, {}, repos if _page_num(path) == 1 else []
+        if "/readme" in path:
+            return 200, {}, _readme_response()
+        if "/git/trees/" in path:
+            if fail:
+                raise TransportError("GitHub request failed after 3 retries")
+            return 200, {}, {"sha": "x", "tree": [{"path": "main.py", "type": "blob"}], "truncated": False}
+        if path.endswith("/contents/"):
+            return 200, {}, []
+        if "/pulls" in path:
+            return 200, {}, []
+        return 404, {}, None
+
+    return transport
+
+
+def test_degraded_code_facts_fetch_is_retried_next_sweep() -> None:
+    """A transient tree failure leaves synced_at unset so the next run retries."""
+    _, sf = _engine_and_sf()
+    repos = [_repo("org/flaky")]
+
+    report = CatalogSync(
+        sf, _tree_failing_transport(repos, fail=True), call_budget=3000, fetch_code_facts=True
+    ).sync("org", bootstrap=True)
+    assert report.budget_exhausted is False  # the sweep survived the failure
+
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/flaky")
+        assert entry.synced_at is None, "degraded fetch must not look fresh"
+        assert entry.readme_head is not None  # metadata still stored
+
+    # Next sweep: transport healthy again, repo is picked up and completed.
+    report2 = CatalogSync(
+        sf, _tree_failing_transport(repos, fail=False), call_budget=3000, fetch_code_facts=True
+    ).sync("org")
+    assert report2.deep_fetched == 1
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/flaky")
+        assert entry.synced_at is not None
+        assert json.loads(entry.tree_paths) == ["main.py"]
+
+
+def test_degraded_fetch_preserves_prior_code_facts() -> None:
+    """A transient failure must not overwrite good facts with empty ones."""
+    _, sf = _engine_and_sf()
+    first_sync = datetime(2025, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
+    repos = [_repo("org/app", pushed="2025-01-01T00:00:00Z")]
+
+    CatalogSync(
+        sf,
+        _tree_failing_transport(repos, fail=False),
+        call_budget=3000,
+        fetch_code_facts=True,
+        now=lambda: first_sync,
+    ).sync("org", bootstrap=True)
+
+    # A push lands, then the refresh sweep's tree fetch fails transiently.
+    repos[0]["pushed_at"] = "2026-01-01T00:00:00Z"
+    CatalogSync(
+        sf, _tree_failing_transport(repos, fail=True), call_budget=3000, fetch_code_facts=True
+    ).sync("org")
+
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/app")
+        assert json.loads(entry.tree_paths) == ["main.py"], "prior facts kept"
+        assert _aware(entry.synced_at) == first_sync, "synced_at unbumped: still stale"
+
+    # The repo is still considered stale, so a healthy sweep refreshes it.
+    report = CatalogSync(
+        sf, _tree_failing_transport(repos, fail=False), call_budget=3000, fetch_code_facts=True
+    ).sync("org")
+    assert report.deep_fetched == 1
+    with sf() as session:
+        entry = session.get(FoundryRepoCatalogEntry, "org/app")
+        assert entry.synced_at is not None
+        assert _aware(entry.synced_at) != first_sync
 
 
 def test_code_facts_budget_reservation_resumes() -> None:
