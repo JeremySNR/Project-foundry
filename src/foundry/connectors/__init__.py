@@ -12,12 +12,13 @@ from .github import GitHubConnector
 from .github_issues import GitHubIssuesConnector
 from .gitlab import GitLabConnector
 from .jira import JiraConnector
-from .linear import LinearConnector
+from .linear import LinearConnector, LinearWriteError
 
 __all__ = [
     "IssueTracker",
     "InMemoryIssueTracker",
     "LinearConnector",
+    "LinearWriteError",
     "GitHubConnector",
     "GitHubIssuesConnector",
     "GitLabConnector",

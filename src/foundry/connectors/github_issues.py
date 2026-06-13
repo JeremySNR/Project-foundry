@@ -19,7 +19,9 @@ which is the idiomatic GitHub way to track pipeline position.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Callable
+from urllib.parse import quote
 
 from foundry.schemas.ticket import RawTicket
 
@@ -28,17 +30,29 @@ Transport = Callable[..., Any]
 
 _STATE_LABEL_PREFIX = "foundry:status:"
 _MAX_KEY_PREFIX = 9  # issue-key pattern allows a 10-char alnum prefix total
+_HASH_LEN = 2  # trailing hash chars that disambiguate same-named repos
 
 
 def github_issue_key(repo_full_name: str, number: int | str) -> str:
     """Deterministic ``REPONAME-123`` key for an issue.
 
-    Built from the repo name (alnum only, upper-cased, truncated) so it matches
-    the ``[A-Za-z][A-Za-z0-9]{1,9}-\\d+`` pattern the orchestrator extracts
-    from branch names and PR titles when correlating delegated-agent PRs.
+    Built from the repo name (alnum only, upper-cased, truncated) plus a short
+    deterministic hash of the *full* ``owner/repo`` path, so it matches the
+    ``[A-Za-z][A-Za-z0-9]{1,9}-\\d+`` pattern the orchestrator extracts from
+    branch names and PR titles when correlating delegated-agent PRs.
+
+    The hash suffix is what keeps repos that normalise to the same prefix
+    distinct: without it ``acme/my-app`` and ``acme/myapp`` (or ``acme/web`` and
+    ``beta/web``) both became ``MYAPP``/``WEB`` and a PR could correlate to the
+    wrong run. The hash derives from the whole ``owner/repo`` string so the
+    owner disambiguates identically-named repos across orgs too.
     """
     name = repo_full_name.rsplit("/", 1)[-1]
-    prefix = "".join(c for c in name if c.isalnum()).upper()[: _MAX_KEY_PREFIX + 1]
+    alnum = "".join(c for c in name if c.isalnum()).upper()
+    digest = hashlib.sha1(repo_full_name.encode("utf-8")).hexdigest()[
+        :_HASH_LEN
+    ].upper()
+    prefix = (alnum[: _MAX_KEY_PREFIX + 1 - _HASH_LEN] + digest)
     if not prefix or not prefix[0].isalpha():
         prefix = ("X" + prefix)[: _MAX_KEY_PREFIX + 1]
     if len(prefix) < 2:  # the key pattern needs a 2+ character prefix
@@ -86,17 +100,32 @@ class GitHubIssuesConnector:
         )
 
     def set_state(self, issue_id: str, state_name: str) -> None:
-        """Track Foundry's pipeline position as a ``foundry:status:...`` label."""
+        """Track Foundry's pipeline position as a ``foundry:status:...`` label.
+
+        Adds the new status label and removes any *stale* status labels rather
+        than rewriting the whole set with a single PUT. A PUT GETs-then-PUTs the
+        full label list, so a concurrent label edit between the two calls is
+        silently clobbered; additive ``POST`` + targeted ``DELETE`` only ever
+        touches Foundry's own ``foundry:status:`` labels, leaving everything
+        else alone.
+        """
         repo, number = split_issue_id(issue_id)
+        slug = state_name.lower().replace("foundry:", "").strip().replace(" ", "-")
+        new_label = f"{_STATE_LABEL_PREFIX}{slug}"
+        # Add first so the issue is never momentarily missing a status label.
+        self._transport(
+            "POST",
+            f"/repos/{repo}/issues/{number}/labels",
+            {"labels": [new_label]},
+        )
         data = self._transport("GET", f"/repos/{repo}/issues/{number}")
-        kept = [
+        current = [
             lab["name"] if isinstance(lab, dict) else str(lab)
             for lab in data.get("labels") or []
         ]
-        kept = [lab for lab in kept if not lab.startswith(_STATE_LABEL_PREFIX)]
-        slug = state_name.lower().replace("foundry:", "").strip().replace(" ", "-")
-        self._transport(
-            "PUT",
-            f"/repos/{repo}/issues/{number}/labels",
-            {"labels": kept + [f"{_STATE_LABEL_PREFIX}{slug}"]},
-        )
+        for lab in current:
+            if lab.startswith(_STATE_LABEL_PREFIX) and lab != new_label:
+                self._transport(
+                    "DELETE",
+                    f"/repos/{repo}/issues/{number}/labels/{quote(lab, safe='')}",
+                )

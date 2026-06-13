@@ -47,6 +47,10 @@ mutation FoundryState($issueId: String!, $stateId: String!) {
 _REPO_LABEL_PREFIX = "repo:"
 
 
+class LinearWriteError(RuntimeError):
+    """A Linear mutation reported ``success: false`` (no GraphQL ``errors``)."""
+
+
 class LinearConnector:
     def __init__(
         self,
@@ -91,11 +95,30 @@ class LinearConnector:
         )
 
     def post_comment(self, issue_id: str, body: str) -> None:
-        self._transport(_COMMENT_MUTATION, {"issueId": issue_id, "body": body})
+        data = self._transport(_COMMENT_MUTATION, {"issueId": issue_id, "body": body})
+        _require_success(data, "commentCreate", issue_id)
 
     def set_state(self, issue_id: str, state_name: str) -> None:
         state_id = self._state_map.get(state_name)
         if state_id is None:
             # No configured mapping for this state; skip rather than guess.
             return
-        self._transport(_STATE_MUTATION, {"issueId": issue_id, "stateId": state_id})
+        data = self._transport(
+            _STATE_MUTATION, {"issueId": issue_id, "stateId": state_id}
+        )
+        _require_success(data, "issueUpdate", issue_id)
+
+
+def _require_success(data: dict[str, Any] | None, field: str, issue_id: str) -> None:
+    """Treat a falsy mutation ``success`` flag as a failure.
+
+    Linear can return HTTP 200 with ``{"data": {"issueUpdate": {"success":
+    false}}}`` and no top-level ``errors`` - the live transport's error check
+    never fires, so without this the write is silently dropped (a comment never
+    posted, a state never advanced).
+    """
+    result = (data or {}).get(field)
+    if isinstance(result, dict) and result.get("success") is False:
+        raise LinearWriteError(
+            f"Linear {field} for {issue_id} returned success=false"
+        )

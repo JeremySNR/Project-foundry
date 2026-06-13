@@ -192,6 +192,55 @@ def test_agent_failure_records_failed_outcome(session_factory) -> None:
     assert row.repo == "customer-web"
 
 
+def test_latest_job_repo_is_deterministic_with_null_started_at(session_factory) -> None:
+    """A NULL started_at must sort last on every backend, not first on SQLite.
+
+    Otherwise "the latest job's repo" picks the unstarted job on SQLite and a
+    real job on Postgres - the derived outcome row would differ by backend.
+    """
+    from datetime import datetime, timezone
+
+    base = datetime(2026, 6, 13, tzinfo=timezone.utc)
+    with session_factory() as s:
+        run = FoundryRun(
+            id="r-null-order",
+            linear_issue_id="i-null",
+            linear_issue_key="LIN-9",
+            status=RunStatus.COMPLETE,
+            trigger_type="label",
+        )
+        s.add(run)
+        s.add_all(
+            [
+                FoundryAgentJob(
+                    id="j-early",
+                    run_id="r-null-order",
+                    provider="fake",
+                    repo="early-repo",
+                    started_at=base,
+                ),
+                FoundryAgentJob(
+                    id="j-late",
+                    run_id="r-null-order",
+                    provider="fake",
+                    repo="late-repo",
+                    started_at=base.replace(hour=5),
+                ),
+                # Never started; must not be treated as the most recent job.
+                FoundryAgentJob(
+                    id="j-unstarted",
+                    run_id="r-null-order",
+                    provider="fake",
+                    repo="unstarted-repo",
+                    started_at=None,
+                ),
+            ]
+        )
+        s.commit()
+        outcome = outcomes_module.derive_outcome(s, run)
+        assert outcome.repo == "late-repo"
+
+
 def test_vague_ticket_records_needs_clarification_with_null_repo(session_factory) -> None:
     orch = FoundryOrchestrator(session_factory)
     run_id = orch.intake_and_plan(

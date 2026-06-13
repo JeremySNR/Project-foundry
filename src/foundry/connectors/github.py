@@ -132,6 +132,14 @@ class GitHubConnector:
         return state
 
     def _from_review(self, payload: dict[str, Any]) -> PullRequestState | None:
+        # Only a freshly *submitted* review reports a completed review. A
+        # ``dismissed`` (or ``edited``) action carries a review object whose
+        # state would otherwise fall through to HUMAN_REVIEWED/BOT_REVIEWED -
+        # reading a withdrawn review as a real one. GitHub always sends an
+        # action for this event; a missing one is treated leniently.
+        action = (payload.get("action") or "").lower()
+        if action and action != "submitted":
+            return None
         pr = payload.get("pull_request")
         review = payload.get("review") or {}
         repo = (payload.get("repository") or {}).get("full_name")
@@ -148,15 +156,26 @@ class GitHubConnector:
     def _from_check_suite(self, payload: dict[str, Any]) -> PullRequestState | None:
         suite = payload.get("check_suite") or {}
         repo = (payload.get("repository") or {}).get("full_name")
-        prs = suite.get("pull_requests") or []
-        if not repo or not prs:
+        if not repo:
             return None
-        pr = prs[0]
+        # Pick the PR whose head matches this suite. Fork PRs arrive with an
+        # empty ``pull_requests`` list (GitHub omits PRs living in another repo),
+        # so fall back to the suite's own ``head_branch`` - correlation is by
+        # branch/issue-key, not PR number, and dropping the event would lose CI
+        # status for every fork contribution.
+        head_branch = suite.get("head_branch") or ""
+        prs = suite.get("pull_requests") or []
+        pr = next(
+            (p for p in prs if (p.get("head") or {}).get("ref") == head_branch),
+            prs[0] if prs else None,
+        )
+        if pr is None and not head_branch:
+            return None
         state = PullRequestState(
             repo=repo,
-            pr_number=pr["number"],
-            url=pr.get("url", ""),
-            branch=(pr.get("head") or {}).get("ref", ""),
+            pr_number=(pr or {}).get("number", 0),
+            url=(pr or {}).get("url", ""),
+            branch=((pr or {}).get("head") or {}).get("ref", "") or head_branch,
             status=PRStatus.OPEN,
         )
         conclusion = (suite.get("conclusion") or "").lower()
