@@ -100,6 +100,24 @@ def test_human_changes_requested_review() -> None:
     assert state.review_status is ReviewStatus.CHANGES_REQUESTED
 
 
+def test_dismissed_review_is_ignored() -> None:
+    """A dismissed review must not read as a completed (human/bot) review."""
+    payload = _pr_payload()
+    payload["action"] = "dismissed"
+    payload["review"] = {"state": "dismissed", "user": {"type": "User"}}
+    assert (
+        GitHubConnector().pr_state_from_event("pull_request_review", payload) is None
+    )
+
+
+def test_submitted_action_still_maps() -> None:
+    payload = _pr_payload()
+    payload["action"] = "submitted"
+    payload["review"] = {"state": "approved", "user": {"type": "User"}}
+    state = GitHubConnector().pr_state_from_event("pull_request_review", payload)
+    assert state.review_status is ReviewStatus.APPROVED
+
+
 def test_check_suite_maps_ci_status() -> None:
     payload = {
         "check_suite": {
@@ -112,6 +130,48 @@ def test_check_suite_maps_ci_status() -> None:
     }
     state = GitHubConnector().pr_state_from_event("check_suite", payload)
     assert state.ci_status is CIStatus.FAILING
+
+
+def test_check_suite_fork_pr_keeps_ci_via_head_branch() -> None:
+    """Fork PRs arrive with an empty pull_requests list; CI must still map."""
+    payload = {
+        "check_suite": {
+            "conclusion": "failure",
+            "head_branch": "foundry/lin-123-favourites",
+            "pull_requests": [],
+        },
+        "repository": {"full_name": "o/customer-web"},
+    }
+    state = GitHubConnector().pr_state_from_event("check_suite", payload)
+    assert state is not None
+    assert state.ci_status is CIStatus.FAILING
+    assert state.branch == "foundry/lin-123-favourites"
+
+
+def test_check_suite_with_no_prs_and_no_branch_is_ignored() -> None:
+    payload = {
+        "check_suite": {"conclusion": "success", "pull_requests": []},
+        "repository": {"full_name": "o/customer-web"},
+    }
+    assert GitHubConnector().pr_state_from_event("check_suite", payload) is None
+
+
+def test_check_suite_picks_pr_matching_suite_head() -> None:
+    """With multiple linked PRs, the one matching the suite head wins, not [0]."""
+    payload = {
+        "check_suite": {
+            "conclusion": "success",
+            "head_branch": "feature-b",
+            "pull_requests": [
+                {"number": 1, "url": "u1", "head": {"ref": "feature-a"}},
+                {"number": 2, "url": "u2", "head": {"ref": "feature-b"}},
+            ],
+        },
+        "repository": {"full_name": "o/customer-web"},
+    }
+    state = GitHubConnector().pr_state_from_event("check_suite", payload)
+    assert state.pr_number == 2
+    assert state.branch == "feature-b"
 
 
 def test_unhandled_event_returns_none() -> None:

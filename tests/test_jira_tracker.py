@@ -76,6 +76,41 @@ def test_set_state_fires_matching_transition() -> None:
     )
 
 
+def test_set_state_does_not_match_blocked_to_unblocked() -> None:
+    """Substring matching used to fire 'Unblocked' when asked for 'Blocked'."""
+    jira = FakeJira()
+    jira.transitions = {
+        "transitions": [
+            {"id": "41", "name": "Unblock", "to": {"name": "Unblocked"}},
+            {"id": "42", "name": "Block", "to": {"name": "Blocked"}},
+        ]
+    }
+    JiraConnector(transport=jira).set_state("ACME-42", "Blocked")
+    # The Blocked transition fires, never the Unblocked one whose name happens
+    # to contain "blocked".
+    assert jira.calls[-1] == (
+        "POST",
+        "/rest/api/2/issue/ACME-42/transitions",
+        {"transition": {"id": "42"}},
+    )
+
+
+def test_set_state_phrase_match_still_works() -> None:
+    """Word-boundary containment keeps matching decorated workflow names."""
+    jira = FakeJira()
+    jira.transitions = {
+        "transitions": [
+            {"id": "51", "name": "Start", "to": {"name": "In Progress (dev)"}},
+        ]
+    }
+    JiraConnector(transport=jira).set_state("ACME-42", "Foundry: In Progress")
+    assert jira.calls[-1] == (
+        "POST",
+        "/rest/api/2/issue/ACME-42/transitions",
+        {"transition": {"id": "51"}},
+    )
+
+
 def test_set_state_without_matching_transition_is_a_noop() -> None:
     jira = FakeJira()
     JiraConnector(transport=jira).set_state("ACME-42", "Foundry: Waiting Approval")

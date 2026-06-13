@@ -221,7 +221,9 @@ class FoundryAgentJob(Base):
     status: Mapped[AgentJobStatus] = mapped_column(
         Enum(AgentJobStatus), default=AgentJobStatus.CREATED
     )
-    repo: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 255 to match FoundryRunOutcome.repo / FoundryRepoCatalog.repo - a long
+    # "org/name" must not fail insert here mid-run when it fits everywhere else.
+    repo: Mapped[str | None] = mapped_column(String(255), nullable=True)
     branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(

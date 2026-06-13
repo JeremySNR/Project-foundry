@@ -141,7 +141,16 @@ def derive_outcome(session, run: FoundryRun) -> FoundryRunOutcome:
     jobs = (
         session.query(FoundryAgentJob)
         .filter_by(run_id=run.id)
-        .order_by(FoundryAgentJob.started_at)
+        # SQLite sorts NULLs first, Postgres last, so a plain ``started_at``
+        # order makes "the latest job's repo" (the reversed() pick below)
+        # backend-dependent. Sort unstarted jobs (NULL started_at) first
+        # explicitly so a started job always counts as more recent, and break
+        # ties on ``id`` - deterministic on both backends.
+        .order_by(
+            FoundryAgentJob.started_at.is_(None).desc(),
+            FoundryAgentJob.started_at,
+            FoundryAgentJob.id,
+        )
         .all()
     )
     costs = [j.cost_usd for j in jobs if j.cost_usd is not None]
