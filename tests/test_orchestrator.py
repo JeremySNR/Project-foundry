@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from foundry.agents.manual import InMemoryFakeProvider
 from foundry.connectors import GitHubConnector, InMemoryIssueTracker
@@ -553,6 +554,81 @@ def test_rejected_issue_can_be_reanalysed(session_factory) -> None:
     orch.reject(first, user="lead@example.com")
     second = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
     assert second != first
+
+
+def test_db_refuses_second_active_run_for_issue(session_factory) -> None:
+    """The schema itself is the arbiter, not just the intake pre-check."""
+    with session_factory() as s:
+        s.add(
+            FoundryRun(
+                id="run-a",
+                linear_issue_id="i-1",
+                linear_issue_key="LIN-123",
+                status=RunStatus.WAITING_APPROVAL,
+                trigger_type="label",
+            )
+        )
+        s.commit()
+    with session_factory() as s:
+        s.add(
+            FoundryRun(
+                id="run-b",
+                linear_issue_id="i-1",
+                linear_issue_key="LIN-123",
+                status=RunStatus.ANALYSING,
+                trigger_type="label",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            s.commit()
+
+
+def test_db_allows_new_run_alongside_finished_ones(session_factory) -> None:
+    """The unique index is partial: terminal runs never pin their issue."""
+    with session_factory() as s:
+        for run_id, status in [
+            ("run-a", RunStatus.REJECTED),
+            ("run-b", RunStatus.NEEDS_CLARIFICATION),
+            ("run-c", RunStatus.NEEDS_CLARIFICATION),
+            ("run-d", RunStatus.WAITING_APPROVAL),
+        ]:
+            s.add(
+                FoundryRun(
+                    id=run_id,
+                    linear_issue_id="i-1",
+                    linear_issue_key="LIN-123",
+                    status=status,
+                    trigger_type="label",
+                )
+            )
+            s.commit()
+
+
+def test_intake_race_attaches_to_surviving_run(session_factory, monkeypatch) -> None:
+    """Two webhook deliveries race past the pre-check; exactly one run survives.
+
+    The pre-check is simulated as stale for both deliveries (each read before
+    the other committed, as in a real multi-worker race); the loser must fall
+    back to the surviving run instead of creating a duplicate or erroring.
+    """
+    orch = _orch(session_factory)
+    real_lookup = FoundryOrchestrator.find_active_run_id_for_issue
+    lookups = {"count": 0}
+
+    def stale_then_real(self, issue_id):
+        lookups["count"] += 1
+        if lookups["count"] <= 2:  # the two deliveries' pre-checks
+            return None
+        return real_lookup(self, issue_id)  # the loser's recovery lookup
+
+    monkeypatch.setattr(
+        FoundryOrchestrator, "find_active_run_id_for_issue", stale_then_real
+    )
+    first = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    second = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert second == first
+    with session_factory() as s:
+        assert s.query(FoundryRun).count() == 1
     assert _status(session_factory, second) is RunStatus.WAITING_APPROVAL
 
 
