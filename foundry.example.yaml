@@ -59,6 +59,21 @@ budget:
   # usage (e.g. Cursor Cloud) report spend.
   max_cost_per_run: 25.0
 
+webhook:
+  # Replay protection for inbound webhooks (see api/dedup.py).
+  #
+  # Durable dedup: every delivery id is recorded in foundry_webhook_deliveries
+  # (unique per provider+delivery_id), so a replayed/redelivered event is
+  # ignored - atomically across workers and across restarts, unlike the old
+  # in-process set. Rows older than the TTL are pruned so the table stays
+  # bounded. null disables pruning (unbounded growth - not advised).
+  dedup_ttl_seconds: 86400        # 24h
+  # Optional, fail-closed: reject a delivery whose provider timestamp is older
+  # than this many seconds. Only Linear sends a timestamp (webhookTimestamp);
+  # GitHub/GitLab/Jira carry only a delivery id, so their replay protection is
+  # the dedup table above. Must be <= dedup_ttl_seconds. null disables it.
+  replay_max_age_seconds: null
+
 agent:
   # Which coding agent receives approved work:
   #   manual           - record the job for a human (safe default)
