@@ -409,10 +409,72 @@ class FoundryOrchestrator:
                     ),
                 )
             )
+            # "Stop"/"reject" must also stop the agent working and spending, not
+            # just stop Foundry listening. Best-effort: a provider that can't
+            # cancel never blocks the run's terminal transition.
+            self._cancel_active_job(session, run_id, user=user)
             issue_id = run.linear_issue_id
             self._record_outcome_if_terminal(session, run)
             session.commit()
         self._notify_state(issue_id, status)
+
+    def _cancel_active_job(self, session, run_id: str, *, user: str) -> None:
+        """Cancel the run's in-flight provider job when a human ends the run.
+
+        Only the latest job is cancellable, and only while it is still
+        ``CREATED``/``RUNNING`` and was launched by the *currently configured*
+        provider (mirrors :meth:`_refresh_job_costs`: a foreign ``provider_job_id``
+        is not ours to cancel). Failure-isolated exactly like tracker write-back -
+        a provider whose cancel call raises still leaves the run blocked, with the
+        failure recorded on the ``AGENT_CANCELLED`` audit event for the trail.
+        """
+        job = (
+            session.query(FoundryAgentJob)
+            .filter(FoundryAgentJob.run_id == run_id)
+            .order_by(FoundryAgentJob.started_at.desc())
+            .first()
+        )
+        if job is None or job.status not in (
+            AgentJobStatus.CREATED,
+            AgentJobStatus.RUNNING,
+        ):
+            return
+        if not job.provider_job_id or job.provider != self._provider.name:
+            return
+
+        error: str | None = None
+        try:
+            self._provider.cancel_job(job.provider_job_id)
+        except Exception as exc:  # never let cancellation break the termination
+            error = str(exc) or exc.__class__.__name__
+            _log.exception(
+                "provider cancel failed for job %s (run %s); run still blocked",
+                job.id,
+                run_id,
+            )
+
+        if error is None:
+            job.status = AgentJobStatus.CANCELLED
+            job.completed_at = datetime.now(timezone.utc)
+        else:
+            job.error = error
+
+        metadata = {
+            "provider": job.provider,
+            "job_id": job.provider_job_id,
+            "cancelled": error is None,
+            "requested_by": user,
+        }
+        if error is not None:
+            metadata["error"] = error
+        session.add(
+            build_audit_event(
+                run_id=run_id,
+                event_type=AuditEventType.AGENT_CANCELLED,
+                actor_type="foundry",
+                metadata=metadata,
+            )
+        )
 
     # -- read helpers (used by the API) ---------------------------------------
 

@@ -765,3 +765,93 @@ def test_mark_agent_failed_on_running_run_still_fails_it(session_factory) -> Non
     orch.mark_agent_failed(run_id, reason="agent crashed")
     assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
     assert _outcome_value(session_factory, run_id) == "failed"
+
+
+# -- stop cancels the agent: "stop" means stop spending, not just stop listening -
+
+
+def _running_run_with_provider(session_factory, provider):
+    """A run dispatched (but not yet finished) so its provider job is in flight."""
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    return orch, run_id, job
+
+
+def _cancellation_events(session_factory, run_id):
+    import json
+
+    from foundry.db.models import AuditEventType, FoundryAuditEvent
+
+    with session_factory() as s:
+        return [
+            json.loads(e.metadata_json or "{}")
+            for e in s.query(FoundryAuditEvent).filter_by(run_id=run_id)
+            if e.event_type is AuditEventType.AGENT_CANCELLED
+        ]
+
+
+def test_stop_cancels_the_provider_job(session_factory) -> None:
+    from foundry.db.models import AgentJobStatus
+
+    provider = InMemoryFakeProvider()
+    orch, run_id, job = _running_run_with_provider(session_factory, provider)
+    # Provider status uses schemas.common.AgentJobStatus; the DB column uses the
+    # db.models enum. They are distinct classes, so compare provider status by
+    # value (==) and the persisted job row by identity (is).
+    assert provider.get_job_status(job.job_id).status == AgentJobStatus.RUNNING
+
+    orch.stop(run_id, user="lead@example.com")
+
+    # The agent was told to stop; the run is blocked; the job row is terminal.
+    assert provider.get_job_status(job.job_id).status == AgentJobStatus.CANCELLED
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _outcome_value(session_factory, run_id) == "blocked"
+    with session_factory() as s:
+        job_row = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+        assert job_row.status is AgentJobStatus.CANCELLED
+        assert job_row.completed_at is not None
+
+    events = _cancellation_events(session_factory, run_id)
+    assert len(events) == 1
+    assert events[0]["cancelled"] is True
+    assert events[0]["job_id"] == job.job_id
+    assert events[0]["requested_by"] == "lead@example.com"
+
+
+def test_stop_still_blocks_when_provider_cancel_fails(session_factory) -> None:
+    from foundry.db.models import AgentJobStatus
+
+    class _UncancellableProvider(InMemoryFakeProvider):
+        def cancel_job(self, job_id: str) -> None:
+            raise RuntimeError("cursor cancel API unavailable")
+
+    provider = _UncancellableProvider()
+    orch, run_id, _job = _running_run_with_provider(session_factory, provider)
+
+    # A provider that cannot cancel must never block the human's stop.
+    orch.stop(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _outcome_value(session_factory, run_id) == "blocked"
+    with session_factory() as s:
+        job_row = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+        # The job is not marked cancelled (the provider refused); the failure is
+        # recorded rather than swallowed.
+        assert job_row.status is AgentJobStatus.RUNNING
+        assert "unavailable" in (job_row.error or "")
+
+    events = _cancellation_events(session_factory, run_id)
+    assert len(events) == 1
+    assert events[0]["cancelled"] is False
+    assert "unavailable" in events[0]["error"]
+
+
+def test_reject_before_dispatch_records_no_cancellation(session_factory) -> None:
+    # No agent has been dispatched yet, so there is nothing to cancel and no
+    # spurious AGENT_CANCELLED event should be written.
+    orch = _orch(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.reject(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.REJECTED
+    assert _cancellation_events(session_factory, run_id) == []
