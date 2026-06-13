@@ -23,6 +23,8 @@ import re
 from datetime import datetime, timezone
 from typing import Mapping
 
+from sqlalchemy.exc import IntegrityError
+
 from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
@@ -169,7 +171,13 @@ class FoundryOrchestrator:
     def intake_and_plan(
         self, ticket: RawTicket, *, trigger_type: str, created_by: str | None = None
     ) -> str:
-        """Run analysis -> context -> risk -> plan -> policy gate; persist all."""
+        """Run analysis -> context -> risk -> plan -> policy gate; persist all.
+
+        Concurrent intake for the same issue is safe: the pre-check below is
+        the fast path, and the ``uq_foundry_runs_one_active_per_issue`` partial
+        unique index is the arbiter. An intake that loses the race returns the
+        surviving run's id instead of creating a duplicate.
+        """
         # At most one *active* run per issue; finished/blocked runs may be
         # superseded by a fresh trigger (e.g. after the ticket is clarified).
         active = self.find_active_run_id_for_issue(ticket.issue_id)
@@ -187,74 +195,91 @@ class FoundryOrchestrator:
 
         status = self._post_plan_status(analysis, risk, decision.allowed)
 
-        with self._sf() as session:
-            run = FoundryRun(
-                id=run_id,
-                linear_issue_id=ticket.issue_id,
-                linear_issue_key=ticket.issue_key,
-                status=RunStatus.ANALYSING,
-                trigger_type=trigger_type,
-                created_by=created_by,
-                current_step="intake",
-                risk_level=risk.overall_risk,
-                agent_mode=decision.allowed_agent_mode,
-            )
-            session.add(run)
-            self._add(session, run_id, ArtifactType.TICKET_SNAPSHOT, ticket)
-            self._add(session, run_id, ArtifactType.TICKET_ANALYSIS, analysis)
-            self._add(session, run_id, ArtifactType.CONTEXT_BUNDLE, context)
-            self._add(session, run_id, ArtifactType.RISK_ASSESSMENT, risk)
-            self._add(session, run_id, ArtifactType.DELIVERY_PLAN, plan)
-            session.add(
-                build_audit_event(
-                    run_id=run_id,
-                    event_type=AuditEventType.RUN_STARTED,
-                    actor_type="foundry",
-                    output_content=ticket,
+        try:
+            with self._sf() as session:
+                run = FoundryRun(
+                    id=run_id,
+                    linear_issue_id=ticket.issue_id,
+                    linear_issue_key=ticket.issue_key,
+                    status=RunStatus.ANALYSING,
+                    trigger_type=trigger_type,
+                    created_by=created_by,
+                    current_step="intake",
+                    risk_level=risk.overall_risk,
+                    agent_mode=decision.allowed_agent_mode,
                 )
-            )
-            session.add(
-                build_audit_event(
-                    run_id=run_id,
-                    event_type=AuditEventType.ANALYSIS_COMPLETED,
-                    actor_type="foundry",
-                    output_content=analysis,
-                )
-            )
-            session.add(
-                build_policy_decision_row(
-                    run_id=run_id, payload=payload, decision=decision
-                )
-            )
-            session.add(
-                build_audit_event(
-                    run_id=run_id,
-                    event_type=AuditEventType.POLICY_EVALUATED,
-                    actor_type="foundry",
-                    output_content=decision,
-                )
-            )
-            run.status = status
-            run.current_step = "planned"
-            if status is RunStatus.WAITING_APPROVAL:
+                session.add(run)
+                self._add(session, run_id, ArtifactType.TICKET_SNAPSHOT, ticket)
+                self._add(session, run_id, ArtifactType.TICKET_ANALYSIS, analysis)
+                self._add(session, run_id, ArtifactType.CONTEXT_BUNDLE, context)
+                self._add(session, run_id, ArtifactType.RISK_ASSESSMENT, risk)
+                self._add(session, run_id, ArtifactType.DELIVERY_PLAN, plan)
                 session.add(
                     build_audit_event(
                         run_id=run_id,
-                        event_type=AuditEventType.APPROVAL_REQUESTED,
+                        event_type=AuditEventType.RUN_STARTED,
                         actor_type="foundry",
+                        output_content=ticket,
                     )
                 )
-            elif status is RunStatus.BLOCKED:
                 session.add(
                     build_audit_event(
                         run_id=run_id,
-                        event_type=AuditEventType.RUN_BLOCKED,
+                        event_type=AuditEventType.ANALYSIS_COMPLETED,
                         actor_type="foundry",
-                        metadata={"category": "unroutable"},
+                        output_content=analysis,
                     )
                 )
-            self._record_outcome_if_terminal(session, run)
-            session.commit()
+                session.add(
+                    build_policy_decision_row(
+                        run_id=run_id, payload=payload, decision=decision
+                    )
+                )
+                session.add(
+                    build_audit_event(
+                        run_id=run_id,
+                        event_type=AuditEventType.POLICY_EVALUATED,
+                        actor_type="foundry",
+                        output_content=decision,
+                    )
+                )
+                run.status = status
+                run.current_step = "planned"
+                if status is RunStatus.WAITING_APPROVAL:
+                    session.add(
+                        build_audit_event(
+                            run_id=run_id,
+                            event_type=AuditEventType.APPROVAL_REQUESTED,
+                            actor_type="foundry",
+                        )
+                    )
+                elif status is RunStatus.BLOCKED:
+                    session.add(
+                        build_audit_event(
+                            run_id=run_id,
+                            event_type=AuditEventType.RUN_BLOCKED,
+                            actor_type="foundry",
+                            metadata={"category": "unroutable"},
+                        )
+                    )
+                self._record_outcome_if_terminal(session, run)
+                session.commit()
+        except IntegrityError:
+            # Lost an intake race: a concurrent delivery for this issue
+            # committed its run first and the one-active-run-per-issue index
+            # refused ours (everything above rolled back as one transaction).
+            # Attach to the surviving run; the winner already owns the tracker
+            # write-back.
+            existing = self.find_active_run_id_for_issue(ticket.issue_id)
+            if existing is None:
+                raise
+            _log.info(
+                "duplicate intake for issue %s lost the race; attaching to "
+                "active run %s",
+                ticket.issue_id,
+                existing,
+            )
+            return existing
 
         # Mirror the outcome back to the tracker (Linear) if one is configured.
         if self._tracker is not None:

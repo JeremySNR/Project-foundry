@@ -29,10 +29,16 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from foundry.schemas.common import AgentMode, OverallRisk, RunStatus
+from foundry.schemas.common import (
+    ACTIVE_RUN_STATUSES,
+    AgentMode,
+    OverallRisk,
+    RunStatus,
+)
 
 from .base import Base
 
@@ -82,12 +88,32 @@ class AuditEventType(str, enum.Enum):
     RUN_BLOCKED = "run.blocked"
 
 
+# SQLAlchemy's Enum persists member *names* ('ANALYSING', ...), so the index
+# predicate below must use names, not values. Derived from ACTIVE_RUN_STATUSES
+# so the schema can never drift from the lifecycle definition.
+_ACTIVE_STATUS_PREDICATE = "status IN ({})".format(
+    ", ".join(sorted(f"'{s.name}'" for s in ACTIVE_RUN_STATUSES))
+)
+
+
 class FoundryRun(Base):
     __tablename__ = "foundry_runs"
 
-    # NOTE: deliberately no unique constraint on linear_issue_id - a ticket may
+    # NOTE: linear_issue_id is deliberately not unique on its own - a ticket may
     # be re-analysed after clarification, rejection or failure. "At most one
-    # *active* run per issue" is enforced at intake, not by the schema.
+    # *active* run per issue" is enforced by the partial unique index below
+    # (migration 0006 on Postgres; create_all on SQLite dev), which backstops
+    # the intake pre-check against concurrent webhook deliveries.
+    __table_args__ = (
+        Index(
+            "uq_foundry_runs_one_active_per_issue",
+            "linear_issue_id",
+            unique=True,
+            sqlite_where=text(_ACTIVE_STATUS_PREDICATE),
+            postgresql_where=text(_ACTIVE_STATUS_PREDICATE),
+        ),
+    )
+
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     linear_issue_id: Mapped[str] = mapped_column(String(128), index=True)
     linear_issue_key: Mapped[str] = mapped_column(String(64), index=True)

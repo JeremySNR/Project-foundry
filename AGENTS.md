@@ -118,7 +118,6 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
 - Risk-from-ticket is keyword matching by default (risk-from-diff globs are
   precise); `risk.provider: llm` adds judgment + cited evidence, escalate-only.
 - Single-tenant DB; approvers are static config (no SSO/SCIM); no rate limiting.
-- No DB-level idempotency on intake — simultaneous webhooks for one issue can race.
 - Temporal driver unproven against a live server; inline driver is production path.
 - One run targets one repo; no cross-repo or epic decomposition.
 - No Slack/Teams surface; approvals are tracker comments or the REST endpoint.
