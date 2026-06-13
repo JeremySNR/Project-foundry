@@ -855,3 +855,101 @@ def test_reject_before_dispatch_records_no_cancellation(session_factory) -> None
     orch.reject(run_id, user="lead@example.com")
     assert _status(session_factory, run_id) is RunStatus.REJECTED
     assert _cancellation_events(session_factory, run_id) == []
+
+
+# -- audit integrity on provider dispatch failure (issue #13) -------------------
+
+
+class _RaisingProvider(InMemoryFakeProvider):
+    """Fake provider whose dispatch raises, like a real provider's HTTP call
+    timing out or the secret-leak guard tripping."""
+
+    name = "raising"
+
+    def _dispatch(self, job_input):  # type: ignore[override]
+        raise RuntimeError("provider API unreachable")
+
+
+def _events_of_type(session_factory, run_id, event_type):
+    from foundry.db.models import FoundryAuditEvent
+
+    with session_factory() as s:
+        return [
+            e
+            for e in s.query(FoundryAuditEvent).filter_by(run_id=run_id)
+            if e.event_type is event_type
+        ]
+
+
+def test_provider_failure_at_dispatch_is_audited_not_swallowed(session_factory) -> None:
+    """A provider exception during the first dispatch must leave a trail: the
+    recorded policy ALLOW decision survives, an AGENT_FAILED event is written,
+    and the run lands in a definite (failed) status - never stranded as APPROVED
+    with a live authorisation but no agent (issue #13)."""
+    from foundry.db.models import AuditEventType
+
+    orch = _orch(session_factory, provider=_RaisingProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+
+    with pytest.raises(RuntimeError):
+        orch.dispatch_agent(run_id)
+
+    # The run did not silently stay APPROVED.
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    # The policy decision that authorised the (failed) dispatch is on the trail.
+    with session_factory() as s:
+        decisions = s.query(FoundryPolicyDecision).filter_by(run_id=run_id).all()
+    assert any(d.allowed for d in decisions), "the allow decision was lost"
+    # The failure itself is recorded.
+    failed = _events_of_type(session_factory, run_id, AuditEventType.AGENT_FAILED)
+    assert len(failed) == 1
+    # No phantom AGENT_STARTED event for an agent that never started, and no job row.
+    assert _events_of_type(session_factory, run_id, AuditEventType.AGENT_STARTED) == []
+    assert _job_count(session_factory, run_id) == 0
+
+
+def test_failed_dispatch_run_is_re_triggerable(session_factory) -> None:
+    """A dispatch that failed at the provider is terminal, so a fresh intake for
+    the same issue is allowed to start a new run (not refused as still-active)."""
+    orch = _orch(session_factory, provider=_RaisingProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    with pytest.raises(RuntimeError):
+        orch.dispatch_agent(run_id)
+
+    # The same issue can be picked up again.
+    assert orch.find_active_run_id_for_issue("i-1") is None
+    new_run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert new_run_id != run_id
+
+
+def test_provider_failure_during_remediation_hands_pr_to_human(session_factory) -> None:
+    """If re-dispatch to fix a failing PR raises at the provider, the RETRY policy
+    decision is still recorded, the failure is audited, and the PR is parked for
+    a human (REVIEW_REQUIRED) rather than left at PR_OPEN with the gate row lost."""
+    from foundry.db.models import AuditEventType
+
+    # Dispatch the first job successfully, then swap in a provider that fails so
+    # the *remediation* dispatch is the one that raises.
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    orch._provider = _RaisingProvider()
+    failing = _pr(files_changed=[], ci_status=CIStatus.FAILING, summary="2 failed")
+    with pytest.raises(RuntimeError):
+        orch.record_pr(run_id, failing)
+
+    assert _status(session_factory, run_id) is RunStatus.REVIEW_REQUIRED
+    # The RETRY_AGENT allow decision was committed before the provider call.
+    with session_factory() as s:
+        decisions = s.query(FoundryPolicyDecision).filter_by(run_id=run_id).all()
+    assert any(d.allowed for d in decisions)
+    # The failed remediation is audited and no second job row was created.
+    assert _events_of_type(session_factory, run_id, AuditEventType.AGENT_FAILED)
+    assert _job_count(session_factory, run_id) == 1
