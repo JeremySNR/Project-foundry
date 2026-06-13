@@ -33,7 +33,10 @@ Point the `claude_code` provider at Fable 5 (or `cursor_*` at Cursor's agents, o
 
 ```bash
 git clone https://github.com/JeremySNR/Project-foundry && cd Project-foundry
-python -m venv .venv && source .venv/bin/activate && pip install -e .
+python -m venv .venv
+source .venv/bin/activate     # macOS / Linux
+# .venv\Scripts\activate      # Windows (PowerShell or cmd)
+pip install -e .
 python scripts/demo.py
 ```
 
@@ -199,7 +202,8 @@ Tagged releases (`vX.Y.Z`) publish a container image to GHCR (`ghcr.io/jeremysnr
 For development:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate     # macOS / Linux; on Windows: .venv\Scripts\activate
 pip install -e ".[test]"
 pytest
 ```
