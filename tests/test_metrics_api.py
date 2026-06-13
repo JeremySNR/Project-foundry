@@ -196,6 +196,33 @@ def test_blocked_run_superseded_by_later_merge(client) -> None:
     assert body["blocked_superseded_by_merged_run"] == 1
 
 
+def test_agent_metrics_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/agents").status_code == 401
+    assert client.get("/metrics/agents?days=0", headers=AUTH).status_code == 422
+
+
+def test_agent_metrics_empty_database(client) -> None:
+    body = client.get("/metrics/agents", headers=AUTH).json()
+    assert body["days"] == 90
+    assert body["min_samples"] == 3
+    assert body["providers"] == []
+
+
+def test_agent_metrics_scores_the_dispatched_provider(client) -> None:
+    _run_to_merged(client)
+    body = client.get("/metrics/agents?days=30", headers=AUTH).json()
+    assert body["days"] == 30
+    providers = body["providers"]
+    assert len(providers) == 1
+    card = providers[0]
+    # The in-memory fake provider shipped the merge.
+    assert card["provider"] == "fake"
+    assert card["runs"] == 1
+    assert card["merged"] == 1
+    assert card["success_rate"] == 1.0
+    assert {r["repo"] for r in card["by_repo"]} == {"customer-web"}
+
+
 def test_final_summary_appears_in_timeline(client) -> None:
     _run_to_merged(client)
     run_id = _latest_run_id(client)
