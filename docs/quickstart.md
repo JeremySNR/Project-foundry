@@ -29,6 +29,11 @@ Copy the example config and edit it:
 cp foundry.example.yaml foundry.yaml
 ```
 
+`docker compose` mounts `foundry.example.yaml` by default so a bare
+`docker compose up` boots with no copy step. To use your edited `foundry.yaml`,
+point the `api` service's `volumes:` line at it (the comment block at the top of
+`docker-compose.yaml` shows exactly which line to change).
+
 The three sections that matter first (keys must be nested exactly as below -
 `config.py` ignores anything it doesn't recognise, so a misplaced block is
 silently dropped):
@@ -73,7 +78,9 @@ docker compose up --build
 
 - API: http://localhost:8000 (health: `/healthz`)
 - Dashboard: http://localhost:8000/dashboard (paste your `FOUNDRY_API_TOKEN`)
-- Postgres data persists in the `foundry-pg` volume
+- Postgres data persists in the `foundry-pg` volume (published on `localhost:5432`)
+- The API container runs `alembic upgrade head` on startup, so the Postgres
+  schema is created (and stamped) automatically — no manual migration step
 
 Expose it: `ngrok http 8000` and note the public URL.
 
