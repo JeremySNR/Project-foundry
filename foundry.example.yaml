@@ -88,6 +88,16 @@ tracker:
 #            self-managed GitLab set FOUNDRY_GITLAB_API_BASE (default
 #            https://gitlab.com/api/v4).
 
+# Chat approvals (Slack):
+#   Slack - set FOUNDRY_SLACK_SIGNING_SECRET to enable POST /webhooks/slack.
+#           Approvers click approve/reject/stop buttons; the request is verified
+#           against Slack's v0 request signature with replay-age protection, then
+#           driven through the SAME policy gate and role checks as every other
+#           surface. The actor is the Slack-signed user id, so when Slack is your
+#           approval surface, key the approvers below by Slack user id (e.g.
+#           "U07ABC123") rather than email - as GitHub Issues approvers are keyed
+#           by login. Fail-closed: no signing secret => endpoint disabled.
+
 triggers:
   # A run starts only on an explicit opt-in, never for every new issue.
   label: "foundry:candidate"
@@ -97,6 +107,8 @@ approval:
   # Who may run /foundry approve, and which approval roles each person's
   # sign-off grants. Roles are CONFIG, never request payload - an API caller
   # cannot claim "security" for themselves. Empty means nobody can approve.
+  # Key approvers by the identity the surface reports: email for Linear/Jira/REST,
+  # GitHub login for GitHub Issues, Slack user id for the Slack approval surface.
   approvers:
     - email: "lead@example.com"
       roles: ["engineering"]

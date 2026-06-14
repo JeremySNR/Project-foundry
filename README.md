@@ -79,7 +79,7 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
 | `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, **Cursor** two ways, **Claude Code** via GitHub Actions, or *any* agent behind a signed webhook (see below). |
 | `foundry.connectors` | Adapters for the tools Foundry talks to. Trackers: **Linear**, **GitHub Issues**, **Jira**. SCMs: **GitHub** and **GitLab** (watch the PR/MR, pull failing check summaries). |
-| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, approval commands, run status, the per-run decision timeline, and the dashboard. |
+| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, Slack interactivity approvals, approval commands, run status, the per-run decision timeline, and the dashboard. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
 ### The Cursor handoff (the nice bit)
@@ -104,6 +104,10 @@ The tracker and the SCM are seams too, not assumptions:
 - **GitHub Issues** (`tracker.provider: github_issues`) - the issue *is* the ticket. Trigger with the `foundry:candidate` label, approve with a `/foundry approve` comment, and Foundry writes its analysis back as comments and tracks pipeline position with `foundry:status:` labels. Approvers are keyed by GitHub login (the webhook signature plus GitHub's own identity authenticates the actor). Issue keys are synthesised from the repo name plus a short hash of the full `owner/repo` path (`CUSTOMEREB-42`) so PR correlation works unchanged and similarly-named repos never collide.
 - **Jira** (`tracker.provider: jira`) - same trigger/command semantics over Jira Cloud webhooks (`/webhooks/jira`). Jira keys (`ACME-42`) already match the correlation pattern. `set_state` fires the matching workflow transition when one exists and otherwise leaves your workflow alone.
 - **GitLab** - point a project webhook at `/webhooks/gitlab` (merge request + pipeline events, `X-Gitlab-Token` auth) and merge requests close the loop exactly like GitHub PRs, including CI-failure remediation. Set `FOUNDRY_GITLAB_API_TOKEN` so MR diffs are fetched and the same file-based gates (forbidden paths, oversize, sensitive areas) apply; without it GitLab MRs are diff-blind, just as GitHub PRs are without `FOUNDRY_GITHUB_API_TOKEN`.
+
+Approvals don't have to happen in the tracker, either:
+
+- **Slack** - approvers who live in chat can approve/reject/stop from an interactive message. Point Slack interactivity at `/webhooks/slack` and set `FOUNDRY_SLACK_SIGNING_SECRET`; each button click is verified against Slack's v0 request signature (with replay-age protection) and then driven through the *same* policy gate, role checks, and audit writes as every other surface. The actor is the Slack-signed `user.id`, so key approvers by Slack user id (as GitHub Issues keys them by login). Fail-closed: no signing secret, no endpoint. (Posting the interactive message and pushing run-status notifications back into Slack is the next slice — see issue #32.)
 
 The webhook payload shapes are pinned by fixtures in `tests/fixtures/` - spec-derived from the providers' webhook docs today, and meant to be replaced by redacted live captures over time. If a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
 
@@ -182,6 +186,7 @@ Secrets via env:
 | `FOUNDRY_JIRA_BASE_URL` / `..._EMAIL` / `..._API_TOKEN` | Jira Cloud credentials when the tracker is `jira`. |
 | `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
 | `FOUNDRY_GITLAB_API_TOKEN` / `..._BASE` | Fetches MR diffs so GitLab MRs run the same file-based gates as GitHub PRs (without it, MRs are diff-blind). `..._BASE` overrides the API root for self-managed GitLab. |
+| `FOUNDRY_SLACK_SIGNING_SECRET` | Enables `/webhooks/slack` (Slack v0 request-signing + replay-age; endpoint disabled without it). |
 | `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
