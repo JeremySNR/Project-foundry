@@ -22,6 +22,7 @@ def test_low_risk_frontend_change_allows_draft_pr() -> None:
                 "risk": {"overall_risk": "low"},
                 "repo": {"name": "customer-web", "confidence": 90},
                 "approval": {},
+                "approval_present": True,
             }
         )
     )
@@ -37,6 +38,7 @@ def test_auth_change_requires_engineering_approval() -> None:
             "risk": {"overall_risk": "medium", "auth": True},
             "repo": {"confidence": 90},
             "approval": {},
+            "approval_present": True,
         }
     )
     decision = _engine().evaluate(payload)
@@ -119,6 +121,7 @@ def test_high_risk_only_allows_human_only_mode() -> None:
                 "risk": {"overall_risk": "high"},
                 "repo": {"confidence": 90},
                 "approval": {},
+                "approval_present": True,
             }
         )
     )
@@ -189,6 +192,7 @@ def test_retry_within_cap_allowed_past_cap_denied() -> None:
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "approval": {},
+        "approval_present": True,
     }
     within = _engine().evaluate(
         PolicyInput.model_validate({**base, "retry": {"attempt": 2, "max_attempts": 2}})
@@ -208,6 +212,7 @@ def test_retry_over_budget_denied_under_budget_allowed() -> None:
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "approval": {},
+        "approval_present": True,
     }
     over = _engine().evaluate(
         PolicyInput.model_validate(
@@ -239,6 +244,7 @@ def test_start_agent_budget_enforced_at_first_dispatch() -> None:
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "approval": {},
+        "approval_present": True,
     }
     over = _engine().evaluate(
         PolicyInput.model_validate(
@@ -303,6 +309,7 @@ def test_budget_not_applied_to_non_spend_actions() -> None:
                 "risk": {"overall_risk": "low"},
                 "repo": {"confidence": 90},
                 "approval": {},
+                "approval_present": True,
                 "budget": {"cost_usd": 99.0, "max_cost_usd": 5.0},
             }
         )
@@ -335,6 +342,7 @@ def _start(**risk_repo) -> PolicyInput:
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "approval": {},
+        "approval_present": True,
     }
     base.update(risk_repo)
     return PolicyInput.model_validate(base)
@@ -359,6 +367,7 @@ def test_budget_cost_exactly_at_cap_denies() -> None:
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "approval": {},
+        "approval_present": True,
     }
     at_cap = _engine().evaluate(
         PolicyInput.model_validate(
@@ -386,6 +395,7 @@ def test_retry_attempt_exactly_at_zero_cap_denies() -> None:
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "approval": {},
+        "approval_present": True,
     }
     first_retry = _engine().evaluate(
         PolicyInput.model_validate(
@@ -410,6 +420,7 @@ def test_multi_area_work_requires_every_derived_role() -> None:
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "high", "auth": True, "payments": True},
         "repo": {"confidence": 90},
+        "approval_present": True,
     }
     none = _engine().evaluate(
         PolicyInput.model_validate({**both_areas, "approval": {}})
@@ -454,7 +465,8 @@ def test_branch_pr_and_complete_actions_are_governed_like_start_agent() -> None:
             )
         )
         assert denied.allowed is False, action
-        # A ready, confident, low-risk ticket passes the same gate.
+        # A ready, confident, low-risk ticket passes the same gate (with a
+        # recorded approval present, which every autonomous action now needs).
         allowed = _engine().evaluate(
             PolicyInput.model_validate(
                 {
@@ -463,7 +475,105 @@ def test_branch_pr_and_complete_actions_are_governed_like_start_agent() -> None:
                     "risk": {"overall_risk": "low"},
                     "repo": {"confidence": 90},
                     "approval": {},
+                    "approval_present": True,
                 }
             )
         )
         assert allowed.allowed is True, action
+
+
+# -- issue #18: the gate itself requires at least one recorded approval --------
+
+
+def _approvable_start(**overrides) -> dict:
+    base = {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_autonomous_action_denied_without_recorded_approval() -> None:
+    """A ready, low-risk, confident-repo run that derives *no* required roles is
+    still refused unless a human approval is recorded - the human-in-the-loop
+    promise as a policy rule, not just an orchestration check (issue #18)."""
+    # Default (approval_present omitted -> False) is denied for missing approval.
+    denied = _engine().evaluate(PolicyInput.model_validate(_approvable_start()))
+    assert denied.allowed is False
+    assert denied.allowed_agent_mode is AgentMode.HUMAN_ONLY
+    assert any(
+        "requires at least one recorded human approval" in r for r in denied.reasons
+    )
+    # An explicit approval_present=False is denied identically.
+    explicit_false = _engine().evaluate(
+        PolicyInput.model_validate(_approvable_start(approval_present=False))
+    )
+    assert explicit_false.allowed is False
+    # With an approval recorded, the same run passes.
+    allowed = _engine().evaluate(
+        PolicyInput.model_validate(_approvable_start(approval_present=True))
+    )
+    assert allowed.allowed is True
+    assert allowed.allowed_agent_mode is AgentMode.DRAFT_PR
+
+
+def test_role_grant_does_not_substitute_for_approval_presence() -> None:
+    """The role-grant map and the role-agnostic ``approval_present`` signal are
+    independent: granting a role without ``approval_present`` is still refused,
+    so a path that fabricates role grants can't bypass the approval backstop."""
+    decision = _engine().evaluate(
+        PolicyInput.model_validate(
+            _approvable_start(
+                risk={"overall_risk": "medium", "auth": True},
+                approval={"engineering": True},
+            )
+        )
+    )
+    assert decision.allowed is False
+    assert any(
+        "requires at least one recorded human approval" in r for r in decision.reasons
+    )
+
+
+def test_retry_denied_without_recorded_approval() -> None:
+    """The approval backstop covers every autonomous action, including retries."""
+    decision = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                "action": "retry_agent",
+                "ticket": {"readiness": "ready"},
+                "risk": {"overall_risk": "low"},
+                "repo": {"confidence": 90},
+                "retry": {"attempt": 1, "max_attempts": 2},
+                "approval": {},
+            }
+        )
+    )
+    assert decision.allowed is False
+    assert any(
+        "requires at least one recorded human approval" in r for r in decision.reasons
+    )
+
+
+def test_advisory_action_never_needs_approval() -> None:
+    """The approval rule is gated on autonomous actions; advisory reads (which
+    never launch work) stay allowed with no approval present."""
+    decision = _engine().evaluate(
+        PolicyInput.model_validate(
+            {
+                "action": "analyse_ticket",
+                "ticket": {"readiness": "ready"},
+                "risk": {"overall_risk": "low"},
+                "repo": {"confidence": 90},
+                "approval": {},
+            }
+        )
+    )
+    assert decision.allowed is True
+    assert not any(
+        "recorded human approval" in r for r in decision.reasons
+    )

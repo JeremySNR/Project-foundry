@@ -216,19 +216,28 @@ class FoundryOrchestrator:
         payload = self._policy_input(PolicyAction.START_AGENT, analysis, context, risk)
         decision = self._policy.evaluate(payload)
 
-        # Distinguish "denied, but a human approval would unlock dispatch" from
-        # "denied no matter who approves" (e.g. DB migrations / prod deploys are
-        # blocked in this version regardless of approvals). Only the latter should
-        # park at BLOCKED; the former is the normal road to WAITING_APPROVAL. We
-        # learn which by re-running the gate with every required approval granted.
+        # The recorded gate decision above is the honest *pre-approval* result:
+        # with no approval yet, the gate denies dispatch (every autonomous action
+        # now requires a recorded approval, issue #18). Probe the gate with a
+        # recorded approval carrying every required role granted to learn two
+        # things: (1) whether the denial is permanent - blocked no matter who
+        # approves, e.g. DB migrations / prod deploys - which parks at BLOCKED
+        # instead of inviting a futile approval; and (2) the agent mode actually
+        # *achievable* once approved, so the run advertises that rather than the
+        # transient human-only of its unapproved state.
         permanently_blocked = False
+        effective_mode = decision.allowed_agent_mode
         if not decision.allowed:
             with_approvals = payload.model_copy(
                 update={
-                    "approval": {role.value: True for role in decision.required_approvals}
+                    "approval": {role.value: True for role in decision.required_approvals},
+                    "approval_present": True,
                 }
             )
-            permanently_blocked = not self._policy.evaluate(with_approvals).allowed
+            approved_decision = self._policy.evaluate(with_approvals)
+            permanently_blocked = not approved_decision.allowed
+            if not permanently_blocked:
+                effective_mode = approved_decision.allowed_agent_mode
 
         status = self._post_plan_status(analysis, risk, permanently_blocked)
 
@@ -243,7 +252,7 @@ class FoundryOrchestrator:
                     created_by=created_by,
                     current_step="intake",
                     risk_level=risk.overall_risk,
-                    agent_mode=decision.allowed_agent_mode,
+                    agent_mode=effective_mode,
                 )
                 session.add(run)
                 self._add(session, run_id, ArtifactType.TICKET_SNAPSHOT, ticket)
@@ -833,6 +842,11 @@ class FoundryOrchestrator:
                 context,
                 risk,
                 approvals=granted,
+                # An approval record exists iff a human approved this run; the
+                # gate now requires it for any autonomous action (issue #18). A
+                # missing record (a path that bypassed approve()) is denied here
+                # rather than slipping through ungoverned.
+                approval_present=approval is not None,
                 budget=PolicyBudget(
                     cost_usd=self._accumulated_cost(session, run_id),
                     pending_cost_usd=self._estimated_cost_per_dispatch,
@@ -1174,6 +1188,9 @@ class FoundryOrchestrator:
                 context,
                 risk,
                 approvals=granted,
+                # The original dispatch only happens after approval, so an
+                # approval record exists for any run reaching a retry (issue #18).
+                approval_present=approval is not None,
                 retry=PolicyRetry(
                     attempt=attempt, max_attempts=self._max_agent_retries
                 ),
@@ -1535,6 +1552,7 @@ class FoundryOrchestrator:
         approvals: set[str] | None = None,
         retry: PolicyRetry | None = None,
         budget: PolicyBudget | None = None,
+        approval_present: bool = False,
     ) -> PolicyInput:
         best_repo = context.best_repository
         return PolicyInput(
@@ -1554,6 +1572,7 @@ class FoundryOrchestrator:
             retry=retry or PolicyRetry(),
             budget=budget or PolicyBudget(),
             approval={role: True for role in (approvals or set())},
+            approval_present=approval_present,
         )
 
     def _forbidden_violations(self, files: list[str]) -> list[str]:
