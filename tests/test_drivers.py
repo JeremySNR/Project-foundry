@@ -7,7 +7,7 @@ import pytest
 from foundry.agents.manual import InMemoryFakeProvider
 from foundry.db import create_all, make_engine, make_session_factory
 from foundry.drivers import InlineDriver
-from foundry.orchestrator import FoundryOrchestrator
+from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.schemas.common import ApprovalRole, PRStatus, RunStatus
 from foundry.schemas.pr import PullRequestState
 from foundry.schemas.ticket import RawTicket
@@ -59,6 +59,21 @@ def test_approve_human_only_work_ends_blocked_not_raised(driver_and_orch) -> Non
         roles={ApprovalRole.ENGINEERING},
     )
     assert orch.get_run(run_id).status is RunStatus.BLOCKED
+
+
+def test_approve_without_required_role_raises_not_swallowed(driver_and_orch) -> None:
+    """Unlike a human-only policy block (swallowed so the run simply ends blocked),
+    an approval the approver is not authorised for is refused *loudly* so the
+    calling surface can report it - and the run stays awaiting approval (issue #18)."""
+    driver, orch = driver_and_orch
+    ticket = _ready_ticket(
+        title="Update the terraform deployment config",
+        description="Acceptance Criteria:\n- terraform plan runs clean\n- config applies",
+    )
+    run_id = driver.start(ticket, trigger_type="label")
+    with pytest.raises(OrchestratorError, match="approval refused"):
+        driver.submit_decision(run_id, decision="approve", user="lead@example.com")
+    assert orch.get_run(run_id).status is RunStatus.WAITING_APPROVAL
 
 
 def test_reject(driver_and_orch) -> None:

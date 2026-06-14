@@ -24,6 +24,11 @@ htmlcov/
 .env.*
 *.local
 
+# .NET
+dotnet/**/bin/
+dotnet/**/obj/
+*.user
+
 # Editors
 .vscode/
 .idea/
