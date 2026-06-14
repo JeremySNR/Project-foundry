@@ -39,10 +39,15 @@ policy:
   repo_confidence_threshold: 70
   # PRs larger than this are routed to human review.
   max_files_changed: 12
-  # Paths an agent may never touch. Matches block the run.
+  # Paths an agent may never touch. Matches block the run (sticky; never retried).
+  # Use the `**/...` form for dirs that can appear at any depth — a bare
+  # `migrations/**` only matches a top-level dir, so a nested
+  # `services/api/migrations/0001.py` would slip the hard block.
   forbidden_globs:
     - "infra/**"
+    - "**/infra/**"
     - "migrations/**"
+    - "**/migrations/**"
     - "**/.env*"
     - "**/secrets/**"
   # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)

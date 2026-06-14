@@ -38,6 +38,7 @@ _REPRODUCTION_HINTS = ("steps to reproduce", "reproduce", "repro:", "stack trace
 # Handles plain text, markdown bold (**...**), and ATX headings (## ...).
 _AC_HEADING = re.compile(
     r"(?:\*{1,2}|#{1,6}\s*)?"  # optional markdown bold or heading prefix
+    r"\b"                       # word boundary: don't match "ac:" inside "Mac:"/"Tarmac:"
     r"(acceptance criteria|acceptance:|ac:|definition of done|dod:)"
     r"(?:\*{1,2})?",            # optional closing bold markers
     re.IGNORECASE,
