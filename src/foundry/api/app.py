@@ -712,9 +712,10 @@ def create_app(
             _submit_decision(run_id, command=command.command, user=user)
         except OrchestratorError as exc:
             msg = str(exc)
-            # Policy gate blocked dispatch (security/risk rejection) → 403.
-            # Wrong state for the operation (e.g. already approved) → 409.
-            if "policy gate blocked" in msg:
+            # Authorisation refusals (policy block at dispatch, or the approver
+            # lacking a role this run requires) → 403. Wrong state for the
+            # operation (e.g. already approved) → 409.
+            if "policy gate blocked" in msg or "approval refused" in msg:
                 raise HTTPException(status_code=403, detail=msg) from exc
             raise HTTPException(status_code=409, detail=msg) from exc
 

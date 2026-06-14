@@ -69,6 +69,7 @@ from foundry.policy.engine import (
     PolicyRetry,
     PolicyRisk,
     PolicyTicket,
+    required_approvals,
 )
 from foundry.schemas.agent import CodingAgentJob, CodingAgentJobInput, JobConstraints
 from foundry.schemas.analysis import TicketAnalysis
@@ -451,6 +452,26 @@ class FoundryOrchestrator:
             if run.status is not RunStatus.WAITING_APPROVAL:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}', not awaiting approval"
+                )
+            # Pre-validate the approver's roles against what this run's risk
+            # actually requires. Recording an approval the policy gate will only
+            # refuse at dispatch writes a *void* APPROVAL_GRANTED into the audit
+            # trail and shows tracker users an approve->blocked whiplash (issue
+            # #18). Refuse up front, before anything is written, so the timeline
+            # never shows an approval for work that was actually denied.
+            risk = self._load(session, run_id, ArtifactType.RISK_ASSESSMENT)
+            required = required_approvals(
+                PolicyRisk(
+                    overall_risk=risk.overall_risk,
+                    **risk.sensitive_areas.model_dump(),
+                )
+            )
+            missing = [role for role in required if role not in granted_roles]
+            if missing:
+                raise OrchestratorError(
+                    f"approval refused: '{user}' lacks the required role(s) "
+                    f"({', '.join(role.value for role in missing)}) for this run; "
+                    f"required: {', '.join(role.value for role in required)}"
                 )
             approval_record = {
                 "user": user,

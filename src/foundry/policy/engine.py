@@ -173,8 +173,13 @@ def _action_str(action: object) -> str:
     return action.value if isinstance(action, PolicyAction) else str(action)
 
 
-def _required_approvals(risk: PolicyRisk) -> list[ApprovalRole]:
-    """Derive required approval roles from the sensitive areas in play."""
+def required_approvals(risk: PolicyRisk) -> list[ApprovalRole]:
+    """Derive required approval roles from the sensitive areas in play.
+
+    Shared by the gate and the orchestrator: ``approve()`` uses it to refuse an
+    approval from someone lacking a required role *before* recording it, so the
+    audit trail never shows an approval the gate will only reject at dispatch.
+    """
     required: list[ApprovalRole] = []
     if risk.auth or risk.infrastructure:
         required.append(ApprovalRole.ENGINEERING)
@@ -205,7 +210,7 @@ class LocalPolicyEngine:
 
     def evaluate(self, payload: PolicyInput) -> PolicyDecision:
         reasons: list[str] = []
-        required = _required_approvals(payload.risk)
+        required = required_approvals(payload.risk)
         threshold = self._repo_confidence_threshold
 
         # Hard-forbidden actions are denied unconditionally - no risk level or
