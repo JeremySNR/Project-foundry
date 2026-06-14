@@ -161,6 +161,7 @@ def create_app(
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
     jira_webhook_secret: str | None = None,
+    jira_allow_query_token: bool = False,
     gitlab_webhook_secret: str | None = None,
     gitlab_connector: GitLabConnector | None = None,
     slack_signing_secret: str | None = None,
@@ -201,6 +202,9 @@ def create_app(
     app.state.github_connector = github_connector or GitHubConnector()
     # Jira/GitLab/Slack endpoints are fail-closed: no secret => endpoint disabled.
     app.state.jira_webhook_secret = jira_webhook_secret
+    # The Jira token is an approver-level credential; accept it from the
+    # request header only unless query delivery is explicitly opted in.
+    app.state.jira_allow_query_token = jira_allow_query_token
     app.state.gitlab_webhook_secret = gitlab_webhook_secret
     app.state.slack_signing_secret = slack_signing_secret
     # Without a transport the connector is diff-blind (file gates skipped),
@@ -449,14 +453,22 @@ def create_app(
         token: str | None = Header(default=None, alias="X-Foundry-Webhook-Token"),
     ) -> dict[str, Any]:
         """Jira issue/comment events. Jira webhooks carry no HMAC signature;
-        the shared secret travels as a token (header, or ?token= query for
-        webhook UIs that cannot set headers). Fail-closed when unconfigured."""
+        the shared secret travels as a token in the X-Foundry-Webhook-Token
+        header. The token is effectively an approver-level credential, so it
+        is header-only by default — query delivery (?token=, which leaks into
+        access logs/proxies/link history) must be opted in with
+        ``tracker.jira_allow_query_token``. Fail-closed when unconfigured."""
         if not app.state.jira_webhook_secret:
             raise HTTPException(
                 status_code=403,
                 detail="jira webhook disabled: configure FOUNDRY_JIRA_WEBHOOK_SECRET",
             )
-        supplied = token or request.query_params.get("token") or ""
+        query_token = (
+            request.query_params.get("token")
+            if app.state.jira_allow_query_token
+            else None
+        )
+        supplied = token or query_token or ""
         if not hmac.compare_digest(app.state.jira_webhook_secret, supplied):
             raise HTTPException(status_code=401, detail="invalid webhook token")
         payload = await request.json()
@@ -1248,6 +1260,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
         jira_webhook_secret=settings.jira_webhook_secret,
+        jira_allow_query_token=settings.jira_allow_query_token,
         gitlab_webhook_secret=settings.gitlab_webhook_secret,
         gitlab_connector=gitlab_connector,
         slack_signing_secret=settings.slack_signing_secret,

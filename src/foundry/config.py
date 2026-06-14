@@ -89,6 +89,12 @@ class Settings:
     jira_base_url: str | None = None
     jira_email: str | None = None
     jira_api_token: str | None = None
+    # Jira webhook UIs that cannot set request headers can pass the shared
+    # secret as a ?token= query parameter. Query-string secrets leak into
+    # access logs, proxies, and link history, so this is off by default:
+    # the token is header-only (X-Foundry-Webhook-Token) unless explicitly
+    # opted in here (behaviour: yaml).
+    jira_allow_query_token: bool = False
 
     # --- GitLab SCM (secret: env); None => endpoint disabled ---
     # GitLab webhooks send the shared secret verbatim in X-Gitlab-Token.
@@ -436,6 +442,8 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["tracker_provider"] = tracker["provider"]
     if "jira_base_url" in tracker:
         out["jira_base_url"] = tracker["jira_base_url"]
+    if "jira_allow_query_token" in tracker:
+        out["jira_allow_query_token"] = bool(tracker["jira_allow_query_token"])
 
     policy = data.get("policy", {}) or {}
     if "provider" in policy:

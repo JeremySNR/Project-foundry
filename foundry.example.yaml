@@ -128,10 +128,20 @@ tracker:
   #                   and FOUNDRY_JIRA_WEBHOOK_SECRET; or set jira_base_url here)
   provider: linear
   # jira_base_url: "https://yourcompany.atlassian.net"
+  # Jira webhooks carry no HMAC signature: the shared secret IS the auth, and
+  # the approver identity comes from the payload, so FOUNDRY_JIRA_WEBHOOK_SECRET
+  # is effectively an approver-level credential (see SECURITY.md). Foundry reads
+  # it from the X-Foundry-Webhook-Token header only. Some Jira webhook UIs can't
+  # set headers; set this true to also accept ?token= in the query string, at
+  # the cost of leaking the secret into access logs/proxies/link history.
+  # jira_allow_query_token: false
 
 # Source control (watching the PR/MR the agent opens):
 #   GitHub - set FOUNDRY_GITHUB_API_TOKEN to enrich the changed-file list that
 #            feeds the forbidden-path / oversize gates (and FOUNDRY_GITHUB_WEBHOOK_SECRET).
+#            If FOUNDRY_GITHUB_WEBHOOK_SECRET is unset, the GitHub PR webhook
+#            falls back to FOUNDRY_LINEAR_WEBHOOK_SECRET, so one leaked secret
+#            covers both providers — set a distinct GitHub secret in production.
 #   GitLab - set FOUNDRY_GITLAB_WEBHOOK_SECRET to enable /webhooks/gitlab, and
 #            FOUNDRY_GITLAB_API_TOKEN so MR diffs are fetched and the SAME file
 #            gates apply. Without the API token, GitLab MRs are diff-blind:

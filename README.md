@@ -187,7 +187,7 @@ Secrets via env:
 | `FOUNDRY_GITHUB_WEBHOOK_SECRET` | Verifies inbound GitHub webhooks. |
 | `FOUNDRY_LINEAR_API_TOKEN` | Turns on the live Linear connector (write-back). |
 | `FOUNDRY_GITHUB_API_TOKEN` | Turns on the live GitHub connector (PR files; also the GitHub Issues tracker). |
-| `FOUNDRY_JIRA_WEBHOOK_SECRET` | Enables `/webhooks/jira` (token-compared; endpoint disabled without it). |
+| `FOUNDRY_JIRA_WEBHOOK_SECRET` | Enables `/webhooks/jira` (token-compared; endpoint disabled without it). Jira has no body signature, so this is an **approver-level credential** (the actor identity comes from the payload) — header-only by default; `?token=` query delivery needs `tracker.jira_allow_query_token: true`. See SECURITY.md. |
 | `FOUNDRY_JIRA_BASE_URL` / `..._EMAIL` / `..._API_TOKEN` | Jira Cloud credentials when the tracker is `jira`. |
 | `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
 | `FOUNDRY_GITLAB_API_TOKEN` / `..._BASE` | Fetches MR diffs so GitLab MRs run the same file-based gates as GitHub PRs (without it, MRs are diff-blind). `..._BASE` overrides the API root for self-managed GitLab. |
