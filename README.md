@@ -179,6 +179,8 @@ tracker:
   provider: linear                # or github_issues / jira
 triggers:
   label: "foundry:candidate"      # runs only start on an explicit opt-in
+epics:
+  auto_decompose: false           # split a multi-repo ticket into per-repo child runs at intake (#35)
 approval:
   approvers:                      # roles are config, never request payload
     - email: "lead@example.com"

@@ -246,6 +246,16 @@ class Settings:
     memory_min_samples: int = 3
     memory_confidence_cap: int = 89
 
+    # --- epics / multi-repo decomposition (behaviour: yaml) ---
+    # When a ticket spans several repositories (an explicit Repositories section,
+    # or >= 2 associated repos), decompose it at intake into one independently
+    # gated child run per repo, grouped under a parent epic run (issue #35).
+    # Off by default: the deterministic producer is conservative, but
+    # automatically fanning a single ticket out into several governed runs is a
+    # behaviour change an operator opts into. A ticket that does not decompose is
+    # unaffected - it runs as a single ordinary run either way.
+    epics_auto_decompose: bool = False
+
     # --- durable execution (behaviour: yaml; address often env) ---
     temporal_address: str = "localhost:7233"
     task_queue: str = "foundry-ticket-to-pr"
@@ -547,6 +557,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "slack_channel" in notifications:
         out["slack_channel"] = notifications["slack_channel"]
 
+    epics = data.get("epics", {}) or {}
+    if "auto_decompose" in epics:
+        out["epics_auto_decompose"] = _bool(epics["auto_decompose"])
+
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
         out["temporal_address"] = temporal["address"]
@@ -617,6 +631,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
             out[field_name] = env[env_key]
     if "FOUNDRY_USE_OPENAI_ANALYZER" in env:
         out["use_openai_analyzer"] = _bool(env["FOUNDRY_USE_OPENAI_ANALYZER"])
+    if "FOUNDRY_EPICS_AUTO_DECOMPOSE" in env:
+        out["epics_auto_decompose"] = _bool(env["FOUNDRY_EPICS_AUTO_DECOMPOSE"])
     if "FOUNDRY_RATE_LIMIT_ENABLED" in env:
         out["rate_limit_enabled"] = _bool(env["FOUNDRY_RATE_LIMIT_ENABLED"])
     if "FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE" in env:

@@ -198,6 +198,18 @@ triggers:
   label: "foundry:candidate"
   status: "Ready for AI Analysis"
 
+epics:
+  # When a triggered ticket spans several repositories - either an explicit
+  # "Repositories:" section (one "- repo: scope" bullet per repo) or >= 2
+  # associated repos - decompose it at intake into one INDEPENDENTLY-gated child
+  # run per repo, grouped under a parent epic run (issue #35). Each child is
+  # analysed, risk-classified, planned, policy-gated and approved on its own; no
+  # gate is weakened. Off by default - the deterministic producer is
+  # conservative, but auto-fanning one ticket into several governed runs is a
+  # behaviour change you opt into. A ticket that doesn't decompose runs as a
+  # single ordinary run either way. (env override: FOUNDRY_EPICS_AUTO_DECOMPOSE)
+  auto_decompose: false
+
 approval:
   # Who may run /foundry approve, and which approval roles each person's
   # sign-off grants. Roles are CONFIG, never request payload - an API caller

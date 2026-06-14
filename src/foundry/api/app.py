@@ -181,6 +181,7 @@ def create_app(
     rate_limit_enabled: bool = True,
     rate_limit_webhook_per_minute: int = 120,
     rate_limit_api_per_minute: int = 60,
+    auto_decompose_epics: bool = False,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -193,7 +194,9 @@ def create_app(
     # seam (inline today, durable Temporal later) so there is one execution path.
     app.state.orchestrator = orch
     app.state.session_factory = session_factory
-    app.state.driver = driver or InlineDriver(orch)
+    app.state.driver = driver or InlineDriver(
+        orch, auto_decompose_epics=auto_decompose_epics
+    )
     app.state.webhook_secret = webhook_secret
     # user -> roles that user's approval actually grants. Roles are config,
     # never request payload: a caller cannot self-assert "security".
@@ -1467,6 +1470,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         rate_limit_enabled=settings.rate_limit_enabled,
         rate_limit_webhook_per_minute=settings.rate_limit_webhook_per_minute,
         rate_limit_api_per_minute=settings.rate_limit_api_per_minute,
+        auto_decompose_epics=settings.epics_auto_decompose,
     )
 
 

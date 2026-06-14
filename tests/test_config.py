@@ -137,6 +137,21 @@ def test_api_token_from_env() -> None:
     assert s.api_token == "tok"
 
 
+def test_epics_auto_decompose_defaults_off() -> None:
+    assert Settings.from_env({}).epics_auto_decompose is False
+
+
+def test_epics_auto_decompose_from_yaml_and_env(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("epics:\n  auto_decompose: true\n")
+    assert Settings.load(path, env={}).epics_auto_decompose is True
+    # Env overrides YAML.
+    s = Settings.load(path, env={"FOUNDRY_EPICS_AUTO_DECOMPOSE": "false"})
+    assert s.epics_auto_decompose is False
+    # Env alone also flips it on.
+    assert Settings.from_env({"FOUNDRY_EPICS_AUTO_DECOMPOSE": "1"}).epics_auto_decompose is True
+
+
 def test_rate_limit_defaults_on() -> None:
     s = Settings.from_env({})
     assert s.rate_limit_enabled is True

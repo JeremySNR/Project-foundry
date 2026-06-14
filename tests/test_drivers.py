@@ -106,3 +106,66 @@ def test_unsupported_decision_raises(driver_and_orch) -> None:
     run_id = driver.start(_ready_ticket(), trigger_type="label")
     with pytest.raises(ValueError):
         driver.submit_decision(run_id, decision="frobnicate", user="lead@example.com")
+
+
+# -- epic auto-decomposition at intake (issue #35) ----------------------------
+
+EPIC_DESC = (
+    "Add favourites across our surfaces.\n\n"
+    "Repositories:\n"
+    "- customer-web: add the favourites button\n"
+    "- mobile-app: add the favourites button\n\n"
+    "Acceptance Criteria:\n"
+    "- A favourites button exists\n"
+    "- Favourites persist across sessions\n"
+)
+
+
+def _epic_ticket(**ov) -> RawTicket:
+    base = dict(
+        issue_id="epic-1",
+        issue_key="LIN-900",
+        title="Add favourites everywhere",
+        description=EPIC_DESC,
+    )
+    base.update(ov)
+    return RawTicket(**base)
+
+
+def test_default_driver_does_not_decompose_epics(driver_and_orch) -> None:
+    """The default driver is unchanged: a multi-repo epic ticket runs as a single
+    ordinary run, no children - decomposition is opt-in."""
+    driver, orch = driver_and_orch
+    run_id = driver.start(_epic_ticket(), trigger_type="label")
+    assert orch.child_runs(run_id) == []
+    assert orch.list_epics() == []
+
+
+def test_auto_decompose_driver_fans_epic_into_child_runs(driver_and_orch) -> None:
+    _, orch = driver_and_orch
+    driver = InlineDriver(orch, auto_decompose_epics=True)
+
+    parent_run_id = driver.start(_epic_ticket(), trigger_type="label")
+
+    # start() returns the parent (epic-root) run id, and the epic fanned out
+    # into one independently-gated child run per repo.
+    children = orch.child_runs(parent_run_id)
+    assert len(children) == 2
+    assert all(c.parent_run_id == parent_run_id for c in children)
+    assert [r.id for r in orch.list_epics()] == [parent_run_id]
+    # Each child is gated on its own and parks for its own approval.
+    for child in children:
+        assert child.status is RunStatus.WAITING_APPROVAL
+
+
+def test_auto_decompose_driver_non_epic_runs_as_single_run(driver_and_orch) -> None:
+    """With decomposition on, a ticket scoped to one repo still degrades to a
+    single ordinary run with no children - so the path is always safe to take."""
+    _, orch = driver_and_orch
+    driver = InlineDriver(orch, auto_decompose_epics=True)
+
+    run_id = driver.start(_ready_ticket(), trigger_type="label")
+
+    assert orch.child_runs(run_id) == []
+    assert orch.list_epics() == []
+    assert orch.get_run(run_id).status is RunStatus.WAITING_APPROVAL
