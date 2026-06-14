@@ -119,6 +119,19 @@ class Settings:
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
+    # --- OIDC API auth (behaviour: yaml; not secrets - public IdP metadata) ---
+    # Optional, additive second credential path (issue #34): when issuer +
+    # audience + jwks_uri are all set, token-gated endpoints also accept a valid
+    # OIDC JWT bearer token, alongside the static api_token. All three are
+    # required together (partial config is rejected at load - fail-closed). The
+    # algorithm allow-list defaults to RS256 (asymmetric only: no alg:none / HS
+    # confusion); leeway is the clock-skew tolerance in seconds.
+    oidc_issuer: str | None = None
+    oidc_audience: str | None = None
+    oidc_jwks_uri: str | None = None
+    oidc_algorithms: tuple[str, ...] = ("RS256",)
+    oidc_leeway_seconds: int = 60
+
     # --- webhook replay protection (behaviour: yaml) ---
     # How long a processed delivery id is remembered in foundry_webhook_deliveries
     # for durable, cross-worker dedup. Rows older than this are pruned so the
@@ -401,6 +414,26 @@ class Settings:
                 "rate_limit_api_per_minute must be >= 1, got "
                 f"{self.rate_limit_api_per_minute} (use rate_limit_enabled: false to disable)"
             )
+        # OIDC is all-or-nothing: a partial config that looked enabled but
+        # silently verified nothing would be a fail-open auth hole.
+        oidc_parts = {
+            "issuer": self.oidc_issuer,
+            "audience": self.oidc_audience,
+            "jwks_uri": self.oidc_jwks_uri,
+        }
+        set_parts = [name for name, value in oidc_parts.items() if value]
+        if set_parts and len(set_parts) != len(oidc_parts):
+            missing = sorted(name for name, value in oidc_parts.items() if not value)
+            raise ValueError(
+                "OIDC auth requires issuer, audience and jwks_uri together; "
+                f"missing: {missing}"
+            )
+        if self.oidc_enabled and not self.oidc_algorithms:
+            raise ValueError("oidc.algorithms must list at least one algorithm")
+        if self.oidc_leeway_seconds < 0:
+            raise ValueError(
+                f"oidc.leeway_seconds must be >= 0, got {self.oidc_leeway_seconds}"
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -431,6 +464,11 @@ class Settings:
     def repo_forbidden_map(self) -> dict[str, tuple[str, ...]]:
         """repo name -> extra forbidden globs scoped to that repo."""
         return {repo: globs for repo, globs in self.repo_forbidden_globs}
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """True when OIDC bearer auth is fully configured (all three parts)."""
+        return bool(self.oidc_issuer and self.oidc_audience and self.oidc_jwks_uri)
 
 
 def _from_yaml(path: Path) -> dict[str, Any]:
@@ -581,6 +619,19 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "auto_decompose" in epics:
         out["epics_auto_decompose"] = _bool(epics["auto_decompose"])
 
+    auth = data.get("auth", {}) or {}
+    oidc = auth.get("oidc", {}) or {}
+    if "issuer" in oidc:
+        out["oidc_issuer"] = oidc["issuer"]
+    if "audience" in oidc:
+        out["oidc_audience"] = oidc["audience"]
+    if "jwks_uri" in oidc:
+        out["oidc_jwks_uri"] = oidc["jwks_uri"]
+    if "algorithms" in oidc:
+        out["oidc_algorithms"] = tuple(oidc["algorithms"] or [])
+    if "leeway_seconds" in oidc:
+        out["oidc_leeway_seconds"] = int(oidc["leeway_seconds"])
+
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
         out["temporal_address"] = temporal["address"]
@@ -647,10 +698,21 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_CONTEXT_ORG": "context_org",
         "FOUNDRY_POLICY_PROVIDER": "policy_provider",
         "FOUNDRY_POLICY_OPA_URL": "policy_opa_url",
+        "FOUNDRY_OIDC_ISSUER": "oidc_issuer",
+        "FOUNDRY_OIDC_AUDIENCE": "oidc_audience",
+        "FOUNDRY_OIDC_JWKS_URI": "oidc_jwks_uri",
     }
     for env_key, field_name in mapping.items():
         if env_key in env:
             out[field_name] = env[env_key]
+    if "FOUNDRY_OIDC_ALGORITHMS" in env:
+        out["oidc_algorithms"] = tuple(
+            part.strip()
+            for part in env["FOUNDRY_OIDC_ALGORITHMS"].split(",")
+            if part.strip()
+        )
+    if "FOUNDRY_OIDC_LEEWAY_SECONDS" in env:
+        out["oidc_leeway_seconds"] = int(env["FOUNDRY_OIDC_LEEWAY_SECONDS"])
     if "FOUNDRY_USE_OPENAI_ANALYZER" in env:
         out["use_openai_analyzer"] = _bool(env["FOUNDRY_USE_OPENAI_ANALYZER"])
     if "FOUNDRY_EPICS_AUTO_DECOMPOSE" in env:

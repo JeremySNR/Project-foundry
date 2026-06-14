@@ -73,6 +73,7 @@ from foundry.schemas.ticket import RawTicket
 from .dashboard import DASHBOARD_HTML
 from .dedup import WebhookDeduplicator, webhook_timestamp_fresh
 from .mapping import linear_payload_to_ticket
+from .oidc import OidcAuthError, OidcVerifier, build_verifier
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
 from .security import (
@@ -163,6 +164,7 @@ def create_app(
     orchestrator: FoundryOrchestrator | None = None,
     approvers: Mapping[str, Iterable[str]] | None = None,
     api_token: str | None = None,
+    oidc_verifier: OidcVerifier | None = None,
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
@@ -205,6 +207,9 @@ def create_app(
         for user, roles in (approvers or {}).items()
     }
     app.state.api_token = api_token
+    # Optional, additive OIDC bearer auth (issue #34). When set, token-gated
+    # endpoints accept a valid OIDC JWT in addition to the static api_token.
+    app.state.oidc_verifier = oidc_verifier
     app.state.ticket_mapper = ticket_mapper or linear_payload_to_ticket
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
@@ -288,14 +293,14 @@ def create_app(
     def dashboard() -> HTMLResponse:
         """Read-only run dashboard (static page, no build step).
 
-        Disabled when no API token is configured - the page is useless without
-        the token-gated timeline endpoint, and serving it would advertise the
-        API surface for free. Same fail-closed posture as approvals.
+        Disabled when no auth is configured - the page is useless without the
+        token-gated timeline endpoint, and serving it would advertise the API
+        surface for free. Same fail-closed posture as approvals.
         """
-        if not app.state.api_token:
+        if not _auth_configured(app):
             raise HTTPException(
                 status_code=403,
-                detail="dashboard disabled: configure FOUNDRY_API_TOKEN",
+                detail="dashboard disabled: configure FOUNDRY_API_TOKEN or OIDC auth",
             )
         return HTMLResponse(DASHBOARD_HTML)
 
@@ -1042,25 +1047,45 @@ def _parse_iso_bound(value: str, *, inclusive_day_end: bool) -> datetime:
     return parsed
 
 
-def _require_api_token(app: FastAPI, request: Request) -> None:
-    """Enforce bearer-token auth on mutating API endpoints.
+def _auth_configured(app: FastAPI) -> bool:
+    """True when any API credential path is configured (static token or OIDC)."""
+    return bool(app.state.api_token) or app.state.oidc_verifier is not None
 
-    Fail closed: with no token configured the endpoint is disabled outright,
-    because an unauthenticated approval surface defeats the human gate. The
-    signed Linear webhook remains available for approvals either way.
+
+def _require_api_token(app: FastAPI, request: Request) -> None:
+    """Enforce bearer-token auth on the token-gated API endpoints.
+
+    Accepts **either** the static ``FOUNDRY_API_TOKEN`` (constant-time compare,
+    unchanged) **or** - when OIDC is configured (issue #34) - a valid OIDC JWT.
+    Both may be enabled at once; the static token keeps working byte-for-byte.
+
+    Fail closed: with no credential configured at all the endpoint is disabled
+    outright, because an unauthenticated approval surface defeats the human
+    gate. The signed Linear webhook remains available for approvals either way.
     """
     expected = app.state.api_token
-    if not expected:
+    verifier: OidcVerifier | None = app.state.oidc_verifier
+    if not expected and verifier is None:
         raise HTTPException(
             status_code=403,
             detail=(
-                "the approval API is disabled: no FOUNDRY_API_TOKEN is "
-                "configured; approve via a signed Linear comment instead"
+                "the approval API is disabled: configure FOUNDRY_API_TOKEN or "
+                "OIDC auth; approve via a signed Linear comment instead"
             ),
         )
     provided = request.headers.get("authorization", "")
-    if not hmac.compare_digest(provided, f"Bearer {expected}"):
-        raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+    # Static token path - unchanged, constant-time.
+    if expected and hmac.compare_digest(provided, f"Bearer {expected}"):
+        return
+    # OIDC path - verify the bearer JWT against the configured IdP.
+    if verifier is not None and provided.startswith("Bearer "):
+        token = provided[len("Bearer ") :]
+        try:
+            verifier.verify(token)
+            return
+        except OidcAuthError:
+            pass
+    raise HTTPException(status_code=401, detail="invalid or missing bearer token")
 
 
 def _actor_identity(payload: dict[str, Any]) -> str | None:
@@ -1455,12 +1480,24 @@ def app_from_settings(settings: Settings) -> FastAPI:
         if settings.gitlab_api_token
         else None
     )
+    oidc_verifier = (
+        build_verifier(
+            issuer=settings.oidc_issuer,
+            audience=settings.oidc_audience,
+            jwks_uri=settings.oidc_jwks_uri,
+            algorithms=settings.oidc_algorithms,
+            leeway_seconds=settings.oidc_leeway_seconds,
+        )
+        if settings.oidc_enabled
+        else None
+    )
     return create_app(
         webhook_secret=settings.linear_webhook_secret,
         session_factory=session_factory,
         orchestrator=build_orchestrator(settings, session_factory),
         approvers={email: roles for email, roles in settings.approvers},
         api_token=settings.api_token,
+        oidc_verifier=oidc_verifier,
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
         jira_webhook_secret=settings.jira_webhook_secret,
