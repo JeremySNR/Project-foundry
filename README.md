@@ -247,6 +247,13 @@ then matches tickets against actual code paths, reason strings cite concrete fil
 candidate files, the test layout and inferred test commands for the plan. Worst case the sync
 spends 9 API calls per repo instead of 3; the same budget and resume semantics apply.
 
+With `planner.provider: llm` the planner consumes that code-aware context and produces a
+**file-level** plan: named files to touch, where the tests live, the commands to verify, and a
+populated `expected_files_or_areas`. It's only consulted for a buildable, confidently-routed run;
+the goal/scope/branch and the guardrail block (forbidden paths, no migrations, stop conditions)
+stay deterministic — the model enriches the plan but can't relax a constraint — and an LLM failure
+degrades to the deterministic template plan. The template planner remains the no-key default.
+
 Optional extras, install what you need:
 
 - `.[llm]` GPT-5.5 analyzer
@@ -312,8 +319,9 @@ src/foundry/
   config.py        YAML + env settings
   observability.py OpenTelemetry spans (no-op without the extra)
   schemas/         the run artifact contracts (+ enums in common.py)
-  engines/         analyzer / enrichment / risk / planner, plus the GPT-5.5 analyzer
-                   and the escalate-only LLM risk classifier (llm_risk.py)
+  engines/         analyzer / enrichment / risk / planner, plus the GPT-5.5 analyzer,
+                   the escalate-only LLM risk classifier (llm_risk.py), and the
+                   file-level LLM planner (llm_planner.py)
   orchestrator.py  the state machine that runs a ticket end to end
   drivers.py       the RunDriver seam (inline today, Temporal attaches here)
   workflows/       decisions.py (pure) + the Temporal workflow, activities, worker

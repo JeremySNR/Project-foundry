@@ -424,6 +424,41 @@ def test_invalid_risk_provider_raises() -> None:
         Settings.from_env({"FOUNDRY_RISK_PROVIDER": "bogus"})
 
 
+def test_planner_provider_defaults_to_template() -> None:
+    s = Settings.from_env({})
+    assert s.planner_provider == "template"
+    assert s.planner_model == "gpt-5.5"
+
+
+def test_planner_provider_from_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("planner:\n  provider: llm\n  model: gpt-4o-2026-04-23\n")
+    s = Settings.load(path, env={})
+    assert s.planner_provider == "llm"
+    assert s.planner_model == "gpt-4o-2026-04-23"
+
+
+def test_planner_provider_env_overrides_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("planner:\n  provider: template\n")
+    s = Settings.load(
+        path,
+        env={
+            "FOUNDRY_PLANNER_PROVIDER": "llm",
+            "FOUNDRY_PLANNER_MODEL": "gpt-5.5-mini",
+        },
+    )
+    assert s.planner_provider == "llm"
+    assert s.planner_model == "gpt-5.5-mini"
+
+
+def test_invalid_planner_provider_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="planner_provider"):
+        Settings.from_env({"FOUNDRY_PLANNER_PROVIDER": "bogus"})
+
+
 def test_policy_provider_defaults_to_local() -> None:
     s = Settings.from_env({})
     assert s.policy_provider == "local"

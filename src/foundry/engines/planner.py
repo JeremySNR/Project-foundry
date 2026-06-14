@@ -30,7 +30,23 @@ DEFAULT_FORBIDDEN_GLOBS = [
     "**/secrets/**",
 ]
 
-_INSTRUCTION_TEMPLATE = """\
+# The guardrail block and the PR-handoff closing are rendered by Foundry, never
+# by a model: every planner (template or LLM) shares this exact text so an LLM
+# planner can enrich the *plan* but can never relax a constraint.
+CONSTRAINTS_BLOCK = """\
+Constraints:
+- Do not modify files matching: {forbidden}
+- Do not add dependencies unless explicitly required.
+- Do not perform database migrations.
+- Do not change auth, payment, PII or infrastructure code.
+- Stop and ask for human input if the change grows beyond the stated scope."""
+
+CLOSING_BLOCK = """\
+When you are done, open a draft PR whose description summarises what changed,
+why, how it was tested, and any follow-ups."""
+
+_INSTRUCTION_TEMPLATE = (
+    """\
 You are working on Linear issue {issue_key}: {title}.
 
 Goal:
@@ -51,16 +67,12 @@ Branch:
 Implementation plan:
 {steps}
 
-Constraints:
-- Do not modify files matching: {forbidden}
-- Do not add dependencies unless explicitly required.
-- Do not perform database migrations.
-- Do not change auth, payment, PII or infrastructure code.
-- Stop and ask for human input if the change grows beyond the stated scope.
-
-When you are done, open a draft PR whose description summarises what changed,
-why, how it was tested, and any follow-ups.
 """
+    + CONSTRAINTS_BLOCK
+    + "\n\n"
+    + CLOSING_BLOCK
+    + "\n"
+)
 
 
 class DeliveryPlanner(Protocol):

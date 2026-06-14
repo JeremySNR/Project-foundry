@@ -20,6 +20,7 @@ from .llm_risk import (
     LlmRiskClassifier,
     build_llm_risk_classifier,
 )
+from .llm_planner import LlmPlanner, build_llm_planner
 from .openai_analyzer import OpenAITicketAnalyzer, build_openai_analyzer
 from .planner import (
     DEFAULT_FORBIDDEN_GLOBS,
@@ -55,6 +56,8 @@ __all__ = [
     "build_llm_risk_classifier",
     "DeliveryPlanner",
     "TemplatePlanner",
+    "LlmPlanner",
+    "build_llm_planner",
     "branch_name_for",
     "DEFAULT_FORBIDDEN_GLOBS",
 ]

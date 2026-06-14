@@ -25,6 +25,20 @@ risk:
   provider: heuristic
   model: gpt-5.5
 
+planner:
+  # Delivery planner backend (override with FOUNDRY_PLANNER_PROVIDER):
+  #   template - renders deterministic "Satisfy acceptance criterion: X" steps
+  #              (default, no API key)
+  #   llm      - adds an LLM pass that produces file-level steps, test locations
+  #              and verify commands from the code-aware context, and populates
+  #              the plan's expected_files_or_areas (set OPENAI_API_KEY; pairs
+  #              best with context.provider: code). Safety guardrails stay
+  #              deterministic - the model can enrich the plan but never relax a
+  #              constraint - and an LLM failure degrades to the template plan.
+  #              Costs one model call per buildable, confidently-routed run.
+  provider: template
+  model: gpt-5.5
+
 policy:
   # Policy backend: "local" (in-process Python engine, the default) or "opa"
   # (delegate to an OPA server running src/foundry/policy/foundry.rego). Both
