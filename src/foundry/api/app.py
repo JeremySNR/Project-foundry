@@ -977,6 +977,19 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
     else:
         raise ValueError(f"unknown tracker.provider: {settings.tracker_provider!r}")
 
+    # Outbound Slack notifications are fail-closed: wired only when BOTH the bot
+    # token and a channel are configured, mirroring the no-token-=>-no-connector
+    # posture of the tracker. Either missing => the orchestrator simply has no
+    # notifier and runs as before.
+    notifier = None
+    if settings.slack_bot_token and settings.slack_channel:
+        from foundry.connectors.slack import SlackNotifier
+        from foundry.connectors.transport import slack_transport
+
+        notifier = SlackNotifier(
+            transport=slack_transport(settings.slack_bot_token, settings.slack_channel)
+        )
+
     repo_keywords = {repo: list(kws) for repo, kws in settings.context_repo_keywords}
     if settings.context_provider in ("catalog", "code"):
         priors = None
@@ -1010,6 +1023,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         diff_risk_classifier=diff_risk_classifier,
         enricher=enricher,
         issue_tracker=tracker,
+        notifier=notifier,
         provider=build_provider(settings, tracker),
         policy_engine=LocalPolicyEngine(
             repo_confidence_threshold=settings.repo_confidence_threshold

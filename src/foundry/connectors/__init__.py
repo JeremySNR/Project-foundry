@@ -13,6 +13,8 @@ from .github_issues import GitHubIssuesConnector
 from .gitlab import GitLabConnector
 from .jira import JiraConnector
 from .linear import LinearConnector, LinearWriteError
+from .notify import ApprovalRequest, InMemoryNotifier, RunNotifier
+from .slack import SlackNotifier, status_label
 
 __all__ = [
     "IssueTracker",
@@ -23,6 +25,11 @@ __all__ = [
     "GitHubIssuesConnector",
     "GitLabConnector",
     "JiraConnector",
+    "RunNotifier",
+    "InMemoryNotifier",
+    "ApprovalRequest",
+    "SlackNotifier",
+    "status_label",
     "format_analysis_comment",
     "format_cursor_delegation",
     "state_for",

@@ -22,11 +22,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Decisions the approval surfaces accept. Mirrors the set the comment surfaces
-# act on in app.py (approve/reject/stop); other /foundry verbs are not exposed
-# as Slack buttons.
-SLACK_ACTION_PREFIX = "foundry_"
-SLACK_DECISIONS = frozenset({"approve", "reject", "stop"})
+# The button wire contract (action_id prefix + the verbs exposed as buttons) is
+# owned by the outbound renderer that emits the buttons; re-exported here so the
+# parser and existing importers keep a single source of truth. Other /foundry
+# verbs are not exposed as Slack buttons.
+from foundry.connectors.slack import SLACK_ACTION_PREFIX, SLACK_DECISIONS
+
+__all__ = [
+    "SLACK_ACTION_PREFIX",
+    "SLACK_DECISIONS",
+    "SlackInteraction",
+    "parse_slack_interaction",
+]
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,7 @@ from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_analysis_comment, state_for
+from foundry.connectors.notify import ApprovalRequest, RunNotifier
 from foundry.observability import traced
 from foundry.audit.events import (
     build_artifact,
@@ -107,6 +108,21 @@ _PR_OBSERVABLE_STATUSES = frozenset(
     {RunStatus.AGENT_RUNNING, RunStatus.PR_OPEN, RunStatus.REVIEW_REQUIRED}
 )
 
+# Status transitions worth pinging a chat surface about: parked, blocked, PR
+# open, merged (and the failure terminals, which an approver wants to hear about
+# as much as a clean block). Routine intermediate states (analysing, approved,
+# agent_running, review_required) are not notified - they would be noise.
+_NOTIFIABLE_STATUSES = frozenset(
+    {
+        RunStatus.NEEDS_CLARIFICATION,
+        RunStatus.BLOCKED,
+        RunStatus.REJECTED,
+        RunStatus.EXECUTION_FAILED,
+        RunStatus.PR_OPEN,
+        RunStatus.COMPLETE,
+    }
+)
+
 # Linear-style issue keys (ENG-123) appearing in branch names or PR titles.
 _ISSUE_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
 
@@ -128,6 +144,7 @@ class FoundryOrchestrator:
         policy_engine: PolicyEngine | None = None,
         provider: CodingAgentProvider | None = None,
         issue_tracker: IssueTracker | None = None,
+        notifier: RunNotifier | None = None,
         max_files_changed: int = 12,
         forbidden_globs: tuple[str, ...] | list[str] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
@@ -144,6 +161,9 @@ class FoundryOrchestrator:
         self._provider = provider or ManualProvider()
         # Optional: when set, Foundry writes progress/state back to the tracker.
         self._tracker = issue_tracker
+        # Optional: when set, Foundry posts approval messages + status updates to
+        # a chat surface (Slack). Best-effort, like the tracker write-back.
+        self._notifier = notifier
         self._max_files_changed = max_files_changed
         self._forbidden_globs = list(
             forbidden_globs if forbidden_globs is not None else DEFAULT_FORBIDDEN_GLOBS
@@ -295,6 +315,12 @@ class FoundryOrchestrator:
                     "authoritative but Linear may be stale",
                     ticket.issue_id,
                 )
+        # Mirror the same outcome onto the chat surface: an actionable approval
+        # message when the run parks for approval, else a status notification.
+        if status is RunStatus.WAITING_APPROVAL:
+            self._notify_approval(ticket, analysis, risk, plan)
+        else:
+            self._notify_run_status(ticket.issue_id, ticket.issue_key, status)
         return run_id
 
     def _notify_state(self, issue_id: str, status: RunStatus) -> None:
@@ -307,6 +333,53 @@ class FoundryOrchestrator:
                     issue_id,
                     status.value,
                 )
+        # The intake path notifies chat itself (it has the full plan context for
+        # the approval message); every later transition flows through here.
+        self._notify_run_status(issue_id, None, status)
+
+    def _notify_run_status(
+        self, issue_id: str, issue_key: str | None, status: RunStatus
+    ) -> None:
+        """Post a status update to the chat surface for notable transitions."""
+        if self._notifier is None or status not in _NOTIFIABLE_STATUSES:
+            return
+        try:
+            self._notifier.status_changed(issue_id, issue_key, status)
+        except Exception:
+            _log.exception(
+                "notifier status update failed for issue %s (-> %s)",
+                issue_id,
+                status.value,
+            )
+
+    def _notify_approval(
+        self,
+        ticket: RawTicket,
+        analysis: TicketAnalysis,
+        risk: RiskAssessment,
+        plan: DeliveryPlan,
+    ) -> None:
+        """Post the interactive approval message to the chat surface."""
+        if self._notifier is None:
+            return
+        repo = plan.affected_repositories[0] if plan.affected_repositories else "unknown"
+        request = ApprovalRequest(
+            issue_id=ticket.issue_id,
+            issue_key=ticket.issue_key,
+            title=analysis.title,
+            work_type=analysis.work_type.value,
+            risk=risk.overall_risk.value,
+            agent_mode=risk.allowed_agent_mode.value,
+            repo=repo,
+            acceptance_criteria=tuple(analysis.acceptance_criteria),
+            required_approvals=tuple(r.value for r in risk.required_approvals),
+        )
+        try:
+            self._notifier.approval_requested(request)
+        except Exception:
+            _log.exception(
+                "notifier approval message failed for issue %s", ticket.issue_id
+            )
 
     def _notify_comment(self, issue_id: str, body: str) -> None:
         if self._tracker is not None:
