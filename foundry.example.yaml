@@ -26,6 +26,15 @@ risk:
   model: gpt-5.5
 
 policy:
+  # Policy backend: "local" (in-process Python engine, the default) or "opa"
+  # (delegate to an OPA server running src/foundry/policy/foundry.rego). Both
+  # enforce identical rules - lock-step is machine-verified over shared vectors
+  # (tests/test_policy_parity.py + scripts/policy_parity.py).
+  provider: local
+  # OPA decision endpoint base URL; required only when provider is "opa".
+  # The repo_confidence_threshold below is sent to OPA so the two backends
+  # evaluate against the same value.
+  # opa_url: http://opa:8181
   # A run is blocked unless one repo clears this confidence (0-100).
   repo_confidence_threshold: 70
   # PRs larger than this are routed to human review.

@@ -1,0 +1,503 @@
+{
+  "_comment": [
+    "Shared policy decision vectors - the single source of truth for lock-step",
+    "between the Python LocalPolicyEngine and the Rego bundle (foundry.rego).",
+    "tests/test_policy_parity.py runs every vector through LocalPolicyEngine;",
+    "scripts/policy_parity.py runs the same vectors through `opa eval` in the OPA",
+    "CI job. Both assert against `expected`, so the two engines cannot diverge",
+    "silently (AGENTS.md invariant #2).",
+    "",
+    "Notes:",
+    "- `reasons` and `required_approvals` are compared set-wise: Rego materialises",
+    "  sets in sorted order while Python preserves insertion order, so only the",
+    "  *set* of strings is load-bearing for audit parity.",
+    "- Always set `risk.overall_risk` explicitly: the Python schema defaults it to",
+    "  'medium' but absent-in-Rego would read as neither low nor medium.",
+    "- `config.repo_confidence_threshold` (default 70) is injected into the OPA",
+    "  input and passed to LocalPolicyEngine's constructor, proving the threshold",
+    "  is threaded through rather than hardcoded.",
+    "- `valid_action: false` marks an action outside the PolicyAction enum: Python",
+    "  rejects it at the schema boundary (its form of default-deny) so only `allow`",
+    "  is checked there; Rego's in-rule default-deny is checked in full."
+  ],
+  "vectors": [
+    {
+      "name": "low_risk_start_allows_draft_pr",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"work_type": "feature", "readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"name": "customer-web", "confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "confidence_exactly_at_threshold_allowed",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 70},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "confidence_one_below_threshold_denied",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 69},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["repository confidence 69 is below the threshold of 70"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "custom_threshold_80_below_denied",
+      "config": {"repo_confidence_threshold": 80},
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 75},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["repository confidence 75 is below the threshold of 80"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "custom_threshold_80_at_boundary_allowed",
+      "config": {"repo_confidence_threshold": 80},
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 80},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "auth_requires_engineering_approval",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "medium", "auth": true},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["sensitive work requires 'engineering' approval, which is missing"],
+        "required_approvals": ["engineering"]
+      }
+    },
+    {
+      "name": "auth_allowed_with_engineering_approval",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "medium", "auth": true},
+        "repo": {"confidence": 90},
+        "approval": {"engineering": true}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": ["engineering"]
+      }
+    },
+    {
+      "name": "customer_data_requires_security_approval",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "medium", "customer_data": true},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["sensitive work requires 'security' approval, which is missing"],
+        "required_approvals": ["security"]
+      }
+    },
+    {
+      "name": "multi_role_auth_payments_none_approved",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "high", "auth": true, "payments": true},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": [
+          "sensitive work requires 'engineering' approval, which is missing",
+          "sensitive work requires 'security' approval, which is missing"
+        ],
+        "required_approvals": ["engineering", "security"]
+      }
+    },
+    {
+      "name": "multi_role_partial_approval_still_denied",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "high", "auth": true, "payments": true},
+        "repo": {"confidence": 90},
+        "approval": {"engineering": true}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["sensitive work requires 'security' approval, which is missing"],
+        "required_approvals": ["engineering", "security"]
+      }
+    },
+    {
+      "name": "multi_role_both_approved_high_risk_human_only",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "high", "auth": true, "payments": true},
+        "repo": {"confidence": 90},
+        "approval": {"engineering": true, "security": true}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": ["engineering", "security"]
+      }
+    },
+    {
+      "name": "migration_blocks_execution",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "medium", "database_migration": true},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["database migrations are blocked in the MVP"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "production_deploy_flag_blocks_open_pr",
+      "input": {
+        "action": "open_pr",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low", "production_deploy": true},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["production deployment is blocked in the MVP"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "not_ready_blocks_execution",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "needs_clarification"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["ticket readiness is 'needs_clarification', not 'ready'"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "risk_blocked_blocks_execution",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "blocked"},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["risk assessment marked the work as blocked"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "high_risk_allowed_but_human_only",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "high"},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "advisory_analysis_always_allowed_high_risk_human_only",
+      "input": {
+        "action": "analyse_ticket",
+        "ticket": {"readiness": "needs_clarification"},
+        "risk": {"overall_risk": "high"},
+        "repo": {"confidence": 0},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["action 'analyse_ticket' is read-only / advisory"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "advisory_create_plan_low_risk_draft_pr_mode",
+      "input": {
+        "action": "create_plan",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["action 'create_plan' is read-only / advisory"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "auto_merge_denied_unconditionally",
+      "input": {
+        "action": "auto_merge",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"name": "customer-web", "confidence": 100},
+        "approval": {"engineering": true, "security": true}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["action 'auto_merge' may never run autonomously in this version"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "production_deploy_action_denied_unconditionally",
+      "input": {
+        "action": "production_deploy",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 100},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["action 'production_deploy' may never run autonomously in this version"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_within_cap_allowed",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "retry": {"attempt": 2, "max_attempts": 2},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_past_cap_denied",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "retry": {"attempt": 3, "max_attempts": 2},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["remediation attempt 3 exceeds the maximum of 2"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_first_attempt_over_zero_cap_denied",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "retry": {"attempt": 1, "max_attempts": 0},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["remediation attempt 1 exceeds the maximum of 0"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_attempt_zero_at_zero_cap_allowed",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "retry": {"attempt": 0, "max_attempts": 0},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_over_budget_denied",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "budget": {"cost_usd": 5.5, "max_cost_usd": 5.0},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["run spend $5.50 has reached the budget cap of $5.00"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_budget_exactly_at_cap_denied",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "budget": {"cost_usd": 5.0, "max_cost_usd": 5.0},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["run spend $5.00 has reached the budget cap of $5.00"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_budget_just_under_cap_allowed",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "budget": {"cost_usd": 4.99, "max_cost_usd": 5.0},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_no_budget_cap_allowed",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "budget": {"cost_usd": 999.0},
+        "approval": {}
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "unknown_action_denied_by_default",
+      "valid_action": false,
+      "input": {
+        "action": "launch_the_missiles",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 100},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["action 'launch_the_missiles' is not covered by this policy; denying by default"],
+        "required_approvals": []
+      }
+    }
+  ]
+}

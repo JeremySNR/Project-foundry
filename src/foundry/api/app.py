@@ -55,7 +55,7 @@ from foundry.db.models import (
 )
 from foundry.engines import build_openai_analyzer
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
-from foundry.policy import LocalPolicyEngine
+from foundry.policy import LocalPolicyEngine, OpaPolicyEngine, PolicyEngine
 from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
@@ -1019,6 +1019,24 @@ def build_provider(settings: Settings, tracker=None):
     raise ValueError(f"unknown agent.provider: {name!r}")
 
 
+def build_policy_engine(settings: Settings) -> PolicyEngine:
+    """Select the policy backend from config.
+
+    ``local`` (default) is the in-process Python engine; ``opa`` delegates to an
+    OPA server running the foundry.rego bundle. Both enforce the same rules - the
+    configured confidence threshold is passed to whichever backend is chosen, so
+    the threshold can never diverge between them.
+    """
+    if settings.policy_provider == "opa":
+        return OpaPolicyEngine(
+            base_url=settings.policy_opa_url,
+            repo_confidence_threshold=settings.repo_confidence_threshold,
+        )
+    return LocalPolicyEngine(
+        repo_confidence_threshold=settings.repo_confidence_threshold
+    )
+
+
 def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrator:
     """Assemble an orchestrator from settings: analyzer, policy thresholds, Linear."""
     from foundry.engines.enrichment import CatalogContextEnricher, StaticContextEnricher
@@ -1120,9 +1138,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         issue_tracker=tracker,
         notifier=notifier,
         provider=build_provider(settings, tracker),
-        policy_engine=LocalPolicyEngine(
-            repo_confidence_threshold=settings.repo_confidence_threshold
-        ),
+        policy_engine=build_policy_engine(settings),
         max_files_changed=settings.max_files_changed,
         forbidden_globs=settings.forbidden_globs,
         sensitive_path_globs=settings.sensitive_globs_map,

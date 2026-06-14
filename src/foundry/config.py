@@ -127,6 +127,14 @@ class Settings:
     risk_model: str = "gpt-5.5"
 
     # --- policy / safety knobs (behaviour: yaml) ---
+    # Policy backend: "local" (the in-process Python LocalPolicyEngine, default)
+    # or "opa" (delegate to an OPA server running the foundry.rego bundle). Both
+    # enforce the same rules - the Rego bundle is held in lock-step by
+    # tests/test_policy_parity.py + scripts/policy_parity.py over shared vectors.
+    policy_provider: str = "local"
+    # OPA decision endpoint base URL (e.g. http://opa:8181). Required when
+    # policy_provider == "opa".
+    policy_opa_url: str | None = None
     repo_confidence_threshold: int = 70
     max_files_changed: int = 12
     forbidden_globs: tuple[str, ...] = DEFAULT_FORBIDDEN_GLOBS
@@ -198,6 +206,14 @@ class Settings:
         return settings
 
     def _validate(self) -> None:
+        if self.policy_provider not in ("local", "opa"):
+            raise ValueError(
+                f"policy_provider must be 'local' or 'opa', got {self.policy_provider!r}"
+            )
+        if self.policy_provider == "opa" and not self.policy_opa_url:
+            raise ValueError(
+                "policy_opa_url is required when policy_provider is 'opa'"
+            )
         if not (0 <= self.repo_confidence_threshold <= 100):
             raise ValueError(
                 f"repo_confidence_threshold must be 0-100, got {self.repo_confidence_threshold}"
@@ -323,6 +339,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["jira_base_url"] = tracker["jira_base_url"]
 
     policy = data.get("policy", {}) or {}
+    if "provider" in policy:
+        out["policy_provider"] = policy["provider"]
+    if "opa_url" in policy:
+        out["policy_opa_url"] = policy["opa_url"]
     if "repo_confidence_threshold" in policy:
         out["repo_confidence_threshold"] = int(policy["repo_confidence_threshold"])
     if "max_files_changed" in policy:
@@ -444,6 +464,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_TASK_QUEUE": "task_queue",
         "FOUNDRY_CONTEXT_PROVIDER": "context_provider",
         "FOUNDRY_CONTEXT_ORG": "context_org",
+        "FOUNDRY_POLICY_PROVIDER": "policy_provider",
+        "FOUNDRY_POLICY_OPA_URL": "policy_opa_url",
     }
     for env_key, field_name in mapping.items():
         if env_key in env:

@@ -163,3 +163,10 @@ jobs:
 
       - name: Run policy tests
         run: opa test src/foundry/policy -v
+
+      # Machine-verified lock-step (AGENTS.md invariant #2): run the shared
+      # decision vectors through the Rego bundle and assert they match the same
+      # expected decisions that tests/test_policy_parity.py asserts against
+      # LocalPolicyEngine. If Python and Rego diverge, one of these two jobs fails.
+      - name: Verify Python/Rego policy parity on shared vectors
+        run: python3 scripts/policy_parity.py

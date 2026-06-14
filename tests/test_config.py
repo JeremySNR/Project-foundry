@@ -372,3 +372,45 @@ def test_invalid_risk_provider_raises() -> None:
 
     with pytest.raises(ValueError, match="risk_provider"):
         Settings.from_env({"FOUNDRY_RISK_PROVIDER": "bogus"})
+
+
+def test_policy_provider_defaults_to_local() -> None:
+    s = Settings.from_env({})
+    assert s.policy_provider == "local"
+    assert s.policy_opa_url is None
+
+
+def test_policy_provider_opa_from_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("policy:\n  provider: opa\n  opa_url: http://opa:8181\n")
+    s = Settings.load(path, env={})
+    assert s.policy_provider == "opa"
+    assert s.policy_opa_url == "http://opa:8181"
+
+
+def test_policy_provider_env_overrides_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("policy:\n  provider: local\n")
+    s = Settings.load(
+        path,
+        env={
+            "FOUNDRY_POLICY_PROVIDER": "opa",
+            "FOUNDRY_POLICY_OPA_URL": "http://opa.internal:8181",
+        },
+    )
+    assert s.policy_provider == "opa"
+    assert s.policy_opa_url == "http://opa.internal:8181"
+
+
+def test_invalid_policy_provider_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="policy_provider"):
+        Settings.from_env({"FOUNDRY_POLICY_PROVIDER": "bogus"})
+
+
+def test_opa_provider_without_url_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="policy_opa_url is required"):
+        Settings.from_env({"FOUNDRY_POLICY_PROVIDER": "opa"})
