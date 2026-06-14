@@ -38,6 +38,7 @@ high "explicit ticket association" confidence rather than guessing.
 from __future__ import annotations
 
 import re
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -227,3 +228,26 @@ def decompose_epic(ticket: RawTicket) -> EpicDecomposition:
             "run as a single ordinary run"
         ),
     )
+
+
+class EpicDecomposer(Protocol):
+    """Split an epic ticket into per-repo children, or decline.
+
+    The orchestrator depends only on this protocol, so a deterministic or an
+    LLM-backed decomposer slots in without any other change. Mirrors the
+    ``TicketAnalyzer`` / ``DeliveryPlanner`` engine seams.
+    """
+
+    def decompose(self, ticket: RawTicket) -> EpicDecomposition: ...
+
+
+class HeuristicDecomposer:
+    """The deterministic :func:`decompose_epic` as an :class:`EpicDecomposer`.
+
+    The no-model, offline reference decomposer and the orchestrator's default.
+    :class:`~foundry.engines.llm_decomposition.LlmDecomposer` enriches it (it
+    keeps this as a non-overridable floor); see that module.
+    """
+
+    def decompose(self, ticket: RawTicket) -> EpicDecomposition:
+        return decompose_epic(ticket)

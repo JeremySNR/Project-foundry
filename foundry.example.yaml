@@ -39,6 +39,25 @@ planner:
   provider: template
   model: gpt-5.5
 
+decomposition:
+  # Epic decomposition backend (override with FOUNDRY_DECOMPOSITION_PROVIDER).
+  # Only consulted on the epic-intake path (epics.auto_decompose below, or an
+  # explicit epic intake); inert otherwise.
+  #   heuristic - deterministic producer: an explicit "Repositories:" section,
+  #               or >= 2 associated repos (default, no API key)
+  #   llm       - adds an inference pass that recovers epics described only in
+  #               prose ("migrate the ledger in billing-api and the checkout in
+  #               customer-web") where neither heuristic shape is present (set
+  #               OPENAI_API_KEY). The heuristic decomposer stays a hard floor:
+  #               the LLM only ADDS a split the heuristic missed, never removes
+  #               or re-scopes one; every proposed repo must appear verbatim in
+  #               the ticket text (no invented repos); fewer than two grounded
+  #               repos => degrade to the deterministic result. Each child run
+  #               is still independently gated and approved - no gate weakened.
+  #               Costs one model call per epic-intake.
+  provider: heuristic
+  model: gpt-5.5
+
 policy:
   # Policy backend: "local" (in-process Python engine, the default) or "opa"
   # (delegate to an OPA server running src/foundry/policy/foundry.rego). Both

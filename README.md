@@ -179,6 +179,8 @@ tracker:
   provider: linear                # or github_issues / jira
 triggers:
   label: "foundry:candidate"      # runs only start on an explicit opt-in
+decomposition:
+  provider: heuristic             # or llm - infer prose-described epic splits (grounded, degrade-to-floor, #35)
 epics:
   auto_decompose: false           # split a multi-repo ticket into per-repo child runs at intake (#35)
 approval:
@@ -265,6 +267,15 @@ populated `expected_files_or_areas`. It's only consulted for a buildable, confid
 the goal/scope/branch and the guardrail block (forbidden paths, no migrations, stop conditions)
 stay deterministic — the model enriches the plan but can't relax a constraint — and an LLM failure
 degrades to the deterministic template plan. The template planner remains the no-key default.
+
+Epic decomposition has the same shape. The deterministic producer splits a multi-repo ticket via
+an explicit `Repositories:` section or `≥2` associated repos; with `decomposition.provider: llm`,
+an epic described only in *prose* — "migrate the ledger in `billing-api` and the checkout in
+`customer-web`" — is recovered by inference. The deterministic decomposer stays a hard floor: the
+model is consulted only when the floor declines, every repo it proposes must already appear in the
+ticket text (no invented repos), fewer than two grounded repos degrades to the floor, and each
+child still runs the full policy gate and its own approval — so the LLM can only *add* a split,
+never weaken one.
 
 Optional extras, install what you need:
 

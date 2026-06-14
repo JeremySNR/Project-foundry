@@ -169,6 +169,15 @@ class Settings:
     # LLM failure degrades to the template plan.
     planner_provider: str = "template"
     planner_model: str = "gpt-5.5"
+    # Epic decomposition backend (issue #35). "heuristic" is the deterministic
+    # producer (explicit Repositories section, or >= 2 associated repos); "llm"
+    # adds an inference pass that recovers epics described in prose, keeping the
+    # heuristic decomposer as a non-overridable floor (it only ever *adds* a
+    # split the heuristic missed, never removes one) and grounding every
+    # proposed repo in the ticket text (needs OPENAI_API_KEY). Only consulted on
+    # the epic-intake path (epics.auto_decompose, or an explicit epic intake).
+    decomposition_provider: str = "heuristic"
+    decomposition_model: str = "gpt-5.5"
 
     # --- policy / safety knobs (behaviour: yaml) ---
     # Policy backend: "local" (the in-process Python LocalPolicyEngine, default)
@@ -344,6 +353,11 @@ class Settings:
                 "planner_provider must be 'template' or 'llm', got "
                 f"{self.planner_provider!r}"
             )
+        if self.decomposition_provider not in ("heuristic", "llm"):
+            raise ValueError(
+                "decomposition_provider must be 'heuristic' or 'llm', got "
+                f"{self.decomposition_provider!r}"
+            )
         if self.context_provider not in ("static", "catalog", "code"):
             raise ValueError(
                 "context_provider must be 'static', 'catalog' or 'code', "
@@ -451,6 +465,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["planner_provider"] = planner["provider"]
     if "model" in planner:
         out["planner_model"] = planner["model"]
+
+    decomposition = data.get("decomposition", {}) or {}
+    if "provider" in decomposition:
+        out["decomposition_provider"] = decomposition["provider"]
+    if "model" in decomposition:
+        out["decomposition_model"] = decomposition["model"]
 
     agent = data.get("agent", {}) or {}
     if "provider" in agent:
@@ -619,6 +639,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_RISK_MODEL": "risk_model",
         "FOUNDRY_PLANNER_PROVIDER": "planner_provider",
         "FOUNDRY_PLANNER_MODEL": "planner_model",
+        "FOUNDRY_DECOMPOSITION_PROVIDER": "decomposition_provider",
+        "FOUNDRY_DECOMPOSITION_MODEL": "decomposition_model",
         "TEMPORAL_ADDRESS": "temporal_address",
         "FOUNDRY_TASK_QUEUE": "task_queue",
         "FOUNDRY_CONTEXT_PROVIDER": "context_provider",

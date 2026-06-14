@@ -312,3 +312,46 @@ def test_intake_epic_rejects_duplicate_active_epic(session_factory) -> None:
     # on the one-active-run-per-issue guard before any new child is created.
     with pytest.raises(OrchestratorError, match="already has an active run"):
         orch.intake_epic(_epic_ticket(), trigger_type="label")
+
+
+def test_intake_epic_uses_injected_llm_decomposer(session_factory) -> None:
+    # A prose epic with no Repositories section and no associated repos: the
+    # deterministic floor declines, so the injected LLM decomposer drives the
+    # split and intake_epic fans out into one independently-gated child per repo.
+    from foundry.engines.llm import FakeStructuredLLM
+    from foundry.engines.llm_decomposition import LlmDecomposer
+
+    llm = FakeStructuredLLM(
+        [
+            {
+                "is_epic": True,
+                "repositories": [
+                    {"repo": "customer-web", "scope": "add the favourites button"},
+                    {"repo": "mobile-app", "scope": "add the favourites button"},
+                ],
+                "reason": "spans two surfaces",
+            }
+        ]
+    )
+    orch = FoundryOrchestrator(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        decomposer=LlmDecomposer(llm),
+    )
+    ticket = RawTicket(
+        issue_id="epic-prose",
+        issue_key="LIN-700",
+        title="Add favourites everywhere",
+        description=(
+            "Add favourites in customer-web and mobile-app together.\n\n"
+            "Acceptance Criteria:\n"
+            "- A favourites button exists\n"
+            "- Favourites persist across sessions\n"
+        ),
+    )
+    result = orch.intake_epic(ticket, trigger_type="label")
+
+    assert result.is_epic is True
+    assert len(result.child_run_ids) == 2
+    for child_id in result.child_run_ids:
+        assert orch.get_run(child_id).status is RunStatus.WAITING_APPROVAL

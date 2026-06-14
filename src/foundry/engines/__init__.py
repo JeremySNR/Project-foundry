@@ -21,6 +21,13 @@ from .llm_risk import (
     build_llm_risk_classifier,
 )
 from .llm_planner import LlmPlanner, build_llm_planner
+from .decomposition import (
+    EpicDecomposer,
+    EpicDecomposition,
+    HeuristicDecomposer,
+    decompose_epic,
+)
+from .llm_decomposition import LlmDecomposer, build_llm_decomposer
 from .openai_analyzer import OpenAITicketAnalyzer, build_openai_analyzer
 from .planner import (
     DEFAULT_FORBIDDEN_GLOBS,
@@ -58,6 +65,12 @@ __all__ = [
     "TemplatePlanner",
     "LlmPlanner",
     "build_llm_planner",
+    "EpicDecomposer",
+    "EpicDecomposition",
+    "HeuristicDecomposer",
+    "decompose_epic",
+    "LlmDecomposer",
+    "build_llm_decomposer",
     "branch_name_for",
     "DEFAULT_FORBIDDEN_GLOBS",
 ]
