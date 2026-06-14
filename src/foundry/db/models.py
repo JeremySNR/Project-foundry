@@ -42,6 +42,7 @@ from foundry.schemas.common import (
 )
 
 from .base import Base
+from .encryption import EncryptedText
 
 
 def _utcnow() -> datetime:
@@ -164,7 +165,11 @@ class FoundryArtifact(Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("foundry_runs.id"), index=True)
     artifact_type: Mapped[ArtifactType] = mapped_column(Enum(ArtifactType))
     version: Mapped[int] = mapped_column(Integer, default=1)
-    content_json: Mapped[str] = mapped_column(Text)
+    # Encrypted at rest when FOUNDRY_ARTIFACT_ENCRYPTION_KEY is set; transparent
+    # plaintext otherwise (see db/encryption.py). The SQL type stays TEXT, so no
+    # migration is needed; content_hash below is computed over the *plaintext*
+    # canonical JSON, so encryption never disturbs integrity verification.
+    content_json: Mapped[str] = mapped_column(EncryptedText)
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow

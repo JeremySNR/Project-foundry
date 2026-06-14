@@ -7,6 +7,15 @@
 database:
   # Usually set via FOUNDRY_DATABASE_URL instead. SQLite is the default.
   url: "sqlite+pysqlite:///:memory:"
+  # Artifact payloads (foundry_artifacts.content_json) can be encrypted at rest.
+  # This is a SECRET, so it comes from the environment, never this file:
+  #   FOUNDRY_ARTIFACT_ENCRYPTION_KEY  - a Fernet key (url-safe base64, 32 bytes;
+  #                                      generate with cryptography.fernet.Fernet
+  #                                      .generate_key()). Comma-separate keys to
+  #                                      rotate (the first encrypts; all decrypt).
+  # Needs the optional 'crypto' extra (pip install project-foundry[crypto]); a key
+  # set without it fails closed at startup. Unset => payloads stored as plaintext.
+  # Content hashes are computed over plaintext, so audit integrity is unaffected.
 
 analyzer:
   # "heuristic" needs no API key and is fully deterministic.

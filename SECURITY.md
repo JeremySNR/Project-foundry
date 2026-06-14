@@ -36,3 +36,11 @@ Foundry fails closed by design, but you still need to deploy it sensibly:
 - Terminate TLS in front of the API; webhook signatures authenticate payloads,
   not transport.
 - Keep the approver → roles mapping in reviewed, committed YAML.
+- To encrypt artifact payloads at rest, set `FOUNDRY_ARTIFACT_ENCRYPTION_KEY`
+  (a Fernet key; install the `crypto` extra). Treat it like any data-encryption
+  key: store it in your secrets manager, never in YAML, and rotate by listing
+  the new key first and the old one after it, comma-separated (the new key
+  encrypts; both decrypt). The content hashes that protect audit integrity are
+  computed over plaintext, so they remain verifiable with or without the key —
+  but **losing the key makes encrypted payloads unrecoverable**, and reads of
+  encrypted rows fail loud if the key is removed.

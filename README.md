@@ -190,6 +190,7 @@ Secrets via env:
 | `FOUNDRY_SLACK_SIGNING_SECRET` | Enables `/webhooks/slack` (Slack v0 request-signing + replay-age; endpoint disabled without it). |
 | `FOUNDRY_SLACK_BOT_TOKEN` / `FOUNDRY_SLACK_CHANNEL` | Enables outbound Slack: posts the interactive approval message + status updates (parked/blocked/PR open/merged). Fail-closed — both (token + channel, the latter also settable via `notifications.slack_channel`) required, else no notifier. |
 | `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
+| `FOUNDRY_ARTIFACT_ENCRYPTION_KEY` | Fernet key to encrypt artifact payloads at rest (comma-separate to rotate). Needs the `crypto` extra; **unset = plaintext** (the default). Content hashes stay over plaintext, so audit integrity is unaffected. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
 | `FOUNDRY_AGENT_WEBHOOK_URL` / `..._SECRET` | Needed when the provider is `webhook`; the secret HMAC-signs the job payload. |
@@ -273,6 +274,7 @@ These are enforced, tested, and not negotiable by a prompt:
 - No auto-merge. Ever, in this version.
 - Secrets never end up in an agent prompt; job inputs are scanned before dispatch.
 - Every decision, every artifact, every approval is content-hashed and written down, so you can always answer "why did the agent do that?".
+- Artifact payloads can be encrypted at rest (`FOUNDRY_ARTIFACT_ENCRYPTION_KEY`, opt-in) without touching the audit guarantees: hashes are computed over plaintext, so integrity verification holds with or without the key.
 
 These aren't suggestions, they're the creed. This is the Way.
 
@@ -316,7 +318,7 @@ src/foundry/
   policy/          the Python engine + foundry.rego (kept in sync)
   agents/          provider abstraction: manual, fake, Cursor (two ways), Claude Code, webhook
   connectors/      Linear, GitHub, GitHub Issues, Jira, GitLab, live HTTP transports
-  db/              SQLAlchemy models (runs, artifacts, audit, policy, jobs)
+  db/              SQLAlchemy models (runs, artifacts, audit, policy, jobs) + at-rest artifact encryption (encryption.py)
   audit/           content hashing + the verifiable trail
   api/             the FastAPI app, webhook security, payload mapping, dashboard
 tests/             one module per package, plus the gated Temporal/Postgres/E2E tests

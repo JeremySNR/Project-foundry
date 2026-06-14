@@ -46,6 +46,7 @@ from foundry.connectors.transport import (
     linear_transport,
 )
 from foundry.db.base import init_schema, make_engine, make_session_factory
+from foundry.db.encryption import configure_cipher_from_key
 from foundry.db.models import (
     FoundryAgentJob,
     FoundryArtifact,
@@ -1176,6 +1177,9 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
 
 
 def app_from_settings(settings: Settings) -> FastAPI:
+    # Set the process artifact cipher before any DB access so writes encrypt and
+    # reads decrypt deterministically (the key is a secret from the environment).
+    configure_cipher_from_key(settings.artifact_encryption_key)
     engine = make_engine(settings.database_url)
     init_schema(engine)
     session_factory = make_session_factory(engine)
