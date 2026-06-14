@@ -97,6 +97,20 @@ tracker:
 #           approval surface, key the approvers below by Slack user id (e.g.
 #           "U07ABC123") rather than email - as GitHub Issues approvers are keyed
 #           by login. Fail-closed: no signing secret => endpoint disabled.
+#
+# Outbound Slack notifications (the message approvers click + status updates):
+#   Set FOUNDRY_SLACK_BOT_TOKEN (a bot token, xoxb-...) AND notifications.slack_channel
+#   (below; or FOUNDRY_SLACK_CHANNEL). Foundry then posts an interactive approval
+#   message (approve/reject/stop buttons that round-trip to /webhooks/slack) when a
+#   run parks for approval, plus short status updates (parked, blocked, PR open,
+#   merged). Best-effort: a Slack outage never breaks a run. Fail-closed: outbound
+#   Slack is wired only when BOTH the bot token and a channel are set.
+
+notifications:
+  # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status
+  # updates into. Needs FOUNDRY_SLACK_BOT_TOKEN set too; either missing => no
+  # outbound Slack. Leave unset to disable.
+  slack_channel: "C01APPROVALS"
 
 triggers:
   # A run starts only on an explicit opt-in, never for every new issue.

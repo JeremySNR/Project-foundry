@@ -84,6 +84,12 @@ class Settings:
     # Slack signs interactivity requests with this signing secret (v0 scheme);
     # approvers are then keyed by Slack user id rather than email.
     slack_signing_secret: str | None = None
+    # --- Slack outbound notifications (token: env; channel: yaml or env) ---
+    # Bot token (xoxb-...) Foundry posts approval messages + status updates with.
+    # Fail-closed: outbound Slack is wired only when BOTH the bot token AND a
+    # channel are set; either missing => no notifier (silent, like no tracker).
+    slack_bot_token: str | None = None
+    slack_channel: str | None = None
 
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
@@ -346,6 +352,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "confidence_cap" in memory:
         out["memory_confidence_cap"] = int(memory["confidence_cap"])
 
+    notifications = data.get("notifications", {}) or {}
+    if "slack_channel" in notifications:
+        out["slack_channel"] = notifications["slack_channel"]
+
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
         out["temporal_address"] = temporal["address"]
@@ -391,6 +401,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_GITLAB_API_TOKEN": "gitlab_api_token",
         "FOUNDRY_GITLAB_API_BASE": "gitlab_api_base",
         "FOUNDRY_SLACK_SIGNING_SECRET": "slack_signing_secret",
+        "FOUNDRY_SLACK_BOT_TOKEN": "slack_bot_token",
+        "FOUNDRY_SLACK_CHANNEL": "slack_channel",
         "FOUNDRY_API_TOKEN": "api_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
         "FOUNDRY_TRACKER_PROVIDER": "tracker_provider",

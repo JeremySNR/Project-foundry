@@ -187,6 +187,7 @@ Secrets via env:
 | `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
 | `FOUNDRY_GITLAB_API_TOKEN` / `..._BASE` | Fetches MR diffs so GitLab MRs run the same file-based gates as GitHub PRs (without it, MRs are diff-blind). `..._BASE` overrides the API root for self-managed GitLab. |
 | `FOUNDRY_SLACK_SIGNING_SECRET` | Enables `/webhooks/slack` (Slack v0 request-signing + replay-age; endpoint disabled without it). |
+| `FOUNDRY_SLACK_BOT_TOKEN` / `FOUNDRY_SLACK_CHANNEL` | Enables outbound Slack: posts the interactive approval message + status updates (parked/blocked/PR open/merged). Fail-closed — both (token + channel, the latter also settable via `notifications.slack_channel`) required, else no notifier. |
 | `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |

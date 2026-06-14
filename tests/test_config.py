@@ -116,6 +116,27 @@ def test_api_token_from_env() -> None:
     assert s.api_token == "tok"
 
 
+def test_slack_notifications_from_env_and_yaml(tmp_path) -> None:
+    # Bot token is env-only; the channel may come from YAML or env (env wins).
+    s = Settings.from_env(
+        {"FOUNDRY_SLACK_BOT_TOKEN": "xoxb-1", "FOUNDRY_SLACK_CHANNEL": "C-env"}
+    )
+    assert s.slack_bot_token == "xoxb-1"
+    assert s.slack_channel == "C-env"
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text("notifications:\n  slack_channel: C-yaml\n")
+    assert Settings.load(path, env={}).slack_channel == "C-yaml"
+    # Env overrides the YAML channel.
+    assert (
+        Settings.load(path, env={"FOUNDRY_SLACK_CHANNEL": "C-env"}).slack_channel
+        == "C-env"
+    )
+    # Default: outbound Slack unconfigured.
+    assert Settings.from_env({}).slack_bot_token is None
+    assert Settings.from_env({}).slack_channel is None
+
+
 def test_env_overrides_yaml(tmp_path) -> None:
     path = tmp_path / "foundry.yaml"
     path.write_text(_YAML)
