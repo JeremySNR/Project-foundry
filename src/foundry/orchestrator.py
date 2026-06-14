@@ -644,6 +644,58 @@ class FoundryOrchestrator:
         self._notify_state(issue_id, status)
         return status
 
+    def fail_run(self, run_id: str, *, reason: str | None = None) -> RunStatus:
+        """Compensation for an irrecoverable durable-workflow error (issue #37).
+
+        When a Temporal activity exhausts its retry budget (a non-retryable
+        deterministic error, or ``maximum_attempts`` reached on a transient
+        one) the workflow fails. Without compensation the run row is left in
+        whatever *active* state it last reached (e.g. ``AGENT_RUNNING`` after a
+        crashing ``record_pr``) - active forever, never recorded as an outcome,
+        and silently distorting the fleet snapshot and the routing priors. This
+        is the durable workflow's last-resort compensation activity: it
+        transitions any still-active run to ``EXECUTION_FAILED`` with an audited
+        ``agent.failed`` event (consistent with ``expire_pending_pr`` and a
+        provider that raises), cancels any in-flight job so a stranded run stops
+        spending, and records the terminal outcome.
+
+        Idempotent and terminal-safe: a run that already finished - including a
+        sticky forbidden-path ``BLOCKED`` (AGENTS.md invariant #7), a human
+        ``stop``/``reject``, or a delivered PR - is left exactly as it is and
+        its current status returned, so re-running this compensation activity
+        under Temporal's at-least-once delivery never overwrites a real terminal
+        state.
+        """
+        with self._sf() as session:
+            run = self._require_run(session, run_id, lock=True)
+            if run.status in TERMINAL_RUN_STATUSES:
+                # Already finished (including a sticky BLOCKED or a delivered
+                # PR's COMPLETE): never overwrite the single recorded outcome.
+                return run.status
+            run.status = RunStatus.EXECUTION_FAILED
+            run.current_step = RunStatus.EXECUTION_FAILED.value
+            metadata: dict[str, str] = {"category": "workflow_irrecoverable_error"}
+            if reason:
+                # Bound the free-text reason so a verbose error never bloats the
+                # audit row; the category is the stable, queryable field.
+                metadata["reason"] = reason[:500]
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.AGENT_FAILED,
+                    actor_type="foundry",
+                    metadata=metadata,
+                )
+            )
+            # A run that crashed mid-flight may still have a job spending;
+            # cancel it best-effort exactly as a human stop / PR expiry would.
+            self._cancel_active_job(session, run_id, user="foundry")
+            issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
+            session.commit()
+        self._notify_state(issue_id, RunStatus.EXECUTION_FAILED)
+        return RunStatus.EXECUTION_FAILED
+
     def _cancel_active_job(self, session, run_id: str, *, user: str) -> None:
         """Cancel the run's in-flight provider job when a human ends the run.
 

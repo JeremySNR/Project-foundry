@@ -19,10 +19,18 @@ import pytest_asyncio  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
+from temporalio.client import WorkflowFailureError  # noqa: E402
+
 from foundry.agents.manual import InMemoryFakeProvider  # noqa: E402
 from foundry.connectors import InMemoryIssueTracker  # noqa: E402
-from foundry.db import create_all, make_engine, make_session_factory  # noqa: E402
+from foundry.db import (  # noqa: E402
+    FoundryRun,
+    create_all,
+    make_engine,
+    make_session_factory,
+)
 from foundry.orchestrator import FoundryOrchestrator  # noqa: E402
+from foundry.schemas.common import RunStatus  # noqa: E402
 from foundry.workflows.activities import FoundryActivities  # noqa: E402
 from foundry.workflows.workflow import TicketToPrWorkflow  # noqa: E402
 
@@ -48,13 +56,19 @@ async def env():
 
 
 def _activities() -> FoundryActivities:
+    return _activities_with_db()[0]
+
+
+def _activities_with_db() -> tuple[FoundryActivities, object]:
+    """Activities plus the session factory, so a test can inspect the run row
+    after the workflow finishes (or fails)."""
     engine = make_engine("sqlite+pysqlite:///:memory:")
     create_all(engine)
     sf = make_session_factory(engine)
     orch = FoundryOrchestrator(
         sf, provider=InMemoryFakeProvider(), issue_tracker=InMemoryIssueTracker()
     )
-    return FoundryActivities(orch)
+    return FoundryActivities(orch), sf
 
 
 async def test_workflow_happy_path_with_signals(env) -> None:
@@ -205,6 +219,45 @@ async def test_workflow_ignores_unknown_decision_then_accepts_valid(env) -> None
             )
             result = await handle.result()
             assert result["status"] == "rejected"
+
+
+async def test_workflow_compensates_irrecoverable_activity_error(env) -> None:
+    # An activity exhausts its retries mid-flight (here a malformed PR payload
+    # makes record_pr raise a non-retryable ValidationError while the run is
+    # agent_running). The workflow must run the fail_run compensation so the run
+    # row ends execution_failed - not stranded active forever - and then surface
+    # the failure to the operator rather than swallowing it (issue #37).
+    activities, sf = _activities_with_db()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[TicketToPrWorkflow],
+            activities=activities.all(),
+            activity_executor=executor,
+        ):
+            handle = await env.client.start_workflow(
+                TicketToPrWorkflow.run,
+                {"ticket": READY_TICKET, "trigger_type": "label"},
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.signal(
+                TicketToPrWorkflow.submit_decision,
+                args=["approve", "lead@example.com", []],
+            )
+            # A malformed PR payload: record_pr's validation raises and the
+            # activity is non-retryable on ValidationError.
+            await handle.signal(
+                TicketToPrWorkflow.pr_observed, {"not": "a valid pr state"}
+            )
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+
+    # The compensation made the run's lifecycle honest despite the crash.
+    with sf() as s:
+        run = s.query(FoundryRun).one()
+        assert run.status is RunStatus.EXECUTION_FAILED
 
 
 async def test_workflow_processes_multiple_pr_events_until_terminal(env) -> None:

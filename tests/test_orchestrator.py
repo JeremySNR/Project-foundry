@@ -1117,6 +1117,68 @@ def test_expire_pending_pr_on_open_pr_is_noop(session_factory) -> None:
     assert _status(session_factory, run_id) is RunStatus.PR_OPEN
 
 
+def test_fail_run_marks_dispatched_run_execution_failed(session_factory) -> None:
+    # The durable-workflow compensation (issue #37): an activity exhausted its
+    # retries mid-flight, so the run is auto-failed rather than left active
+    # forever at agent_running.
+    from foundry.db.models import AuditEventType
+
+    orch, run_id = _dispatched_run(session_factory)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+    status = orch.fail_run(run_id, reason="record_pr exhausted retries")
+    assert status is RunStatus.EXECUTION_FAILED
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    assert _outcome_value(session_factory, run_id) == "failed"
+    metas = _audit_meta(session_factory, run_id, AuditEventType.AGENT_FAILED)
+    failed = [m for m in metas if m.get("category") == "workflow_irrecoverable_error"]
+    assert len(failed) == 1
+    assert failed[0]["reason"] == "record_pr exhausted retries"
+
+
+def test_fail_run_works_from_any_active_state(session_factory) -> None:
+    # The crash can happen before dispatch too (e.g. the approve activity), so
+    # fail_run must terminate any still-active run, not only agent_running.
+    orch = _orch(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    assert orch.fail_run(run_id) is RunStatus.EXECUTION_FAILED
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    assert _outcome_value(session_factory, run_id) == "failed"
+
+
+def test_fail_run_is_idempotent_on_terminal_run(session_factory) -> None:
+    # Temporal delivers activities at-least-once: a retried compensation, or one
+    # that races a human stop / a delivered PR, must never overwrite a real
+    # terminal state (AGENTS.md invariant #7: sticky BLOCKED stays blocked).
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.reject(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.REJECTED
+
+    assert orch.fail_run(run_id) is RunStatus.REJECTED
+    assert _status(session_factory, run_id) is RunStatus.REJECTED
+    # The original outcome stands; no failure outcome overwrote it.
+    assert _outcome_value(session_factory, run_id) == "rejected"
+
+
+def test_fail_run_cancels_in_flight_job(session_factory) -> None:
+    # A run that crashed mid-flight may still have a job spending; compensation
+    # cancels it like a human stop / PR-window expiry would.
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    orch.dispatch_agent(run_id)  # job left in flight
+
+    orch.fail_run(run_id)
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    with session_factory() as s:
+        job = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+        assert job.status is AgentJobStatus.CANCELLED
+
+
 def test_expire_pending_pr_cancels_in_flight_job(session_factory) -> None:
     # A dispatched-but-undelivered run may still be spending; PR-window expiry
     # cancels the job like a human stop would.

@@ -111,6 +111,15 @@ ACTIVITY_OPTIONS: dict[str, ActivityOptions] = {
         maximum_attempts=3,
         non_retryable_error_types=DETERMINISTIC_ERRORS,
     ),
+    # Last-resort compensation: mark a run failed after another activity
+    # exhausted its retries (issue #37). A short terminal state write, idempotent
+    # under retry (a run already terminal is a no-op), so retry a transient DB
+    # hiccup a few times but fail fast on a deterministic error.
+    "fail_run": ActivityOptions(
+        start_to_close_timeout=timedelta(minutes=1),
+        maximum_attempts=3,
+        non_retryable_error_types=DETERMINISTIC_ERRORS,
+    ),
 }
 
 # Conservative fallback for an unmapped activity name: a short timeout and
