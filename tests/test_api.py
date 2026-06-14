@@ -207,6 +207,79 @@ def _start_ready_run(client) -> str:
     return run["id"]
 
 
+# -- epic auto-decomposition on the webhook intake path (issue #35) ------------
+
+_EPIC_DESC = (
+    "Roll favourites out across our surfaces.\n\n"
+    "Repositories:\n"
+    "- customer-web: add the favourites button\n"
+    "- mobile-app: add the favourites button\n\n"
+    "Acceptance Criteria:\n"
+    "- A favourites button exists\n"
+    "- Favourites persist across sessions\n"
+)
+
+
+def _epic_payload(issue_id="issue-epic", key="LIN-900") -> dict:
+    return {
+        "data": {
+            "id": issue_id,
+            "issueId": issue_id,
+            "identifier": key,
+            "title": "Add favourites everywhere",
+            "description": _EPIC_DESC,
+            "labels": [{"name": "foundry:candidate"}],
+            "actor": {"name": "po@example.com"},
+        }
+    }
+
+
+def test_webhook_does_not_decompose_epics_by_default() -> None:
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+    orch = FoundryOrchestrator(sf, provider=InMemoryFakeProvider())
+    client = TestClient(
+        create_app(
+            webhook_secret=SECRET,
+            session_factory=sf,
+            orchestrator=orch,
+            approvers=APPROVERS,
+            api_token=API_TOKEN,
+        )
+    )
+    resp = _post_webhook(client, _epic_payload(), delivery="d-epic-off")
+    run_id = resp.json()["run"]["id"]
+    assert orch.child_runs(run_id) == []
+    assert orch.list_epics() == []
+
+
+def test_webhook_fans_epic_into_child_runs_when_enabled() -> None:
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+    orch = FoundryOrchestrator(sf, provider=InMemoryFakeProvider())
+    client = TestClient(
+        create_app(
+            webhook_secret=SECRET,
+            session_factory=sf,
+            orchestrator=orch,
+            approvers=APPROVERS,
+            api_token=API_TOKEN,
+            auto_decompose_epics=True,
+        )
+    )
+    resp = _post_webhook(client, _epic_payload(), delivery="d-epic-on")
+    assert resp.status_code == 202
+    # The webhook reports the parent (epic-root) run...
+    parent_run_id = resp.json()["run"]["id"]
+    # ...and the epic fanned out into one independently-gated child run per repo.
+    children = orch.child_runs(parent_run_id)
+    assert len(children) == 2
+    assert all(c.parent_run_id == parent_run_id for c in children)
+    assert [r.id for r in orch.list_epics()] == [parent_run_id]
+
+
 # -- approval API auth ---------------------------------------------------------
 
 

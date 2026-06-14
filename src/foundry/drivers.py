@@ -48,14 +48,37 @@ class RunDriver(Protocol):
 
 
 class InlineDriver:
-    """Execute run steps synchronously via the orchestrator, in-process."""
+    """Execute run steps synchronously via the orchestrator, in-process.
 
-    def __init__(self, orchestrator: FoundryOrchestrator) -> None:
+    ``auto_decompose_epics`` (issue #35) routes intake through
+    :meth:`FoundryOrchestrator.intake_epic` so a ticket spanning several repos is
+    automatically split into one independently-gated child run per repo. It is
+    opt-in (default off) and behaviour-only: the deterministic producer is
+    conservative, but auto-fanning one ticket into several governed runs is a
+    change an operator turns on. With it off, ``start`` behaves exactly as
+    before (a single ``intake_and_plan`` run).
+    """
+
+    def __init__(
+        self,
+        orchestrator: FoundryOrchestrator,
+        *,
+        auto_decompose_epics: bool = False,
+    ) -> None:
         self._orch = orchestrator
+        self._auto_decompose_epics = auto_decompose_epics
 
     def start(
         self, ticket: RawTicket, *, trigger_type: str, created_by: str | None = None
     ) -> str:
+        if self._auto_decompose_epics:
+            # An epic fans out into independently-gated child runs; a ticket that
+            # does not decompose degrades to a single ordinary run. Either way
+            # the returned id is the run for the ticket itself (the epic root),
+            # so the caller's one-active-run-per-issue bookkeeping is unchanged.
+            return self._orch.intake_epic(
+                ticket, trigger_type=trigger_type, created_by=created_by
+            ).parent_run_id
         return self._orch.intake_and_plan(
             ticket, trigger_type=trigger_type, created_by=created_by
         )
