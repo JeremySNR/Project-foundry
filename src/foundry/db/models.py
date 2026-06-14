@@ -119,6 +119,13 @@ class FoundryRun(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     linear_issue_id: Mapped[str] = mapped_column(String(128), index=True)
     linear_issue_key: Mapped[str] = mapped_column(String(64), index=True)
+    # Epic decomposition (issue #35): a child run points at the parent run it
+    # was split out of. Nullable and self-referential; single-level only (a
+    # parent is itself a root - the orchestrator refuses to nest). Indexed so
+    # listing an epic's children is a cheap lookup.
+    parent_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("foundry_runs.id"), nullable=True, index=True
+    )
     status: Mapped[RunStatus] = mapped_column(
         Enum(RunStatus), default=RunStatus.ANALYSING
     )
@@ -153,6 +160,14 @@ class FoundryRun(Base):
     )
     agent_jobs: Mapped[list["FoundryAgentJob"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
+    )
+    # Self-referential epic linkage. ``children`` are the runs decomposed from
+    # this one; ``parent`` is the epic a child belongs to (None for a root).
+    children: Mapped[list["FoundryRun"]] = relationship(
+        "FoundryRun", back_populates="parent"
+    )
+    parent: Mapped["FoundryRun | None"] = relationship(
+        "FoundryRun", back_populates="children", remote_side=lambda: [FoundryRun.id]
     )
 
 

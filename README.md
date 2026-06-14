@@ -79,7 +79,7 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
 | `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, **Cursor** two ways, **Claude Code** via GitHub Actions, or *any* agent behind a signed webhook (see below). |
 | `foundry.connectors` | Adapters for the tools Foundry talks to. Trackers: **Linear**, **GitHub Issues**, **Jira**. SCMs: **GitHub** and **GitLab** (watch the PR/MR, pull failing check summaries). |
-| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, Slack interactivity approvals, approval commands, run status, the per-run decision timeline, compliance evidence packs (`GET /runs/{id}/evidence`, plus the org-wide date-range archive `GET /evidence`), and the dashboard. |
+| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, Slack interactivity approvals, approval commands, run status, the per-run decision timeline, the epic view for parent/child runs (`GET /runs/{id}/epic`), compliance evidence packs (`GET /runs/{id}/evidence`, plus the org-wide date-range archive `GET /evidence`), and the dashboard. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
 ### The Cursor handoff (the nice bit)

@@ -30,6 +30,7 @@ from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_analysis_comment, state_for
 from foundry.connectors.notify import ApprovalRequest, RunNotifier
+from foundry.epics import compute_epic_rollup
 from foundry.observability import traced
 from foundry.audit.events import (
     build_artifact,
@@ -192,7 +193,12 @@ class FoundryOrchestrator:
 
     @traced("foundry.intake_and_plan")
     def intake_and_plan(
-        self, ticket: RawTicket, *, trigger_type: str, created_by: str | None = None
+        self,
+        ticket: RawTicket,
+        *,
+        trigger_type: str,
+        created_by: str | None = None,
+        parent_run_id: str | None = None,
     ) -> str:
         """Run analysis -> context -> risk -> plan -> policy gate; persist all.
 
@@ -200,6 +206,11 @@ class FoundryOrchestrator:
         the fast path, and the ``uq_foundry_runs_one_active_per_issue`` partial
         unique index is the arbiter. An intake that loses the race returns the
         surviving run's id instead of creating a duplicate.
+
+        ``parent_run_id`` links the new run as a child of an existing epic run
+        (issue #35). The parent must exist and itself be a root - epics are a
+        single level in v1, so a child cannot be an epic. Each child is an
+        ordinary, independently-gated run; the parent only groups them.
         """
         # At most one *active* run per issue; finished/blocked runs may be
         # superseded by a fresh trigger (e.g. after the ticket is clarified).
@@ -208,6 +219,8 @@ class FoundryOrchestrator:
             raise OrchestratorError(
                 f"issue {ticket.issue_id} already has an active run ({active})"
             )
+        if parent_run_id is not None:
+            self._validate_epic_parent(parent_run_id)
         run_id = new_id("run")
         analysis = self._analyzer.analyse(ticket)
         context = self._enricher.enrich(ticket, analysis)
@@ -253,6 +266,7 @@ class FoundryOrchestrator:
                     current_step="intake",
                     risk_level=risk.overall_risk,
                     agent_mode=effective_mode,
+                    parent_run_id=parent_run_id,
                 )
                 session.add(run)
                 self._add(session, run_id, ArtifactType.TICKET_SNAPSHOT, ticket)
@@ -799,6 +813,55 @@ class FoundryOrchestrator:
     def list_runs(self) -> list[FoundryRun]:
         with self._sf() as session:
             return list(session.query(FoundryRun).order_by(FoundryRun.created_at).all())
+
+    # -- epics (parent/child runs) -------------------------------------------
+
+    def _validate_epic_parent(self, parent_run_id: str) -> None:
+        """Reject linking to a missing parent or nesting epics (issue #35).
+
+        Epics are a single level in v1: a parent must exist and must itself be
+        a root, so a child can never also be an epic. Raised before the
+        analysis pipeline runs so a bad linkage fails fast.
+        """
+        with self._sf() as session:
+            parent = session.get(FoundryRun, parent_run_id)
+            if parent is None:
+                raise OrchestratorError(
+                    f"parent run {parent_run_id} does not exist"
+                )
+            if parent.parent_run_id is not None:
+                raise OrchestratorError(
+                    f"run {parent_run_id} is itself a child; epics are a "
+                    "single level (no nesting)"
+                )
+
+    def child_runs(self, run_id: str) -> list[FoundryRun]:
+        """The child runs decomposed from ``run_id``, oldest first."""
+        with self._sf() as session:
+            return list(
+                session.query(FoundryRun)
+                .filter(FoundryRun.parent_run_id == run_id)
+                .order_by(FoundryRun.created_at)
+                .all()
+            )
+
+    def epic_root_id(self, run_id: str) -> str | None:
+        """Resolve the epic root for ``run_id``: its parent if it is a child,
+        else itself. ``None`` if the run does not exist.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            return None
+        return run.parent_run_id or run.id
+
+    def epic_rollup(self, run_id: str) -> dict:
+        """Rolled-up epic status + child summary for ``run_id``'s epic.
+
+        Resolves the epic root (so calling on a child returns the whole epic),
+        then summarises its children via :func:`epics.compute_epic_rollup`.
+        """
+        children = self.child_runs(run_id)
+        return compute_epic_rollup(c.status for c in children)
 
     # -- agent dispatch -------------------------------------------------------
 

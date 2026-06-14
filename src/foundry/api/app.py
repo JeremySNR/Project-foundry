@@ -47,6 +47,7 @@ from foundry.config import Settings
 from foundry.connectors.github import GitHubConnector
 from foundry.connectors.gitlab import GitLabConnector
 from foundry.drivers import InlineDriver, RunDriver
+from foundry.epics import compute_epic_rollup
 from foundry.connectors.linear import LinearConnector
 from foundry.connectors.transport import (
     github_transport,
@@ -97,6 +98,7 @@ def _run_to_dict(run: FoundryRun) -> dict[str, Any]:
         "linear_issue_id": run.linear_issue_id,
         "linear_issue_key": run.linear_issue_key,
         "status": run.status.value,
+        "parent_run_id": run.parent_run_id,
         "trigger_type": run.trigger_type,
         "current_step": run.current_step,
         "risk_level": run.risk_level.value if run.risk_level else None,
@@ -560,6 +562,28 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")
         return _run_to_dict(run)
+
+    @app.get("/runs/{run_id}/epic")
+    def run_epic(run_id: str, request: Request) -> dict[str, Any]:
+        """The epic view for a run (issue #35): its rolled-up status and the
+        child runs decomposed from it.
+
+        Resolves the epic root first, so calling this on a child returns the
+        whole epic, not an empty rollup. Token-gated like the timeline. A run
+        with no children rolls up to ``empty`` - i.e. it is simply not an epic.
+        """
+        _require_api_token(app, request)
+        orch: FoundryOrchestrator = app.state.orchestrator
+        root_id = orch.epic_root_id(run_id)
+        if root_id is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        root = orch.get_run(root_id)
+        children = orch.child_runs(root_id)
+        return {
+            "run": _run_to_dict(root),
+            "rollup": compute_epic_rollup(c.status for c in children),
+            "children": [_run_to_dict(c) for c in children],
+        }
 
     @app.get("/runs/{run_id}/timeline")
     def run_timeline(run_id: str, request: Request) -> dict[str, Any]:
