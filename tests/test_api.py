@@ -1109,6 +1109,61 @@ def test_evidence_archive_html_render(client) -> None:
     assert "Compliance evidence archive" in resp.text
 
 
+# -- epic (cross-run) evidence export ------------------------------------------
+
+
+def test_epic_evidence_requires_token(client) -> None:
+    parent, _ = _make_epic(client)
+    assert client.get(f"/runs/{parent}/epic/evidence").status_code == 401
+
+
+def test_epic_evidence_disabled_without_configured_token() -> None:
+    c = _make_client(api_token=None)
+    assert c.get("/runs/whatever/epic/evidence", headers=AUTH).status_code == 403
+
+
+def test_epic_evidence_unknown_run_404(client) -> None:
+    assert client.get("/runs/nope/epic/evidence", headers=AUTH).status_code == 404
+
+
+def test_epic_evidence_bad_format_422(client) -> None:
+    parent, _ = _make_epic(client)
+    resp = client.get(f"/runs/{parent}/epic/evidence?format=pdf", headers=AUTH)
+    assert resp.status_code == 422
+
+
+def test_epic_evidence_bundles_parent_and_children(client) -> None:
+    parent, child = _make_epic(client)
+    pack = client.get(f"/runs/{parent}/epic/evidence", headers=AUTH).json()
+
+    assert pack["epic"]["root_run_id"] == parent
+    assert pack["epic"]["child_run_ids"] == [child]
+    assert pack["run_count"] == 2  # parent + one child
+    assert pack["root"]["run"]["id"] == parent
+    assert [p["run"]["id"] for p in pack["children"]] == [child]
+    assert pack["children"][0]["run"]["parent_run_id"] == parent
+    # The rollup agrees with GET /runs/{id}/epic (one in-flight child).
+    assert pack["epic"]["rollup"]["total"] == 1
+    assert pack["epic"]["rollup"]["status"] == "in_progress"
+
+
+def test_epic_evidence_resolves_root_from_child(client) -> None:
+    parent, child = _make_epic(client)
+    # Asking for a child's epic evidence returns the whole epic, rooted at parent.
+    pack = client.get(f"/runs/{child}/epic/evidence", headers=AUTH).json()
+    assert pack["epic"]["root_run_id"] == parent
+    assert pack["epic"]["child_run_ids"] == [child]
+
+
+def test_epic_evidence_html_render(client) -> None:
+    parent, _ = _make_epic(client)
+    resp = client.get(f"/runs/{parent}/epic/evidence?format=html", headers=AUTH)
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert resp.text.startswith("<!doctype html>")
+    assert "Epic evidence pack" in resp.text
+
+
 # -- dashboard -----------------------------------------------------------------
 
 

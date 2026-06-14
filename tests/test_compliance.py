@@ -17,9 +17,11 @@ from foundry.audit import build_artifact, build_audit_event
 from foundry.compliance import (
     DEFAULT_CONTROL_MAPPINGS,
     ControlMapping,
+    build_epic_evidence_pack,
     build_evidence_archive,
     build_evidence_pack,
     render_archive_html,
+    render_epic_evidence_html,
     render_evidence_html,
     verify_integrity,
 )
@@ -465,6 +467,135 @@ def test_render_archive_html_marks_failed_integrity(session_factory) -> None:
     _seed_run_at(session_factory, "bad", created_at=now, tamper=True)
     archive = _archive(session_factory)
     html = render_archive_html(archive)
+    assert "INTEGRITY CHECK FAILED" in html
+
+
+# -- epic (cross-run) evidence export ------------------------------------------
+
+
+def _link_child(session_factory, child_id: str, parent_id: str) -> None:
+    with session_factory() as session:
+        child = session.get(FoundryRun, child_id)
+        child.parent_run_id = parent_id
+        session.commit()
+
+
+def _epic_pack(session_factory, root_id: str, **kwargs) -> dict:
+    with session_factory() as session:
+        root = session.get(FoundryRun, root_id)
+        children = (
+            session.query(FoundryRun)
+            .filter(FoundryRun.parent_run_id == root_id)
+            .order_by(FoundryRun.created_at, FoundryRun.id)
+            .all()
+        )
+        return build_epic_evidence_pack(session, root, children, **kwargs)
+
+
+def _seed_epic(session_factory) -> str:
+    """A root epic run with two children (one complete, one blocked)."""
+    now = datetime(2026, 6, 14, 12, 0, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "epic", created_at=now, status=RunStatus.COMPLETE)
+    _seed_run_at(
+        session_factory, "c1", created_at=now + timedelta(minutes=1),
+        status=RunStatus.COMPLETE,
+    )
+    _seed_run_at(
+        session_factory, "c2", created_at=now + timedelta(minutes=2),
+        status=RunStatus.BLOCKED, with_pr=False,
+    )
+    _link_child(session_factory, "c1", "epic")
+    _link_child(session_factory, "c2", "epic")
+    return "epic"
+
+
+def test_epic_pack_bundles_root_and_children(session_factory) -> None:
+    _seed_epic(session_factory)
+    pack = _epic_pack(
+        session_factory, "epic", control_mappings=DEFAULT_CONTROL_MAPPINGS
+    )
+
+    assert pack["epic"]["root_run_id"] == "epic"
+    assert pack["epic"]["child_run_ids"] == ["c1", "c2"]  # ordered by created_at
+    assert pack["run_count"] == 3  # root + two children
+    assert pack["root"]["run"]["id"] == "epic"
+    assert [p["run"]["id"] for p in pack["children"]] == ["c1", "c2"]
+
+
+def test_epic_pack_rollup_matches_children(session_factory) -> None:
+    _seed_epic(session_factory)
+    rollup = _epic_pack(session_factory, "epic")["epic"]["rollup"]
+    # One child complete, one blocked, none in flight => partial.
+    assert rollup["total"] == 2
+    assert rollup["status"] == "partial"
+    assert rollup["status_breakdown"] == {"complete": 1, "blocked": 1}
+
+
+def test_epic_pack_summary_aggregates_all_runs(session_factory) -> None:
+    _seed_epic(session_factory)
+    summary = _epic_pack(
+        session_factory, "epic", control_mappings=DEFAULT_CONTROL_MAPPINGS
+    )["summary"]
+    # Root + both children: two complete, one blocked.
+    assert summary["status_breakdown"] == {"complete": 2, "blocked": 1}
+    assert summary["verified"] is True
+    assert summary["runs_verified"] == 3
+    by_control = {c["control_id"]: c for c in summary["control_coverage"]}
+    assert by_control["Article 14"]["total_runs"] == 3
+
+
+def test_epic_pack_each_run_carries_parent_linkage(session_factory) -> None:
+    _seed_epic(session_factory)
+    pack = _epic_pack(session_factory, "epic")
+    assert pack["root"]["run"]["parent_run_id"] is None
+    assert all(p["run"]["parent_run_id"] == "epic" for p in pack["children"])
+
+
+def test_epic_pack_single_run_is_degenerate_empty_epic(session_factory) -> None:
+    # A run with no children exports as a one-run epic with an empty rollup.
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "solo", created_at=now)
+    pack = _epic_pack(session_factory, "solo")
+    assert pack["run_count"] == 1
+    assert pack["children"] == []
+    assert pack["epic"]["child_run_ids"] == []
+    assert pack["epic"]["rollup"]["status"] == "empty"
+
+
+def test_epic_pack_aggregate_integrity_flags_tampered_child(session_factory) -> None:
+    now = datetime(2026, 6, 14, 12, 0, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "epic", created_at=now)
+    _seed_run_at(
+        session_factory, "bad", created_at=now + timedelta(minutes=1), tamper=True
+    )
+    _link_child(session_factory, "bad", "epic")
+    summary = _epic_pack(session_factory, "epic")["summary"]
+    assert summary["verified"] is False
+    assert summary["runs_failed_integrity"] == ["bad"]
+    assert summary["runs_verified"] == 1
+
+
+def test_render_epic_html_is_standalone(session_factory) -> None:
+    _seed_epic(session_factory)
+    pack = _epic_pack(
+        session_factory, "epic", control_mappings=DEFAULT_CONTROL_MAPPINGS
+    )
+    html = render_epic_evidence_html(pack)
+    assert html.startswith("<!doctype html>")
+    assert "Epic evidence pack" in html
+    assert "INTEGRITY VERIFIED" in html
+    assert "partial" in html  # the rollup status
+    assert "ENG-epic" in html
+
+
+def test_render_epic_html_marks_failed_integrity(session_factory) -> None:
+    now = datetime(2026, 6, 14, 12, 0, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "epic", created_at=now)
+    _seed_run_at(
+        session_factory, "bad", created_at=now + timedelta(minutes=1), tamper=True
+    )
+    _link_child(session_factory, "bad", "epic")
+    html = render_epic_evidence_html(_epic_pack(session_factory, "epic"))
     assert "INTEGRITY CHECK FAILED" in html
 
 
