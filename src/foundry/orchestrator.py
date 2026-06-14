@@ -151,6 +151,7 @@ class FoundryOrchestrator:
         max_agent_retries: int = 2,
         retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
         max_cost_per_run: float | None = None,
+        estimated_cost_per_dispatch: float = 0.0,
     ) -> None:
         self._sf = session_factory
         self._analyzer = analyzer or HeuristicAnalyzer()
@@ -184,6 +185,7 @@ class FoundryOrchestrator:
         self._max_agent_retries = max_agent_retries
         self._retry_on = frozenset(retry_on)
         self._max_cost_per_run = max_cost_per_run
+        self._estimated_cost_per_dispatch = estimated_cost_per_dispatch
 
     # -- intake + planning ----------------------------------------------------
 
@@ -799,8 +801,22 @@ class FoundryOrchestrator:
             approval = self._load_raw(session, run_id, ArtifactType.APPROVAL_RECORD)
 
             granted = set(approval.get("granted_roles", [])) if approval else set()
+            # Enforce the budget cap at first dispatch too (issue #29): no job
+            # has spent yet, so the projected cost is just this dispatch's
+            # estimate - enough to refuse a run whose single attempt already
+            # exceeds the cap.
+            self._refresh_job_costs(session, run_id)
             payload = self._policy_input(
-                PolicyAction.START_AGENT, analysis, context, risk, approvals=granted
+                PolicyAction.START_AGENT,
+                analysis,
+                context,
+                risk,
+                approvals=granted,
+                budget=PolicyBudget(
+                    cost_usd=self._accumulated_cost(session, run_id),
+                    pending_cost_usd=self._estimated_cost_per_dispatch,
+                    max_cost_usd=self._max_cost_per_run,
+                ),
             )
             decision = self._policy.evaluate(payload)
             session.add(
@@ -1124,12 +1140,12 @@ class FoundryOrchestrator:
             attempt = prior_jobs  # attempt N = N-th re-dispatch
 
             # Refresh provider-reported spend before the budget check so the
-            # decision is made on the freshest numbers we can get.
+            # decision is made on the freshest numbers we can get. Jobs whose
+            # provider reports no cost fall back to the per-dispatch estimate
+            # (issue #29), and the upcoming retry counts as pending spend so the
+            # gate blocks *before* overspending, not after.
             self._refresh_job_costs(session, run_id)
-            run_cost = sum(
-                job.cost_usd or 0.0
-                for job in session.query(FoundryAgentJob).filter_by(run_id=run_id)
-            )
+            run_cost = self._accumulated_cost(session, run_id)
 
             payload = self._policy_input(
                 PolicyAction.RETRY_AGENT,
@@ -1141,7 +1157,9 @@ class FoundryOrchestrator:
                     attempt=attempt, max_attempts=self._max_agent_retries
                 ),
                 budget=PolicyBudget(
-                    cost_usd=run_cost, max_cost_usd=self._max_cost_per_run
+                    cost_usd=run_cost,
+                    pending_cost_usd=self._estimated_cost_per_dispatch,
+                    max_cost_usd=self._max_cost_per_run,
                 ),
             )
             decision = self._policy.evaluate(payload)
@@ -1296,6 +1314,40 @@ class FoundryOrchestrator:
                 continue
             if status.cost_usd is not None:
                 job.cost_usd = status.cost_usd
+
+    def _accumulated_cost(self, session, run_id: str) -> float:
+        """Spend recorded across a run's jobs so far.
+
+        Provider-reported ``cost_usd`` is authoritative; for any job whose
+        provider reported nothing (``claude_code`` / ``webhook`` / ``manual``)
+        the configured ``estimated_cost_per_dispatch`` stands in as a proxy so
+        the budget cap can still bind. With the estimate at 0 (the default) an
+        unreported job contributes nothing, preserving prior behaviour.
+        """
+        total = 0.0
+        for job in session.query(FoundryAgentJob).filter_by(run_id=run_id):
+            total += (
+                job.cost_usd
+                if job.cost_usd is not None
+                else self._estimated_cost_per_dispatch
+            )
+        return total
+
+    def budget_snapshot(self, run_id: str) -> dict[str, float | None]:
+        """Recorded spend vs the configured cap, for the timeline / dashboard.
+
+        Read-only: never calls the provider (no network), so it is safe on the
+        token-gated timeline endpoint. ``consumed_usd`` uses the same
+        estimate-fallback as the budget gate so the surfaced number matches the
+        figure the gate would compare against.
+        """
+        with self._sf() as session:
+            consumed = self._accumulated_cost(session, run_id)
+        return {
+            "consumed_usd": round(consumed, 4),
+            "cap_usd": self._max_cost_per_run,
+            "estimated_cost_per_dispatch": self._estimated_cost_per_dispatch,
+        }
 
     @staticmethod
     def _remediation_instructions(reason: str, pr_state: PullRequestState) -> str:

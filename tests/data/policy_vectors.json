@@ -427,7 +427,7 @@
       "expected": {
         "allow": false,
         "allowed_agent_mode": "human_only",
-        "reasons": ["run spend $5.50 has reached the budget cap of $5.00"],
+        "reasons": ["projected run spend $5.50 would reach the budget cap of $5.00"],
         "required_approvals": []
       }
     },
@@ -444,7 +444,7 @@
       "expected": {
         "allow": false,
         "allowed_agent_mode": "human_only",
-        "reasons": ["run spend $5.00 has reached the budget cap of $5.00"],
+        "reasons": ["projected run spend $5.00 would reach the budget cap of $5.00"],
         "required_approvals": []
       }
     },

@@ -82,11 +82,19 @@ class PolicyRetry(BaseModel):
 
 
 class PolicyBudget(BaseModel):
-    """Run spend so far vs the configured cap; only checked for ``retry_agent``."""
+    """Run spend vs the configured cap; checked for every spending action.
+
+    The gate evaluates *projected* spend - ``cost_usd`` (recorded so far) plus
+    ``pending_cost_usd`` (the estimated cost of the dispatch about to happen) -
+    so a run can be stopped before it blows the budget, not just after. With
+    ``pending_cost_usd`` at its default of 0 the check is the historical
+    "already-spent vs cap" comparison, so existing behaviour is unchanged.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     cost_usd: float = Field(default=0.0, ge=0)
+    pending_cost_usd: float = Field(default=0.0, ge=0)
     # None = no budget cap configured.
     max_cost_usd: float | None = Field(default=None, gt=0)
 
@@ -132,6 +140,13 @@ _AUTONOMOUS_ACTIONS = frozenset(
         PolicyAction.RETRY_AGENT,
         PolicyAction.MARK_COMPLETE,
     }
+)
+
+# Actions that launch a coding agent and therefore spend against the run
+# budget. The budget cap is enforced for these at *every* attempt, including
+# the first dispatch (issue #29) - not only on retries.
+_SPEND_ACTIONS = frozenset(
+    {PolicyAction.START_AGENT, PolicyAction.RETRY_AGENT}
 )
 
 # Read-only / advisory actions: always allowed, still recorded. This is an
@@ -258,14 +273,15 @@ class LocalPolicyEngine:
                 f"maximum of {payload.retry.max_attempts}"
             )
         if (
-            payload.action is PolicyAction.RETRY_AGENT
+            payload.action in _SPEND_ACTIONS
             and payload.budget.max_cost_usd is not None
-            and payload.budget.cost_usd >= payload.budget.max_cost_usd
         ):
-            reasons.append(
-                f"run spend ${payload.budget.cost_usd:.2f} has reached the "
-                f"budget cap of ${payload.budget.max_cost_usd:.2f}"
-            )
+            projected = payload.budget.cost_usd + payload.budget.pending_cost_usd
+            if projected >= payload.budget.max_cost_usd:
+                reasons.append(
+                    f"projected run spend ${projected:.2f} would reach the "
+                    f"budget cap of ${payload.budget.max_cost_usd:.2f}"
+                )
 
         # --- sensitive areas require explicit approval ---
         for role in required:

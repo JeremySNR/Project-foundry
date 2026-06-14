@@ -179,6 +179,13 @@ function when(iso) {
   return new Date(iso).toLocaleString();
 }
 
+function fmtBudget(b) {
+  if (!b) return "-";
+  const consumed = "$" + Number(b.consumed_usd || 0).toFixed(2);
+  if (b.cap_usd == null) return consumed + " (no cap)";
+  return consumed + " / $" + Number(b.cap_usd).toFixed(2) + " cap";
+}
+
 // Statuses that mean "waiting on a human" - the approval queue.
 const AWAITING = new Set(["waiting_approval", "review_required", "needs_clarification"]);
 let allRuns = [];
@@ -302,6 +309,7 @@ async function loadTimeline(runId) {
         <b>run</b> ${esc(r.id)} &middot; <b>risk</b> ${esc(r.risk_level || "unclassified")}
         &middot; <b>mode</b> ${esc(r.agent_mode || "-")}
         &middot; <b>approved by</b> ${esc(r.approved_by || "-")}
+        &middot; <b>spend</b> ${fmtBudget(data.budget)}
       </div>
     </div>
     <h2>Policy decisions</h2>${decisions}

@@ -68,10 +68,18 @@ remediation:
   retry_on: ["ci_failed", "changes_requested"]
 
 budget:
-  # Deny further agent retries once a run's provider-reported spend reaches
-  # this many USD. Omit (or null) for no cap. Only providers that expose
-  # usage (e.g. Cursor Cloud) report spend.
+  # Deny agent dispatch once a run's spend reaches this many USD. Enforced at
+  # first dispatch and on every retry (the gate compares *projected* spend:
+  # recorded cost so far plus the next dispatch's estimate). Omit (or null) for
+  # no cap.
   max_cost_per_run: 25.0
+  # Fallback per-dispatch cost (USD) for providers that don't report spend.
+  # Only some providers expose usage (e.g. Cursor Cloud reports cost_usd); with
+  # claude_code / webhook / manual the cap can never bind on reported cost
+  # alone. Set this so each dispatched attempt counts as a proxy and the cap
+  # still trips. Provider-reported cost always wins where available.
+  # 0 (the default) = no estimate; the cap then needs reported cost to bind.
+  estimated_cost_per_dispatch: 0.0
 
 agent:
   # Which coding agent receives approved work:

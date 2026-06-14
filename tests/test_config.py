@@ -206,11 +206,13 @@ def test_remediation_and_budget_yaml(tmp_path) -> None:
         "  retry_on: [ci_failed]\n"
         "budget:\n"
         "  max_cost_per_run: 10.5\n"
+        "  estimated_cost_per_dispatch: 2.5\n"
     )
     settings = Settings.load(str(config), env={})
     assert settings.max_agent_retries == 1
     assert settings.retry_on == ("ci_failed",)
     assert settings.max_cost_per_run == 10.5
+    assert settings.estimated_cost_per_dispatch == 2.5
 
 
 def test_invalid_remediation_and_budget_rejected(tmp_path) -> None:
@@ -218,6 +220,7 @@ def test_invalid_remediation_and_budget_rejected(tmp_path) -> None:
 
     cases = [
         "budget:\n  max_cost_per_run: 0\n",
+        "budget:\n  estimated_cost_per_dispatch: -1\n",
         "remediation:\n  retry_on: [nonsense]\n",
         "remediation:\n  max_agent_retries: -1\n",
     ]
