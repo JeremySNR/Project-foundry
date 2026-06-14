@@ -29,6 +29,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -320,6 +321,40 @@ class FoundryRunOutcome(Base):
     )
 
     run: Mapped[FoundryRun] = relationship()
+
+
+class FoundryWebhookDelivery(Base):
+    """Durable, bounded webhook idempotency / replay guard.
+
+    One row per processed inbound delivery. The unique ``(provider,
+    delivery_id)`` constraint makes dedup *atomic* (concurrent workers race to
+    INSERT; the loser gets an IntegrityError and treats the delivery as a
+    duplicate) and *durable* (survives a restart) - unlike the old in-process
+    ``set``, which was per-process, lost on restart, and grew without bound.
+
+    Rows older than the configured TTL are pruned opportunistically so the
+    table stays small; the TTL is required to be >= the replay-age window so a
+    delivery can never age out of this table while still being fresh enough to
+    replay.
+
+    Not tied to a run: a duplicate may arrive before the run row exists (or for
+    a delivery that never starts a run at all), so this is a standalone table.
+    """
+
+    __tablename__ = "foundry_webhook_deliveries"
+    __table_args__ = (
+        UniqueConstraint("provider", "delivery_id", name="uq_webhook_delivery"),
+        Index("idx_webhook_delivery_received", "received_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # "linear" / "github" / ... - the same delivery id from two providers is
+    # not a collision, so the uniqueness is per (provider, delivery_id).
+    provider: Mapped[str] = mapped_column(String(32))
+    delivery_id: Mapped[str] = mapped_column(String(255))
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
 
 
 class FoundryRepoCatalogEntry(Base):

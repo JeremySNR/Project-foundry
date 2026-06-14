@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .base import Base, create_all, make_engine, make_session_factory
+from .base import Base, create_all, init_schema, make_engine, make_session_factory
 from .models import (
     ArtifactType,
     AuditEventType,
@@ -18,6 +18,7 @@ __all__ = [
     "make_engine",
     "make_session_factory",
     "create_all",
+    "init_schema",
     "FoundryRun",
     "FoundryArtifact",
     "FoundryAuditEvent",

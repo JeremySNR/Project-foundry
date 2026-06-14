@@ -79,7 +79,7 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
 | `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, **Cursor** two ways, **Claude Code** via GitHub Actions, or *any* agent behind a signed webhook (see below). |
 | `foundry.connectors` | Adapters for the tools Foundry talks to. Trackers: **Linear**, **GitHub Issues**, **Jira**. SCMs: **GitHub** and **GitLab** (watch the PR/MR, pull failing check summaries). |
-| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, approval commands, run status, the per-run decision timeline, compliance evidence packs (`GET /runs/{id}/evidence`), and the dashboard. |
+| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, Slack interactivity approvals, approval commands, run status, the per-run decision timeline, compliance evidence packs (`GET /runs/{id}/evidence`), and the dashboard. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
 ### The Cursor handoff (the nice bit)
@@ -105,15 +105,19 @@ The tracker and the SCM are seams too, not assumptions:
 - **Jira** (`tracker.provider: jira`) - same trigger/command semantics over Jira Cloud webhooks (`/webhooks/jira`). Jira keys (`ACME-42`) already match the correlation pattern. `set_state` fires the matching workflow transition when one exists and otherwise leaves your workflow alone.
 - **GitLab** - point a project webhook at `/webhooks/gitlab` (merge request + pipeline events, `X-Gitlab-Token` auth) and merge requests close the loop exactly like GitHub PRs, including CI-failure remediation. Set `FOUNDRY_GITLAB_API_TOKEN` so MR diffs are fetched and the same file-based gates (forbidden paths, oversize, sensitive areas) apply; without it GitLab MRs are diff-blind, just as GitHub PRs are without `FOUNDRY_GITHUB_API_TOKEN`.
 
-The webhook payload shapes are pinned by recorded fixtures in `tests/fixtures/` - if a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
+Approvals don't have to happen in the tracker, either:
+
+- **Slack** - approvers who live in chat can approve/reject/stop from an interactive message. Point Slack interactivity at `/webhooks/slack` and set `FOUNDRY_SLACK_SIGNING_SECRET`; each button click is verified against Slack's v0 request signature (with replay-age protection) and then driven through the *same* policy gate, role checks, and audit writes as every other surface. The actor is the Slack-signed `user.id`, so key approvers by Slack user id (as GitHub Issues keys them by login). Fail-closed: no signing secret, no endpoint. (Posting the interactive message and pushing run-status notifications back into Slack is the next slice — see issue #32.)
+
+The webhook payload shapes are pinned by fixtures in `tests/fixtures/` - spec-derived from the providers' webhook docs today, and meant to be replaced by redacted live captures over time. If a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
 
 ### The feedback loop
 
-A PR that opens and then fails CI used to be where automation stalled. Now: a failing check suite or a changes-requested review re-dispatches the agent onto the *same branch* with the failure context (failing check names and summaries pulled from GitHub). Every retry passes the policy gate as `retry_agent` - approvals are re-checked, attempts are counted against `remediation.max_agent_retries`, and optional spend is checked against `budget.max_cost_per_run`. Past the cap, the run parks at *review required* with a comment saying a human is needed. Forbidden-path blocks are never retried - blocked stays blocked.
+A PR that opens and then fails CI used to be where automation stalled. Now: a failing check suite or a changes-requested review re-dispatches the agent onto the *same branch* with the failure context (failing check names and summaries pulled from GitHub). Every retry passes the policy gate as `retry_agent` - approvals are re-checked, attempts are counted against `remediation.max_agent_retries`, and projected spend is checked against `budget.max_cost_per_run`. The cap binds at first dispatch too, not just on retries; providers that don't report `cost_usd` count `budget.estimated_cost_per_dispatch` per attempt as a proxy. Past the cap, the run parks at *review required* with a comment saying a human is needed. Forbidden-path blocks are never retried - blocked stays blocked.
 
 ### The dashboard
 
-`GET /dashboard` serves a zero-build, read-only page over the audit data: every run with status badges, and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`).
+`GET /dashboard` serves a zero-build, read-only page over the audit data: a **live fleet strip** at the top (runs in flight, the approval-queue depth, agents running, PRs open, and spend committed by runs still in flight - the "what is every agent doing right now" view, backed by `GET /metrics/fleet`), every run with status badges (filterable down to an **approval queue** - just what is waiting on a human right now), a delivery-metrics strip, a **delivery-trend table** (PRs shipped vs blocked, by week), and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`). `GET /metrics/fleet` is a snapshot of the runs' *current* state (no time window), distinct from the historical delivery metrics below, which aggregate finished runs over a window.
 
 ### Compliance evidence packs
 
@@ -124,7 +128,7 @@ A PR that opens and then fails CI used to be where automation stalled. Now: a fa
 A run used to end at "PR merged" and the data died there. Now every finished run is distilled into an outcome row - time to merge, retries consumed, escalations, spend, and a block-reason taxonomy - derived entirely from the audit trail (so `foundry-memory backfill` rebuilds it for runs that finished before the table existed). That history feeds back in two ways:
 
 - **Routing priors.** With the catalog enricher, "14 of 16 of this team's feature tickets merged in billing-service" becomes a routing signal with an audit-friendly reason string. It is bounded on every side: a minimum sample size before history speaks at all, a smoothed (never triumphalist) success rate that must clear 50%, and a confidence cap of 89 so an explicit repo association on the ticket (90) always wins. `memory.priors_enabled: false` switches it off.
-- **ROI evidence.** `GET /metrics/delivery?days=90` (token-gated) answers the question a buyer actually asks - PRs shipped, blocked and why, median/p90 time to merge, retries, escalations, total agent spend - plus observed routing precision by confidence band, which is the data you need before moving `policy.repo_confidence_threshold` off its default. The dashboard shows the same numbers in a strip above the run list, and `foundry-memory show-priors` prints the mined history.
+- **ROI evidence.** `GET /metrics/delivery?days=90` (token-gated) answers the question a buyer actually asks - PRs shipped, blocked and why, median/p90 time to merge, retries, escalations, total agent spend - plus observed routing precision by confidence band, which is the data you need before moving `policy.repo_confidence_threshold` off its default. The dashboard shows the same numbers in a strip above the run list, and `foundry-memory show-priors` prints the mined history. `GET /metrics/delivery/trends?days=90&bucket=week` (or `bucket=day`) returns the same throughput/blocks/spend bucketed over time - the "is delivery trending up or down?" view - which the dashboard renders as a trend table.
 - **Agent scorecards.** `GET /metrics/agents?days=90` (token-gated) turns the same outcome rows into *which agent* to trust: per provider, broken down by work type and repo, the smoothed merge rate, retries consumed, and spend. GitHub will never tell you Cursor outperforms Copilot on your billing service; Foundry can, with receipts, and it compounds with every run. `foundry-memory show-scorecards` prints it and the dashboard carries it alongside the metrics strip. This is reporting only - acting on it (`agent.provider: auto` learned dispatch) is a deliberately separate, policy-gated change.
 
 Blocks are never auto-judged: a blocked run whose issue later merges in a fresh run is reported as *superseded*, which is the honest proxy for "the gate held and a human fixed the input".
@@ -149,7 +153,7 @@ risk:
 policy:
   repo_confidence_threshold: 70   # block work we can't confidently place in a repo
   max_files_changed: 12           # bigger PRs go to a human
-  forbidden_globs: ["infra/**", "migrations/**", "**/.env*", "**/secrets/**"]
+  forbidden_globs: ["infra/**", "**/infra/**", "migrations/**", "**/migrations/**", "**/.env*", "**/secrets/**"]
   sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
     auth: ["**/auth/**", "**/login/**", "**/sso/**"]
     payments: ["**/billing/**", "**/stripe/**"]
@@ -157,7 +161,8 @@ remediation:
   max_agent_retries: 2            # CI-failure/review retries before a human takes over
   retry_on: ["ci_failed", "changes_requested"]
 budget:
-  max_cost_per_run: 25.0          # deny retries once provider-reported spend hits this
+  max_cost_per_run: 25.0          # deny dispatch (first + retries) once projected spend hits this
+  estimated_cost_per_dispatch: 0.0 # proxy cost for providers that don't report spend (0 = off)
 agent:
   provider: cursor_via_linear     # or cursor_cloud / claude_code / webhook / manual
 tracker:
@@ -186,6 +191,8 @@ Secrets via env:
 | `FOUNDRY_JIRA_BASE_URL` / `..._EMAIL` / `..._API_TOKEN` | Jira Cloud credentials when the tracker is `jira`. |
 | `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
 | `FOUNDRY_GITLAB_API_TOKEN` / `..._BASE` | Fetches MR diffs so GitLab MRs run the same file-based gates as GitHub PRs (without it, MRs are diff-blind). `..._BASE` overrides the API root for self-managed GitLab. |
+| `FOUNDRY_SLACK_SIGNING_SECRET` | Enables `/webhooks/slack` (Slack v0 request-signing + replay-age; endpoint disabled without it). |
+| `FOUNDRY_SLACK_BOT_TOKEN` / `FOUNDRY_SLACK_CHANNEL` | Enables outbound Slack: posts the interactive approval message + status updates (parked/blocked/PR open/merged). Fail-closed — both (token + channel, the latter also settable via `notifications.slack_channel`) required, else no notifier. |
 | `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API, the compliance evidence-pack endpoint and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
@@ -199,7 +206,7 @@ The same code runs on a laptop (SQLite, heuristics, no keys) and in production (
 
 ## Running it
 
-The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quickstart.md)** - zero to governed PR in ~30 minutes with `docker compose up` (API + Postgres, optional Temporal profile, dashboard included).
+The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quickstart.md)** - zero to governed PR in ~30 minutes with `docker compose up` (API + Postgres, optional Temporal profile, dashboard included). A bare `docker compose up` boots on a fresh clone with no copy step (it mounts the committed `foundry.example.yaml`); the API container applies Alembic migrations on startup, so Postgres gets its schema — and its `alembic_version` stamp — without a manual step.
 
 Tagged releases (`vX.Y.Z`) publish a container image to GHCR (`ghcr.io/jeremysnr/project-foundry`) automatically, gated on the full test suite.
 
@@ -245,7 +252,7 @@ Optional extras, install what you need:
 - `.[llm]` GPT-5.5 analyzer
 - `.[http]` live Linear and GitHub transports
 - `.[workflow]` Temporal durable execution
-- `.[postgres]` Postgres driver + Alembic migrations (`alembic upgrade head`)
+- `.[postgres]` Postgres driver + Alembic migrations. On Postgres, Alembic is the **single** schema owner: run `alembic upgrade head` (the Docker image does this automatically on startup; `make migrate` does it by hand). SQLite dev/test databases have no migration step and are bootstrapped in-process.
 - `.[otel]` OpenTelemetry tracing (without it, the spans are free no-ops)
 
 There is also a live end-to-end smoke test (`scripts/smoke_e2e.py`) that drives a real Linear issue through approval, agent dispatch and PR observation. It is gated on `FOUNDRY_E2E=1` plus real credentials and never runs in CI.
@@ -260,8 +267,10 @@ These are enforced, tested, and not negotiable by a prompt:
 - If we can't confidently say which repo this belongs in, we stop and ask.
 - Production deploys and database migrations cannot run autonomously. Full stop, for now. `auto_merge` and `production_deploy` are modelled as policy actions that are **denied unconditionally** - "never" is an enforced, audited decision, not an absence of code.
 - The policy gate is **default-deny**: an action it doesn't recognise is refused.
-- Auth, payments, PII and customer data need a human approval before an agent goes near them - and the approval has to come from someone whose *configured role* covers it. Roles live in committed YAML; an API caller cannot claim "security" for themselves.
+- Auth, payments, PII and customer data need a human approval before an agent goes near them - and the approval has to come from someone whose *configured role* covers it. Roles live in committed YAML; an API caller cannot claim "security" for themselves. A sign-off from someone whose role doesn't cover the work is **refused up front** - never recorded and then quietly blocked at dispatch, so the audit trail never shows an approval for work that was actually denied.
 - Approval surfaces are authenticated, full stop. Linear comments arrive over a signed webhook with the actor identity from Linear; the REST endpoint needs a bearer token and is disabled outright when none is configured.
+- A captured webhook can't be replayed into action. Every delivery is deduped against a durable, bounded table (`(provider, delivery_id)`, shared across workers, pruned on a TTL), so a redelivered approval or CI-failure event is dropped instead of re-driving state. Set `webhook.replay_max_age_seconds` to additionally reject deliveries older than a window for providers that carry a timestamp (Linear).
+- The network surfaces are rate limited. Signatures stop *unauthorised* callers; a coarse per-client cap (on by default, configurable under `rate_limit:`) stops a flood of authorised-looking ones - a replayed webhook in a loop, a runaway integration, a token brute-force - from exhausting the process. Webhooks and the API get independent budgets so a burst on one can't starve the other.
 - Risk is checked twice: once from the ticket (before dispatch) and again from the **diff** (after the PR opens). A ticket that said "fix the button" whose PR touches `auth/` escalates to human review - and the guardrails re-run on *every push*, so an agent can't open a clean PR and sneak files in later. With `risk.provider: llm`, a model pass writes its cited reasoning into the audit trail ("touches session issuance in `auth/tokens.py`") - and it may only *escalate* over the deterministic keyword/glob floor, never downgrade it.
 - Bigger-than-expected PRs and anything touching forbidden paths get bounced to a human.
 - The agent may retry its own failing PR, but every retry is a fresh policy decision: approvals re-checked, attempts capped, budget capped, all audited. Past the cap, a human takes over. A forbidden-path block is never retried.
@@ -315,8 +324,8 @@ src/foundry/
   audit/           content hashing + the verifiable trail
   api/             the FastAPI app, webhook security, payload mapping, dashboard
 tests/             one module per package, plus the gated Temporal/Postgres/E2E tests
-tests/fixtures/    recorded webhook payloads pinning every payload mapping
-migrations/        Alembic migrations (Postgres prod; SQLite dev uses create_all)
+tests/fixtures/    spec-derived webhook payloads pinning every payload mapping
+migrations/        Alembic migrations — the sole schema owner on Postgres; SQLite dev uses init_schema/create_all
 examples/          reference Claude Code runner workflow
 scripts/           demo.py (offline narrated demo) + the live E2E smoke test
 docs/              quickstart

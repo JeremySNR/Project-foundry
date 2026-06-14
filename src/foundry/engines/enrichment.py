@@ -31,6 +31,12 @@ _LINKED_REPO_CONFIDENCE = 85
 # Stale-cap: catalog-derived confidence is held below the 70 dispatch threshold.
 _STALE_CONFIDENCE_CAP = 65
 
+# Lexical (keyword/catalog token) scoring is capped one below the explicit
+# ticket-association tier (90) so a coincidental pile of keyword hits can never
+# outrank — or tie — an explicit repo association. Mirrors the priors cap and the
+# documented tiering ("explicit association always wins").
+_LEXICAL_CONFIDENCE_CAP = 89
+
 _STOPWORDS = frozenset(
     "the and for with that this from are was should would when then than "
     "can our your has have not but all any out new use using add fix bug "
@@ -122,7 +128,7 @@ class StaticContextEnricher:
                 # (below the 70% dispatch threshold) so one coincidental keyword
                 # cannot trigger autonomous work. Two independent hits are needed
                 # to cross the threshold.
-                confidence = min(50 + 10 * len(hits), 95)
+                confidence = min(50 + 10 * len(hits), _LEXICAL_CONFIDENCE_CAP)
                 _consider(
                     candidates,
                     repo,
@@ -400,7 +406,7 @@ class CatalogContextEnricher:
             if not matched_terms:
                 continue
 
-            confidence = min(50 + 10 * len(matched_terms), 95)
+            confidence = min(50 + 10 * len(matched_terms), _LEXICAL_CONFIDENCE_CAP)
 
             # Step 4: freshness capping
             entry = entry_map[repo]

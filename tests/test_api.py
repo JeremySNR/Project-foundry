@@ -298,6 +298,70 @@ def test_roles_in_body_are_ignored(client) -> None:
     assert resp.json()["run"]["approved_by"] == "pm@example.com"
 
 
+def _ready_infra_payload(issue_id="issue-infra", key="LIN-INF") -> dict:
+    """Ready work that requires an ENGINEERING approval (infrastructure)."""
+    return {
+        "data": {
+            "id": issue_id,
+            "issueId": issue_id,
+            "identifier": key,
+            "title": "Update the terraform deployment config",
+            "description": (
+                "Acceptance Criteria:\n"
+                "- terraform plan runs clean\n"
+                "- the deployment config applies\n"
+            ),
+            "labels": [{"name": "foundry:candidate"}, {"name": "repo:customer-web"}],
+            "actor": {"name": "po@example.com"},
+        }
+    }
+
+
+def test_approve_without_required_role_is_forbidden_and_records_nothing() -> None:
+    """Issue #18: a configured approver who lacks a role the run requires is
+    refused with 403, and no approval is recorded (the run stays waiting)."""
+    c = _make_client(approvers={"pm@example.com": []})
+    body = json.dumps(_ready_infra_payload()).encode("utf-8")
+    sig = "sha256=" + compute_signature(SECRET, body)
+    run_id = c.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": "d-infra", "Linear-Signature": sig},
+    ).json()["run"]["id"]
+
+    resp = c.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "pm@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 403
+    assert "approval refused" in resp.json()["detail"]
+    # Nothing was recorded: the run is still awaiting approval.
+    run = c.get(f"/runs/{run_id}", headers=AUTH).json()
+    assert run["status"] == "waiting_approval"
+    assert run["approved_by"] is None
+
+
+def test_approve_with_required_role_dispatches_infra_work(client) -> None:
+    """The same infra work, approved by an engineering-capable approver, records
+    the approval and dispatches (medium risk -> draft PR)."""
+    body = json.dumps(_ready_infra_payload()).encode("utf-8")
+    sig = "sha256=" + compute_signature(SECRET, body)
+    run_id = client.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": "d-infra2", "Linear-Signature": sig},
+    ).json()["run"]["id"]
+
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["run"]["status"] == "agent_running"
+
+
 def test_reject_terminates_run(client) -> None:
     run_id = _start_ready_run(client)
     resp = client.post(
@@ -658,6 +722,30 @@ def test_build_orchestrator_code_uses_code_enricher() -> None:
     assert isinstance(orch._enricher, CodeContextEnricher)
 
 
+def test_build_orchestrator_slack_notifier_fail_closed() -> None:
+    """Outbound Slack is wired only when BOTH the bot token and channel are set."""
+    from dataclasses import replace
+
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.connectors.slack import SlackNotifier
+    from foundry.db import create_all, make_engine, make_session_factory
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+    base = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"})
+
+    # Neither / only one => no notifier.
+    assert build_orchestrator(base, sf)._notifier is None
+    assert build_orchestrator(replace(base, slack_bot_token="xoxb-1"), sf)._notifier is None
+    assert build_orchestrator(replace(base, slack_channel="C1"), sf)._notifier is None
+
+    # Both => a SlackNotifier is wired.
+    both = replace(base, slack_bot_token="xoxb-1", slack_channel="C1")
+    assert isinstance(build_orchestrator(both, sf)._notifier, SlackNotifier)
+
+
 def test_build_orchestrator_static_carries_yaml_keywords() -> None:
     """Keywords from context.repo_keywords are wired into StaticContextEnricher."""
     from foundry.api.app import build_orchestrator
@@ -816,6 +904,11 @@ def test_timeline_exposes_full_decision_record(client) -> None:
 
     assert timeline["agent_jobs"], "the dispatched agent job must be visible"
     assert timeline["agent_jobs"][0]["provider"] == "fake"
+
+    # Spend vs cap is surfaced so an approver sees budget before approving.
+    assert {"consumed_usd", "cap_usd", "estimated_cost_per_dispatch"} == set(
+        timeline["budget"]
+    )
 
 
 # -- compliance evidence pack --------------------------------------------------

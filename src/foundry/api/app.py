@@ -6,6 +6,11 @@ Surfaces:
   ``FoundryOrchestrator.intake_and_plan``, plus the *primary* approval surface:
   ``/foundry approve|reject|stop`` comments arrive here already authenticated
   by the webhook signature, with the actor taken from the Linear payload.
+- ``POST /webhooks/slack`` - the chat approval surface: a Slack interactivity
+  request (approve/reject/stop button) verified against Slack's v0 request
+  signature with replay-age protection, then driven through the same policy-gated
+  decision path. Fail-closed (no ``FOUNDRY_SLACK_SIGNING_SECRET`` => disabled);
+  the actor is the Slack-signed ``user.id`` and roles come from config.
 - ``POST /runs/{run_id}/approval`` - the API approval surface. Requires a
   bearer token (``FOUNDRY_API_TOKEN``); disabled entirely when no token is
   configured, because an unauthenticated approval endpoint would let anyone
@@ -22,11 +27,12 @@ from __future__ import annotations
 
 import hmac
 import json
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func
 
 from foundry.compliance import (
@@ -45,7 +51,7 @@ from foundry.connectors.transport import (
     gitlab_transport,
     linear_transport,
 )
-from foundry.db.base import create_all, make_engine, make_session_factory
+from foundry.db.base import init_schema, make_engine, make_session_factory
 from foundry.db.models import (
     FoundryAgentJob,
     FoundryArtifact,
@@ -55,13 +61,21 @@ from foundry.db.models import (
 )
 from foundry.engines import build_openai_analyzer
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
-from foundry.policy import LocalPolicyEngine
+from foundry.policy import LocalPolicyEngine, OpaPolicyEngine, PolicyEngine
 from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
 from .dashboard import DASHBOARD_HTML
+from .dedup import WebhookDeduplicator, webhook_timestamp_fresh
 from .mapping import linear_payload_to_ticket
-from .security import is_authorised_approver, parse_command, verify_signature
+from .ratelimit import RateLimiter
+from .slack import parse_slack_interaction
+from .security import (
+    is_authorised_approver,
+    parse_command,
+    verify_signature,
+    verify_slack_signature,
+)
 
 # Trigger conditions: a run starts only on an explicit opt-in, never for every
 # new issue (that would create noise).
@@ -94,6 +108,20 @@ def _run_to_dict(run: FoundryRun) -> dict[str, Any]:
 
 def _extract_event_id(payload: dict[str, Any], delivery_header: str | None) -> str | None:
     return delivery_header or payload.get("deliveryId") or payload.get("id")
+
+
+def _rate_limit_bucket(path: str) -> str | None:
+    """Which rate-limit bucket (if any) a request path falls into.
+
+    ``webhook`` covers every inbound provider delivery; ``api`` covers the run
+    reads, metrics and the approval POST. ``/healthz`` (load-balancer polling),
+    ``/dashboard`` (static HTML) and the docs are deliberately unthrottled.
+    """
+    if path.startswith("/webhooks/"):
+        return "webhook"
+    if path == "/runs" or path.startswith("/runs/") or path.startswith("/metrics"):
+        return "api"
+    return None
 
 
 def _is_trigger(payload: dict[str, Any], *, label: str, status: str) -> bool:
@@ -135,14 +163,21 @@ def create_app(
     jira_webhook_secret: str | None = None,
     gitlab_webhook_secret: str | None = None,
     gitlab_connector: GitLabConnector | None = None,
+    slack_signing_secret: str | None = None,
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
     control_mappings: tuple[ControlMapping, ...] | None = None,
+    webhook_dedup_ttl_seconds: int | None = 86_400,
+    webhook_replay_max_age_seconds: int | None = None,
+    clock: Callable[[], datetime] | None = None,
+    rate_limit_enabled: bool = True,
+    rate_limit_webhook_per_minute: int = 120,
+    rate_limit_api_per_minute: int = 60,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
-        create_all(engine)
+        init_schema(engine)
         session_factory = make_session_factory(engine)
 
     app = FastAPI(title="Project Foundry", version="1.1.0")
@@ -164,9 +199,10 @@ def create_app(
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
     app.state.github_connector = github_connector or GitHubConnector()
-    # Jira/GitLab endpoints are fail-closed: no secret => endpoint disabled.
+    # Jira/GitLab/Slack endpoints are fail-closed: no secret => endpoint disabled.
     app.state.jira_webhook_secret = jira_webhook_secret
     app.state.gitlab_webhook_secret = gitlab_webhook_secret
+    app.state.slack_signing_secret = slack_signing_secret
     # Without a transport the connector is diff-blind (file gates skipped),
     # mirroring GitHubConnector with no transport.
     app.state.gitlab_connector = gitlab_connector or GitLabConnector()
@@ -176,8 +212,53 @@ def create_app(
     app.state.control_mappings = (
         DEFAULT_CONTROL_MAPPINGS if control_mappings is None else tuple(control_mappings)
     )
-    # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
-    app.state.processed_events = set()
+    # Replay defences. Dedup is durable (DB-backed, atomic across workers,
+    # TTL-pruned) - it replaces the old per-process set that was lost on
+    # restart and unbounded. Replay-age validation is opt-in: only providers
+    # that actually carry a timestamp (Linear's webhookTimestamp) can use it.
+    app.state.clock = clock or (lambda: datetime.now(timezone.utc))
+    app.state.deduplicator = WebhookDeduplicator(
+        session_factory,
+        ttl_seconds=webhook_dedup_ttl_seconds,
+        clock=app.state.clock,
+    )
+    app.state.webhook_replay_max_age_seconds = webhook_replay_max_age_seconds
+
+    # Per-client request caps on the network surfaces. Two buckets so a flood on
+    # one surface cannot starve the other. Per-process (like the dedup set);
+    # see api/ratelimit.py for the scope caveats. Disabled => no limiters wired.
+    if rate_limit_enabled:
+        app.state.rate_limiters = {
+            "webhook": RateLimiter(limit=rate_limit_webhook_per_minute),
+            "api": RateLimiter(limit=rate_limit_api_per_minute),
+        }
+    else:
+        app.state.rate_limiters = {}
+
+    @app.middleware("http")
+    async def _rate_limit(request: Request, call_next):
+        bucket = _rate_limit_bucket(request.url.path)
+        limiter = app.state.rate_limiters.get(bucket) if bucket else None
+        if limiter is None:
+            return await call_next(request)
+        client = request.client.host if request.client else "unknown"
+        result = limiter.check(f"{bucket}:{client}")
+        if not result.allowed:
+            # 429 before the handler runs: no signature check, no DB hit, no
+            # workflow side effect for a throttled request.
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "rate limit exceeded; retry later"},
+                headers={
+                    "Retry-After": str(result.retry_after),
+                    "X-RateLimit-Limit": str(result.limit),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(result.limit)
+        response.headers["X-RateLimit-Remaining"] = str(result.remaining)
+        return response
 
     def _submit_decision(run_id: str, *, command: str, user: str) -> None:
         """Drive an approve/reject/stop decision with config-derived roles."""
@@ -221,11 +302,27 @@ def create_app(
 
         payload = await request.json()
         orch: FoundryOrchestrator = app.state.orchestrator
-        event_id = _extract_event_id(payload, delivery_id)
 
+        # Replay-age guard (opt-in): a captured, validly-signed delivery still
+        # fails once it is older than the window. Linear sends webhookTimestamp
+        # (epoch ms); fail-closed when the check is on but no timestamp is sent.
+        max_age = app.state.webhook_replay_max_age_seconds
+        if max_age is not None and not webhook_timestamp_fresh(
+            payload.get("webhookTimestamp"),
+            now=app.state.clock(),
+            max_age_seconds=max_age,
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="stale or missing webhook timestamp (possible replay)",
+            )
+
+        event_id = _extract_event_id(payload, delivery_id)
         ticket = app.state.ticket_mapper(payload)
 
-        if event_id and event_id in app.state.processed_events:
+        # Durable dedup: marks the delivery processed and tells us if it was
+        # already seen (across workers and restarts), then we branch on intent.
+        if app.state.deduplicator.seen("linear", event_id):
             return {"status": "duplicate", "run": _existing_run(orch, ticket.issue_id)}
 
         # Approval commands arrive as Linear comments. The webhook signature
@@ -235,8 +332,6 @@ def create_app(
         body_text = data.get("body") or payload.get("body") or ""
         command = parse_command(body_text)
         if command and command.command in {"approve", "reject", "stop"}:
-            if event_id:
-                app.state.processed_events.add(event_id)
             return _handle_linear_decision(
                 app, orch, ticket.issue_id, command.command, payload
             )
@@ -244,8 +339,6 @@ def create_app(
         if not _is_trigger(
             payload, label=app.state.trigger_label, status=app.state.trigger_status
         ):
-            if event_id:
-                app.state.processed_events.add(event_id)
             return {"status": "ignored", "reason": "no trigger condition matched"}
 
         if not ticket.issue_id:
@@ -256,8 +349,6 @@ def create_app(
         # ticket can be re-analysed with a fresh trigger.
         active_id = orch.find_active_run_id_for_issue(ticket.issue_id)
         if active_id is not None:
-            if event_id:
-                app.state.processed_events.add(event_id)
             return {"status": "exists", "run": _run_to_dict(orch.get_run(active_id))}
 
         run_id = app.state.driver.start(
@@ -265,8 +356,6 @@ def create_app(
             trigger_type=_trigger_type(payload, status=app.state.trigger_status),
             created_by=(data.get("actor") or {}).get("name"),
         )
-        if event_id:
-            app.state.processed_events.add(event_id)
         return {"status": "started", "run": _run_to_dict(orch.get_run(run_id))}
 
     @app.post("/webhooks/github", status_code=202)
@@ -285,15 +374,18 @@ def create_app(
 
         payload = await request.json()
 
+        # Durable dedup spans every GitHub delivery, not just intake: a
+        # replayed pull_request / check_run event re-drives real state
+        # (re-dispatch, status flips), so dedup before any of those paths.
+        # GitHub carries no timestamp, only the X-GitHub-Delivery UUID, so this
+        # delivery-id dedup *is* GitHub's replay protection.
+        if app.state.deduplicator.seen("github", delivery_id):
+            return {"status": "duplicate"}
+
         # GitHub Issues as the tracker: the issue is the ticket, the label is
         # the trigger, and /foundry commands work in issue comments.
         if event in {"issues", "issue_comment"}:
-            if delivery_id and delivery_id in app.state.processed_events:
-                return {"status": "duplicate"}
-            result = _handle_github_issue_event(app, event, payload)
-            if delivery_id:
-                app.state.processed_events.add(delivery_id)
-            return result
+            return _handle_github_issue_event(app, event, payload)
 
         # Best-effort: keep catalog staleness detection live between sweeps.
         _nudge_catalog_pushed_at(app, payload)
@@ -370,6 +462,60 @@ def create_app(
         payload = await request.json()
         return _handle_jira_event(app, payload)
 
+    @app.post("/webhooks/slack", status_code=200)
+    async def slack_webhook(
+        request: Request,
+        signature: str | None = Header(default=None, alias="X-Slack-Signature"),
+        timestamp: str | None = Header(
+            default=None, alias="X-Slack-Request-Timestamp"
+        ),
+    ) -> dict[str, Any]:
+        """Slack interactivity (approve/reject/stop buttons).
+
+        The approval surface for chat: a Slack button click is verified against
+        Slack's v0 request signature (HMAC over ``v0:{timestamp}:{body}``) with
+        replay-age protection, then driven through the same policy-gated decision
+        path as every other surface. Fail-closed: no signing secret => disabled.
+
+        The acting identity is the Slack ``user.id`` Slack signs into the payload,
+        so it cannot be forged without the signing secret. Configure approvers by
+        Slack user id (as GitHub Issues approvers are keyed by login). Roles come
+        from config, never the payload.
+        """
+        if not app.state.slack_signing_secret:
+            raise HTTPException(
+                status_code=403,
+                detail="slack webhook disabled: configure FOUNDRY_SLACK_SIGNING_SECRET",
+            )
+        raw = await request.body()
+        if not verify_slack_signature(
+            app.state.slack_signing_secret, raw, timestamp, signature
+        ):
+            raise HTTPException(status_code=401, detail="invalid slack signature")
+
+        # Slack delivers interactivity as a urlencoded body with a single JSON
+        # ``payload`` field. Signature is over the raw body above; parse it here
+        # directly (no multipart dependency) now that it is authenticated.
+        fields = urllib.parse.parse_qs(raw.decode("utf-8"))
+        raw_payload = (fields.get("payload") or [None])[0]
+        if not raw_payload:
+            return {"status": "ignored", "reason": "no interaction payload"}
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError):
+            return {"status": "ignored", "reason": "unparseable interaction payload"}
+
+        interaction = parse_slack_interaction(payload)
+        if interaction is None:
+            return {"status": "ignored", "reason": "no actionable foundry decision"}
+        return _apply_decision(
+            app,
+            app.state.orchestrator,
+            interaction.issue_id,
+            interaction.command,
+            interaction.user,
+        )
+
     @app.get("/runs")
     def list_runs(skip: int = 0, limit: int = 100) -> dict[str, Any]:
         orch: FoundryOrchestrator = app.state.orchestrator
@@ -440,6 +586,7 @@ def create_app(
             )
             return {
                 "run": _run_to_dict(run),
+                "budget": orch.budget_snapshot(run_id),
                 "artifacts": [
                     {
                         "id": a.id,
@@ -538,6 +685,31 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **delivery_metrics(session, since=since)}
 
+    @app.get("/metrics/delivery/trends")
+    def metrics_delivery_trends(
+        request: Request, days: int = 90, bucket: str = "week"
+    ) -> dict[str, Any]:
+        """Delivery outcomes bucketed over time (PRs shipped, blocks, spend per
+        period) - the trend the single-window ``/metrics/delivery`` can't show.
+        Token-gated and fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS, delivery_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **delivery_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/agents")
     def metrics_agents(request: Request, days: int = 90) -> dict[str, Any]:
         """Per-provider agent scorecards: merge rate, retries and spend, broken
@@ -553,6 +725,22 @@ def create_app(
         since = datetime.now(timezone.utc) - timedelta(days=days)
         with app.state.session_factory() as session:
             return {"days": days, **agent_scorecards(session, since=since)}
+
+    @app.get("/metrics/fleet")
+    def metrics_fleet(request: Request) -> dict[str, Any]:
+        """Live fleet snapshot: every run's *current* state across the org -
+        runs in flight, the human-approval queue depth, agents running, PRs
+        open, and spend committed by runs not yet finished. The "what are the
+        agents doing right now" view the historical ``/metrics/delivery``
+        endpoints (finished runs only) can't give; there is no time window
+        because it is a snapshot of now. Token-gated and fail-closed like the
+        other metrics endpoints.
+        """
+        from foundry.memory.metrics import fleet_status
+
+        _require_api_token(app, request)
+        with app.state.session_factory() as session:
+            return fleet_status(session)
 
     @app.post("/runs/{run_id}/approval")
     def approval(
@@ -588,9 +776,10 @@ def create_app(
             _submit_decision(run_id, command=command.command, user=user)
         except OrchestratorError as exc:
             msg = str(exc)
-            # Policy gate blocked dispatch (security/risk rejection) → 403.
-            # Wrong state for the operation (e.g. already approved) → 409.
-            if "policy gate blocked" in msg:
+            # Authorisation refusals (policy block at dispatch, or the approver
+            # lacking a role this run requires) → 403. Wrong state for the
+            # operation (e.g. already approved) → 409.
+            if "policy gate blocked" in msg or "approval refused" in msg:
                 raise HTTPException(status_code=403, detail=msg) from exc
             raise HTTPException(status_code=409, detail=msg) from exc
 
@@ -896,6 +1085,24 @@ def build_provider(settings: Settings, tracker=None):
     raise ValueError(f"unknown agent.provider: {name!r}")
 
 
+def build_policy_engine(settings: Settings) -> PolicyEngine:
+    """Select the policy backend from config.
+
+    ``local`` (default) is the in-process Python engine; ``opa`` delegates to an
+    OPA server running the foundry.rego bundle. Both enforce the same rules - the
+    configured confidence threshold is passed to whichever backend is chosen, so
+    the threshold can never diverge between them.
+    """
+    if settings.policy_provider == "opa":
+        return OpaPolicyEngine(
+            base_url=settings.policy_opa_url,
+            repo_confidence_threshold=settings.repo_confidence_threshold,
+        )
+    return LocalPolicyEngine(
+        repo_confidence_threshold=settings.repo_confidence_threshold
+    )
+
+
 def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrator:
     """Assemble an orchestrator from settings: analyzer, policy thresholds, Linear."""
     from foundry.engines.enrichment import CatalogContextEnricher, StaticContextEnricher
@@ -949,6 +1156,19 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
     else:
         raise ValueError(f"unknown tracker.provider: {settings.tracker_provider!r}")
 
+    # Outbound Slack notifications are fail-closed: wired only when BOTH the bot
+    # token and a channel are configured, mirroring the no-token-=>-no-connector
+    # posture of the tracker. Either missing => the orchestrator simply has no
+    # notifier and runs as before.
+    notifier = None
+    if settings.slack_bot_token and settings.slack_channel:
+        from foundry.connectors.slack import SlackNotifier
+        from foundry.connectors.transport import slack_transport
+
+        notifier = SlackNotifier(
+            transport=slack_transport(settings.slack_bot_token, settings.slack_channel)
+        )
+
     repo_keywords = {repo: list(kws) for repo, kws in settings.context_repo_keywords}
     if settings.context_provider in ("catalog", "code"):
         priors = None
@@ -982,22 +1202,22 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         diff_risk_classifier=diff_risk_classifier,
         enricher=enricher,
         issue_tracker=tracker,
+        notifier=notifier,
         provider=build_provider(settings, tracker),
-        policy_engine=LocalPolicyEngine(
-            repo_confidence_threshold=settings.repo_confidence_threshold
-        ),
+        policy_engine=build_policy_engine(settings),
         max_files_changed=settings.max_files_changed,
         forbidden_globs=settings.forbidden_globs,
         sensitive_path_globs=settings.sensitive_globs_map,
         max_agent_retries=settings.max_agent_retries,
         retry_on=settings.retry_on,
         max_cost_per_run=settings.max_cost_per_run,
+        estimated_cost_per_dispatch=settings.estimated_cost_per_dispatch,
     )
 
 
 def app_from_settings(settings: Settings) -> FastAPI:
     engine = make_engine(settings.database_url)
-    create_all(engine)
+    init_schema(engine)
     session_factory = make_session_factory(engine)
     github_connector = (
         GitHubConnector(transport=github_transport(settings.github_api_token))
@@ -1024,9 +1244,15 @@ def app_from_settings(settings: Settings) -> FastAPI:
         jira_webhook_secret=settings.jira_webhook_secret,
         gitlab_webhook_secret=settings.gitlab_webhook_secret,
         gitlab_connector=gitlab_connector,
+        slack_signing_secret=settings.slack_signing_secret,
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
         control_mappings=settings.compliance_control_mappings,
+        webhook_dedup_ttl_seconds=settings.webhook_dedup_ttl_seconds,
+        webhook_replay_max_age_seconds=settings.webhook_replay_max_age_seconds,
+        rate_limit_enabled=settings.rate_limit_enabled,
+        rate_limit_webhook_per_minute=settings.rate_limit_webhook_per_minute,
+        rate_limit_api_per_minute=settings.rate_limit_api_per_minute,
     )
 
 
