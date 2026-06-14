@@ -16,7 +16,7 @@ from foundry.db.models import (
 )
 from foundry.memory import outcomes as outcomes_module
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
-from foundry.schemas.common import CIStatus, PRStatus, RunStatus
+from foundry.schemas.common import ApprovalRole, CIStatus, PRStatus, RunStatus
 from foundry.schemas.pr import PullRequestState
 from foundry.schemas.ticket import RawTicket
 
@@ -190,6 +190,17 @@ def test_agent_failure_records_failed_outcome(session_factory) -> None:
     row = _outcome(session_factory, run_id)
     assert row.outcome == "failed"
     assert row.repo == "customer-web"
+    # The agent that ran is captured for per-provider scorecards.
+    assert row.provider == "fake"
+
+
+def test_undispatched_run_records_null_provider(session_factory) -> None:
+    orch = FoundryOrchestrator(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.reject(run_id, user="lead@example.com")
+    row = _outcome(session_factory, run_id)
+    assert row.outcome == "rejected"
+    assert row.provider is None  # no agent ever ran
 
 
 def test_latest_job_repo_is_deterministic_with_null_started_at(session_factory) -> None:
@@ -239,6 +250,7 @@ def test_latest_job_repo_is_deterministic_with_null_started_at(session_factory) 
         s.commit()
         outcome = outcomes_module.derive_outcome(s, run)
         assert outcome.repo == "late-repo"
+        assert outcome.provider == "fake"
 
 
 def test_vague_ticket_records_needs_clarification_with_null_repo(session_factory) -> None:
@@ -266,7 +278,12 @@ def test_dispatch_policy_block_records_policy_denied(session_factory) -> None:
         ),
         trigger_type="label",
     )
-    orch.approve(run_id, user="lead@example.com")
+    # Approve *with* the engineering role the auth area requires (so the approval
+    # is recorded, not refused up front) - the point here is the dispatch-time
+    # HUMAN_ONLY block, which holds regardless of who approved.
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.ENGINEERING}
+    )
     with pytest.raises(OrchestratorError):
         orch.dispatch_agent(run_id)
     row = _outcome(session_factory, run_id)

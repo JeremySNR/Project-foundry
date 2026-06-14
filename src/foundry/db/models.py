@@ -281,6 +281,9 @@ class FoundryRunOutcome(Base):
     outcome: Mapped[str] = mapped_column(String(32), index=True)
     # Where the work landed (latest agent job). NULL = never routed/dispatched.
     repo: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Which agent shipped it (latest agent job's provider). NULL = never
+    # dispatched. Feeds per-provider scorecards (which agent, by work type/repo).
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Best-candidate confidence at routing time, from the context_bundle
     # artifact - the raw material for precision-by-confidence-band calibration.
     routed_confidence: Mapped[int | None] = mapped_column(Integer, nullable=True)

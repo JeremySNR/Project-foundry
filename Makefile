@@ -20,7 +20,9 @@ up:  ## API + Postgres via docker compose
 down:
 	docker compose down
 
-migrate:  ## apply Alembic migrations to FOUNDRY_DATABASE_URL
+migrate:  ## apply Alembic migrations to FOUNDRY_DATABASE_URL (the API container does this automatically on startup)
+	# Against the docker compose stack from the host, point at the published port:
+	#   FOUNDRY_DATABASE_URL=postgresql+psycopg2://foundry:foundry@localhost:5432/foundry make migrate
 	alembic upgrade head
 
 image:

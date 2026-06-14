@@ -1,0 +1,91 @@
+{
+  "channel": "C01APPROVALS",
+  "text": "Run awaiting approval: Add customer favourites (LIN-123)",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": "Foundry: approval needed"
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Add customer favourites*"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Issue:*\nLIN-123"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Work type:*\n`feature`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Risk:*\n`medium`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Mode:*\n`draft_pr`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Repo:*\n`customer-web`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Required approval:*\nengineering"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Acceptance criteria*\n- A favourites button exists\n- Favourites persist across sessions"
+      }
+    },
+    {
+      "type": "actions",
+      "block_id": "foundry_decision",
+      "elements": [
+        {
+          "type": "button",
+          "action_id": "foundry_approve",
+          "text": {
+            "type": "plain_text",
+            "text": "Approve"
+          },
+          "value": "issue-r",
+          "style": "primary"
+        },
+        {
+          "type": "button",
+          "action_id": "foundry_reject",
+          "text": {
+            "type": "plain_text",
+            "text": "Reject"
+          },
+          "value": "issue-r",
+          "style": "danger"
+        },
+        {
+          "type": "button",
+          "action_id": "foundry_stop",
+          "text": {
+            "type": "plain_text",
+            "text": "Stop"
+          },
+          "value": "issue-r"
+        }
+      ]
+    }
+  ]
+}

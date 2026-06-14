@@ -46,9 +46,9 @@ Know what is smart and what is deliberately dumb before you "improve" anything:
 | Ticket readiness / AC extraction | Regex + structure heuristics (default) **or** OpenAI structured output (`analyzer.provider: openai`). LLM failures degrade to the heuristic analyzer, recorded in the analysis `assumptions` — an OpenAI outage never fails intake. | `engines/analyzer.py`, `engines/openai_analyzer.py` |
 | Work-type classification | Keyword-hit counting | `engines/analyzer.py` |
 | Risk classification | Hardcoded keyword lists on ticket text + `fnmatch` globs on PR diff paths (default) **or** an LLM pass with cited evidence (`risk.provider: llm`). The heuristics are a hard floor: the LLM may only escalate (add areas, raise the level), never downgrade — enforced in the classifier before the policy gate, so the policy engine/Rego are untouched. Evidence lands in the `RiskAssessment` artifact and `risk.escalated` event metadata. LLM failures degrade to the floor, recorded in the artifact. | `engines/risk.py`, `engines/llm_risk.py` |
-| Repo routing | Tiered: explicit ticket association (conf 90) > delivery-memory priors (capped 89) > catalog IDF-token scoring (stale-capped 65) > legacy YAML keywords. Lexical, not semantic. With `context.provider: code`, the synced file tree becomes a scored field and the bundle carries `RepoCodeFacts` (test layout, CODEOWNERS, manifests) + candidate files + inferred test commands; reasons cite concrete paths. Same confidence tiers/caps — code evidence never adds a tier. | `engines/enrichment.py`, `engines/code_context.py`, `catalog/`, `memory/priors.py` |
+| Repo routing | Tiered: explicit ticket association (conf 90) > delivery-memory priors (capped 89) > catalog IDF-token / keyword scoring (lexical-capped 89, stale-capped 65) > legacy YAML keywords. Lexical, not semantic. With `context.provider: code`, the synced file tree becomes a scored field and the bundle carries `RepoCodeFacts` (test layout, CODEOWNERS, manifests) + candidate files + inferred test commands; reasons cite concrete paths. Same confidence tiers/caps — code evidence never adds a tier. | `engines/enrichment.py`, `engines/code_context.py`, `catalog/`, `memory/priors.py` |
 | Planning | Template rendering — steps are "Satisfy acceptance criterion: X". No file-level analysis. | `engines/planner.py` |
-| Delivery memory | Outcomes derived purely from the audit trail; Beta-smoothed routing priors (min 3 samples, >50% success); ROI metrics API | `memory/` |
+| Delivery memory | Outcomes derived purely from the audit trail; Beta-smoothed routing priors (min 3 samples, >50% success); per-provider agent scorecards (which agent ships, by work type/repo — reporting only, auto-dispatch is a future gated change); ROI metrics API | `memory/` |
 
 The deterministic heuristics are the no-key/offline reference implementations and
 the test baseline; they are intentionally conservative, not unfinished LLM calls.
@@ -59,22 +59,26 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | --- | --- |
 | `schemas/` | Pydantic contracts for every artifact a run produces (`extra="forbid"` — changes here are API changes; update consumers in the same PR) |
 | `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam + `llm_risk.py` escalate-only LLM risk classifiers |
-| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, forbidden globs, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally) |
-| `policy/foundry.rego` | OPA mirror of the Python engine — **must change in lock-step**, tests on both sides |
-| `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows |
+| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally). The budget cap binds on **every** spending action (first `start_agent` + each `retry_agent`), comparing *projected* spend — recorded cost plus the next dispatch's `estimated_cost_per_dispatch` proxy for providers that don't report `cost_usd`. **Forbidden-path blocking is *not* here** — it lives in `orchestrator._forbidden_violations()` (diff-aware, sticky `BLOCKED`) and has no Rego mirror, so invariant #2 doesn't apply to it |
+| `policy/foundry.rego` | OPA backend, selectable via `policy.provider: opa` (`OpaPolicyEngine`); the Python `LocalPolicyEngine` is the default. **Must change in lock-step** (machine-verified over shared vectors — see invariant #2). The confidence threshold is read from input, not hardcoded, so both backends honour the configured value |
+| `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows. `approve()` pre-validates the approver's roles against the run's required approvals (derived from risk) and refuses *before* recording, so a void approval can't land on the trail and be blocked only at dispatch |
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |
-| `workflows/` | Temporal version (durable waits for approval/PR). Exists, signal-driven, **not yet battle-tested against a real server** |
+| `workflows/` | Temporal version (durable waits for approval/PR). Signal-driven; the sequencing decisions are pure functions in `decisions.py` (offline-tested) and the workflow is a thin shell. Wait timeouts terminate cleanly (approval window → `BLOCKED`, PR window → `EXECUTION_FAILED`, both audited via `expire_pending_approval` / `expire_pending_pr`); unknown decision verbs are dropped in the signal handler (never a silent stop); `intake_and_plan` is idempotent under activity retries; PR observation loops on every push until the run leaves a PR-observable state. **Still not battle-tested against a real server** (the E2E `test_temporal_workflow.py` runs only where the time-skipping test-server binary is fetchable — CI, not offline sandboxes) |
 | `agents/` | Provider abstraction: `manual`, fake, `cursor_cloud`, `cursor_via_linear`, `claude_code` (GitHub Actions `workflow_dispatch`), `webhook` (HMAC-signed). All go through one `create_job` path with a secret-leak scan, and expose `cancel_job` — a human `stop`/`reject` best-effort cancels the in-flight job (Cursor cancel API; no-op for `manual`/`webhook`/`claude_code`) so a stopped run stops spending, recorded as an `AGENT_CANCELLED` audit event |
-| `connectors/` | Trackers: Linear, GitHub Issues, Jira. SCMs: GitHub, GitLab. Both fetch the changed-file list via an injected transport (`github_transport` / `gitlab_transport`, GitLab paging `/diffs`) so file-based gates see the full diff; **no token ⇒ diff-blind, gates skipped**. `transport.py` is the HTTP seam (fakes in tests) |
+| `connectors/` | Trackers: Linear, GitHub Issues, Jira. SCMs: GitHub, GitLab. Both fetch the changed-file list via an injected transport (`github_transport` / `gitlab_transport`, GitLab paging `/diffs`) so file-based gates see the full diff; **no token ⇒ diff-blind, gates skipped**. Chat notifications: `RunNotifier` seam (`connectors/notify.py`) with a `SlackNotifier` (`connectors/slack.py`, `slack_transport` → `chat.postMessage`) that posts the interactive approval message (buttons whose `action_id`/`value` the inbound `api/slack.py` parser consumes — the wire contract `SLACK_ACTION_PREFIX`/`SLACK_DECISIONS` lives in `connectors/slack.py`, re-exported by `api/slack.py`) and status updates (parked/blocked/PR open/merged). Best-effort like the tracker write-back; **fail-closed: wired only when both `FOUNDRY_SLACK_BOT_TOKEN` and a channel are set**. `transport.py` is the HTTP seam (fakes in tests) |
 | `catalog/` | `foundry-catalog sync` — GitHub org metadata sweep feeding the catalog enricher (stateful, budget-aware, resumable). `--code-facts` (implied by `context.provider: code`) adds per-repo code facts: file tree via the Git Trees API, CODEOWNERS, root manifests; derivation logic is pure functions in `catalog/code_facts.py` |
-| `memory/` | Run outcomes, routing priors, delivery metrics; `foundry-memory backfill / show-priors` |
-| `api/` | FastAPI: signed webhooks (Linear/GitHub/Jira/GitLab), REST approvals, run timeline, `GET /metrics/delivery`, and a zero-build HTML dashboard at `/dashboard`. Everything token-gated, **fail-closed** (no `FOUNDRY_API_TOKEN` = endpoints disabled). Replayed/redelivered webhooks are dropped by a **durable, bounded dedup** table (`api/dedup.py`, keyed on `(provider, delivery_id)`, TTL-pruned — not the old per-process set); an optional fail-closed replay-age check rejects deliveries older than `webhook.replay_max_age_seconds` for providers that carry a timestamp (Linear's `webhookTimestamp`) |
+| `memory/` | Run outcomes, routing priors, agent scorecards, delivery metrics; `foundry-memory backfill / show-priors / show-scorecards` |
+| `api/` | FastAPI: signed webhooks (Linear/GitHub/Jira/GitLab), Slack interactivity approvals (`POST /webhooks/slack` — `api/slack.py`; Slack v0 request-signing + replay-age in `api/security.py`; approve/reject/stop buttons drive the same `_apply_decision` path; actor = Slack-signed `user.id`, approvers keyed by Slack user id; fail-closed on `FOUNDRY_SLACK_SIGNING_SECRET`), REST approvals, run timeline, `GET /metrics/delivery`, `GET /metrics/delivery/trends` (the same aggregates bucketed by `day`/`week` over time), `GET /metrics/agents` (per-provider scorecards), `GET /metrics/fleet` (a live, no-window snapshot of every run's *current* state — runs in flight, approval-queue depth, agents running, PRs open, spend committed by in-flight runs — read from `FoundryRun`, distinct from the finished-run-only delivery aggregates; in `memory/metrics.py`), and a zero-build HTML dashboard at `/dashboard` (a live fleet strip, run board with an approval-queue filter, the metrics strip, the delivery-trend table, and the per-run timeline). Everything token-gated, **fail-closed** (no `FOUNDRY_API_TOKEN` = endpoints disabled). Replayed/redelivered webhooks are dropped by a **durable, bounded dedup** table (`api/dedup.py`, keyed on `(provider, delivery_id)`, TTL-pruned); an optional fail-closed replay-age check rejects deliveries older than `webhook.replay_max_age_seconds` for providers that carry a timestamp (Linear's `webhookTimestamp`). Coarse per-client rate limiting (`api/ratelimit.py`) fronts the webhook and API surfaces via an ASGI middleware — fixed-window, two independent buckets (`webhook`/`api`), on by default, configurable under `rate_limit:`; **per-process** (in-memory), keyed by the direct peer address |
 | `db/models.py` | SQLAlchemy: runs, artifacts, audit events, policy decisions, agent jobs, repo catalog, run outcomes, webhook deliveries (dedup). **Single-tenant** — no org/tenant columns |
 | `audit/` | SHA-256 content hashing for artifacts and events |
 | `config.py` | Layering: built-in defaults → YAML (`FOUNDRY_CONFIG`) → env vars. Behaviour in YAML (committed), secrets in env (never committed). Example: `foundry.example.yaml` |
 
-Other locations: `tests/fixtures/` (recorded webhook payloads pinning every payload
-mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
+Other locations: `tests/fixtures/` (webhook payloads — spec-derived from the
+providers' webhook docs, replaceable by redacted live captures — pinning every
+payload mapping), `migrations/` (Alembic — the **single** schema owner on Postgres, run by the
+Docker entrypoint on startup; SQLite dev/test is bootstrapped in-process by
+`db.base.init_schema`, which create_alls only on SQLite so it never strands a
+later `alembic upgrade head`),
 `examples/claude-code-runner.yml` (reference agent workflow), `scripts/demo.py`
 (offline narrated end-to-end demo — the fastest way to see the whole loop).
 
@@ -83,7 +87,11 @@ mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
 1. **Never weaken a gate.** PRs that loosen a policy rule, approval requirement,
    or audit write don't merge. Change rules explicitly, with tests, or not at all.
 2. **Python policy engine and `foundry.rego` change together**, with tests in
-   `tests/test_policy_engine.py` and `foundry_test.rego`.
+   `tests/test_policy_engine.py` and `foundry_test.rego`. Lock-step is
+   machine-verified: shared vectors in `tests/data/policy_vectors.json` run
+   through `LocalPolicyEngine` (`tests/test_policy_parity.py`) **and** through
+   `opa eval` (`scripts/policy_parity.py`, in the OPA CI job) against the same
+   expected decisions — add a vector when you add a rule, on both sides.
 3. **No network in core tests.** `pytest` must pass offline with zero API keys.
    New external calls need a transport seam + a fake.
 4. **The policy gate is default-deny**; an unrecognised action is refused.
@@ -102,7 +110,7 @@ mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
 ## Dev commands
 
 ```bash
-pip install -e ".[test]" && pytest          # full offline suite (~320 tests)
+pip install -e ".[test]" && pytest          # full offline suite (~500 tests)
 ruff check src tests                        # lint
 opa test src/foundry/policy -v              # Rego tests (needs opa CLI)
 python scripts/demo.py                      # offline end-to-end demo
@@ -125,6 +133,10 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   precise); `risk.provider: llm` adds judgment + cited evidence, escalate-only.
 - Single-tenant DB; approvers are static config (no SSO/SCIM); no rate limiting.
 - Temporal driver unproven against a live server; inline driver is production path.
+  The known workflow holes (wait-timeout handling, decision-verb validation,
+  intake idempotency, single-shot PR observation) are fixed and CI-tested under
+  the time-skipping environment, but durability against a real Temporal server
+  is still the open work in #37.
 - One run targets one repo; no cross-repo or epic decomposition.
 - No Slack/Teams surface; approvals are tracker comments or the REST endpoint.
 
