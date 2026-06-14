@@ -29,20 +29,31 @@ Copy the example config and edit it:
 cp foundry.example.yaml foundry.yaml
 ```
 
-The three sections that matter first:
+The three sections that matter first (keys must be nested exactly as below -
+`config.py` ignores anything it doesn't recognise, so a misplaced block is
+silently dropped):
 
 ```yaml
-approvers:
-  - email: you@company.com
-    roles: [engineering, security, product]
-
-repos:
-  - name: your-org/your-repo
-    description: The repo Foundry should map tickets onto
+approval:
+  approvers:
+    - email: you@company.com
+      roles: [engineering, security, product]
 
 agent:
   provider: cursor_via_linear   # or cursor_cloud / claude_code / webhook / manual
+
+context:
+  provider: static              # keyword routing, no DB required (the default)
+  # Map each candidate repo to the words that, in a ticket, point at it.
+  # With provider: static this list IS the routing catalog; with
+  # provider: catalog / code it's merged into the synced org catalog.
+  repo_keywords:
+    your-org/your-repo: [favourites, checkout, billing]
 ```
+
+There is no top-level `approvers:` or `repos:` key - routing is driven by
+`context.repo_keywords` (or, for `provider: catalog`/`code`, the catalog synced
+by `foundry-catalog sync`). See `foundry.example.yaml` for every option.
 
 Secrets never go in the YAML. Put them in `.env` next to `docker-compose.yaml`:
 

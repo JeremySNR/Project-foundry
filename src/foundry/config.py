@@ -23,7 +23,19 @@ from typing import Any, Mapping
 
 _TRUE = {"1", "true", "yes", "on"}
 
-DEFAULT_FORBIDDEN_GLOBS = ("infra/**", "migrations/**", "**/.env*", "**/secrets/**")
+# Root-anchored *and* depth-agnostic variants: `migrations/**` only matches a
+# top-level dir, so the `**/...` siblings ensure a nested `services/api/migrations/`
+# is caught by the sticky forbidden-path block too (not just the softer
+# sensitive-area escalation). `**/.env*` and `**/secrets/**` already match at any
+# depth via the `**/` prefix handling in `glob_match`.
+DEFAULT_FORBIDDEN_GLOBS = (
+    "infra/**",
+    "**/infra/**",
+    "migrations/**",
+    "**/migrations/**",
+    "**/.env*",
+    "**/secrets/**",
+)
 DEFAULT_TRIGGER_LABEL = "foundry:candidate"
 DEFAULT_TRIGGER_STATUS = "Ready for AI Analysis"
 
@@ -80,8 +92,29 @@ class Settings:
     # API root; override for self-managed GitLab (e.g. https://gitlab.example.com/api/v4).
     gitlab_api_base: str = "https://gitlab.com/api/v4"
 
+    # --- Slack approvals (secret: env); None => /webhooks/slack disabled ---
+    # Slack signs interactivity requests with this signing secret (v0 scheme);
+    # approvers are then keyed by Slack user id rather than email.
+    slack_signing_secret: str | None = None
+    # --- Slack outbound notifications (token: env; channel: yaml or env) ---
+    # Bot token (xoxb-...) Foundry posts approval messages + status updates with.
+    # Fail-closed: outbound Slack is wired only when BOTH the bot token AND a
+    # channel are set; either missing => no notifier (silent, like no tracker).
+    slack_bot_token: str | None = None
+    slack_channel: str | None = None
+
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
+
+    # --- API rate limiting (behaviour: yaml; operational env overrides) ---
+    # Coarse per-client request caps on the network surfaces. Enabled by
+    # default with generous limits; set rate_limit_enabled: false to turn off.
+    # Two buckets so a flood on one surface can't starve the other:
+    # webhooks (provider deliveries can be bursty) and the API (human/automation).
+    # Per-process, fixed-window; see api/ratelimit.py for the scope caveats.
+    rate_limit_enabled: bool = True
+    rate_limit_webhook_per_minute: int = 120
+    rate_limit_api_per_minute: int = 60
 
     # --- issue tracker (behaviour: yaml) ---
     # "linear" (default), "github_issues" (the issue is the ticket; approvers
@@ -106,6 +139,14 @@ class Settings:
     risk_model: str = "gpt-5.5"
 
     # --- policy / safety knobs (behaviour: yaml) ---
+    # Policy backend: "local" (the in-process Python LocalPolicyEngine, default)
+    # or "opa" (delegate to an OPA server running the foundry.rego bundle). Both
+    # enforce the same rules - the Rego bundle is held in lock-step by
+    # tests/test_policy_parity.py + scripts/policy_parity.py over shared vectors.
+    policy_provider: str = "local"
+    # OPA decision endpoint base URL (e.g. http://opa:8181). Required when
+    # policy_provider == "opa".
+    policy_opa_url: str | None = None
     repo_confidence_threshold: int = 70
     max_files_changed: int = 12
     forbidden_globs: tuple[str, ...] = DEFAULT_FORBIDDEN_GLOBS
@@ -177,6 +218,14 @@ class Settings:
         return settings
 
     def _validate(self) -> None:
+        if self.policy_provider not in ("local", "opa"):
+            raise ValueError(
+                f"policy_provider must be 'local' or 'opa', got {self.policy_provider!r}"
+            )
+        if self.policy_provider == "opa" and not self.policy_opa_url:
+            raise ValueError(
+                "policy_opa_url is required when policy_provider is 'opa'"
+            )
         if not (0 <= self.repo_confidence_threshold <= 100):
             raise ValueError(
                 f"repo_confidence_threshold must be 0-100, got {self.repo_confidence_threshold}"
@@ -224,6 +273,16 @@ class Settings:
         if not (0 <= self.memory_confidence_cap <= 100):
             raise ValueError(
                 f"memory_confidence_cap must be 0-100, got {self.memory_confidence_cap}"
+            )
+        if self.rate_limit_webhook_per_minute < 1:
+            raise ValueError(
+                "rate_limit_webhook_per_minute must be >= 1, got "
+                f"{self.rate_limit_webhook_per_minute} (use rate_limit_enabled: false to disable)"
+            )
+        if self.rate_limit_api_per_minute < 1:
+            raise ValueError(
+                "rate_limit_api_per_minute must be >= 1, got "
+                f"{self.rate_limit_api_per_minute} (use rate_limit_enabled: false to disable)"
             )
 
     @classmethod
@@ -292,6 +351,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["jira_base_url"] = tracker["jira_base_url"]
 
     policy = data.get("policy", {}) or {}
+    if "provider" in policy:
+        out["policy_provider"] = policy["provider"]
+    if "opa_url" in policy:
+        out["policy_opa_url"] = policy["opa_url"]
     if "repo_confidence_threshold" in policy:
         out["repo_confidence_threshold"] = int(policy["repo_confidence_threshold"])
     if "max_files_changed" in policy:
@@ -341,6 +404,18 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "confidence_cap" in memory:
         out["memory_confidence_cap"] = int(memory["confidence_cap"])
 
+    rate_limit = data.get("rate_limit", {}) or {}
+    if "enabled" in rate_limit:
+        out["rate_limit_enabled"] = _bool(rate_limit["enabled"], default=True)
+    if "webhook_per_minute" in rate_limit:
+        out["rate_limit_webhook_per_minute"] = int(rate_limit["webhook_per_minute"])
+    if "api_per_minute" in rate_limit:
+        out["rate_limit_api_per_minute"] = int(rate_limit["api_per_minute"])
+
+    notifications = data.get("notifications", {}) or {}
+    if "slack_channel" in notifications:
+        out["slack_channel"] = notifications["slack_channel"]
+
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
         out["temporal_address"] = temporal["address"]
@@ -385,6 +460,9 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_GITLAB_WEBHOOK_SECRET": "gitlab_webhook_secret",
         "FOUNDRY_GITLAB_API_TOKEN": "gitlab_api_token",
         "FOUNDRY_GITLAB_API_BASE": "gitlab_api_base",
+        "FOUNDRY_SLACK_SIGNING_SECRET": "slack_signing_secret",
+        "FOUNDRY_SLACK_BOT_TOKEN": "slack_bot_token",
+        "FOUNDRY_SLACK_CHANNEL": "slack_channel",
         "FOUNDRY_API_TOKEN": "api_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
         "FOUNDRY_TRACKER_PROVIDER": "tracker_provider",
@@ -398,10 +476,20 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_TASK_QUEUE": "task_queue",
         "FOUNDRY_CONTEXT_PROVIDER": "context_provider",
         "FOUNDRY_CONTEXT_ORG": "context_org",
+        "FOUNDRY_POLICY_PROVIDER": "policy_provider",
+        "FOUNDRY_POLICY_OPA_URL": "policy_opa_url",
     }
     for env_key, field_name in mapping.items():
         if env_key in env:
             out[field_name] = env[env_key]
     if "FOUNDRY_USE_OPENAI_ANALYZER" in env:
         out["use_openai_analyzer"] = _bool(env["FOUNDRY_USE_OPENAI_ANALYZER"])
+    if "FOUNDRY_RATE_LIMIT_ENABLED" in env:
+        out["rate_limit_enabled"] = _bool(env["FOUNDRY_RATE_LIMIT_ENABLED"])
+    if "FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE" in env:
+        out["rate_limit_webhook_per_minute"] = int(
+            env["FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE"]
+        )
+    if "FOUNDRY_RATE_LIMIT_API_PER_MINUTE" in env:
+        out["rate_limit_api_per_minute"] = int(env["FOUNDRY_RATE_LIMIT_API_PER_MINUTE"])
     return out

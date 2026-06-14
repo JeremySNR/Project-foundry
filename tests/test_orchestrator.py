@@ -135,6 +135,32 @@ def test_forbidden_file_blocks_run(session_factory) -> None:
     assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
 
 
+def test_nested_forbidden_migrations_path_blocks_run(session_factory) -> None:
+    """A migrations dir nested under a service path still hard-blocks.
+
+    Regression for root-anchored forbidden globs: ``migrations/**`` only matched
+    a top-level dir, so a nested ``services/api/migrations/...`` got the softer
+    sensitive-area escalation (REVIEW_REQUIRED) instead of the sticky BLOCK the
+    forbidden list promises.
+    """
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+
+    pr = PullRequestState(
+        repo="customer-web",
+        pr_number=2,
+        url="https://github.com/example/customer-web/pull/2",
+        branch="foundry/lin-123",
+        status=PRStatus.OPEN,
+        files_changed=["services/api/migrations/0001_init.py"],
+    )
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+
+
 def test_forbidden_file_on_second_page_blocks_run(session_factory) -> None:
     """A forbidden file at position 101+ in a large PR still hard-blocks.
 
@@ -220,6 +246,46 @@ def test_auth_change_is_human_only_and_blocks_dispatch(session_factory) -> None:
     with pytest.raises(OrchestratorError):
         orch.dispatch_agent(run_id)
     assert _status(session_factory, run_id) is RunStatus.BLOCKED
+
+
+def test_permanently_blocked_ticket_parks_blocked_not_waiting_approval(
+    session_factory,
+) -> None:
+    """A DB-migration ticket is denied by policy no matter who approves, so it
+    parks at BLOCKED at intake instead of inviting a futile approval that
+    dispatch would only convert to BLOCKED.
+    """
+    import json
+
+    from foundry.db.models import AuditEventType, FoundryAuditEvent
+
+    orch = _orch(session_factory)
+    ticket = _ready_ticket(
+        title="Migrate the users table",
+        description=(
+            "Acceptance Criteria:\n"
+            "- alter table users add column nickname\n"
+            "- backfill existing rows\n"
+        ),
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    # A permanently-blocked run cannot be approved.
+    with pytest.raises(OrchestratorError):
+        orch.approve(run_id, user="lead@example.com")
+
+    # The block is recorded as a policy denial (not "unroutable"), with the
+    # decision attached so the trail shows why approval was never offered.
+    with session_factory() as s:
+        events = (
+            s.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id, event_type=AuditEventType.RUN_BLOCKED)
+            .all()
+        )
+    assert len(events) == 1
+    meta = json.loads(events[0].metadata_json or "{}")
+    assert meta["category"] == "policy_denied"
+    assert events[0].output_hash is not None
 
 
 def test_dispatch_requires_approval_first(session_factory) -> None:
@@ -402,6 +468,19 @@ def test_correlate_pr_no_match_returns_none(session_factory) -> None:
     assert orch.correlate_pr(pr) is None
 
 
+def test_find_run_id_for_branch_ignores_terminal_runs(session_factory) -> None:
+    """A branch whose run has gone terminal is not matched, so a late PR webhook
+    cannot revive it (correlate_pr's documented PR-observable-only contract).
+    """
+    branch = "foundry/lin-123-add-customer-favourites"
+    orch, run_id = _dispatched_run(session_factory)
+    # While the run is observable (AGENT_RUNNING), the branch correlates.
+    assert orch.find_run_id_for_branch(branch) == run_id
+    # Drive it terminal; the same branch must no longer match.
+    orch.stop(run_id, user="lead@example.com")
+    assert orch.find_run_id_for_branch(branch) is None
+
+
 # -- governed remediation loop ----------------------------------------------------
 
 
@@ -484,6 +563,38 @@ def test_changes_requested_review_triggers_remediation(session_factory) -> None:
     orch.record_pr(run_id, _pr())
     review = _pr(files_changed=[], review_status=ReviewStatus.CHANGES_REQUESTED)
     assert orch.record_pr(run_id, review) is RunStatus.AGENT_RUNNING
+
+
+def test_pr_opened_emitted_once_across_remediation(session_factory) -> None:
+    """PR_OPENED fires only on the first observation; later events (including
+    pushes during remediation, when the status is AGENT_RUNNING again) emit
+    PR_UPDATED. Regression for keying ``first_observation`` off the run status.
+    """
+    from foundry.db.models import AuditEventType, FoundryAuditEvent
+
+    orch, run_id, _provider = _dispatched_with_provider(session_factory)
+    orch.record_pr(run_id, _pr())  # first observation -> PR_OPENED
+    # CI fails -> re-dispatch; the run is AGENT_RUNNING again.
+    assert (
+        orch.record_pr(run_id, _pr(ci_status=CIStatus.FAILING))
+        is RunStatus.AGENT_RUNNING
+    )
+    # The agent pushes again mid-remediation: must be PR_UPDATED, not PR_OPENED.
+    orch.record_pr(run_id, _pr())
+
+    with session_factory() as s:
+        opened = (
+            s.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id, event_type=AuditEventType.PR_OPENED)
+            .count()
+        )
+        updated = (
+            s.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id, event_type=AuditEventType.PR_UPDATED)
+            .count()
+        )
+    assert opened == 1
+    assert updated >= 2
 
 
 def test_retry_on_config_disables_remediation(session_factory) -> None:
