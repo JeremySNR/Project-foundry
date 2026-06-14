@@ -1,10 +1,12 @@
-"""Recorded webhook fixtures driven through the real signed endpoints.
+"""Webhook fixtures driven through the real signed endpoints.
 
-The payloads in ``tests/fixtures/`` mirror what Linear and GitHub actually
-send. These tests are the contract for the payload mappings: when a live
-integration exposes a mapping bug, the fix starts with a (redacted) captured
-payload landing in that directory and an assertion landing here. No
-credentials required - which is the point.
+The payloads in ``tests/fixtures/`` are spec-derived from the providers'
+webhook documentation (not yet captured from live traffic) and model what
+Linear and GitHub send. These tests are the contract for the payload mappings:
+when a live integration exposes a mapping bug, the fix starts with a (redacted)
+captured payload landing in that directory - strictly better than the
+spec-derived shape - and an assertion landing here. No credentials required -
+which is the point.
 """
 
 from __future__ import annotations

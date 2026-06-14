@@ -56,7 +56,7 @@ def main() -> None:
 def _run_sync(args: argparse.Namespace) -> None:
     from foundry.config import Settings
     from foundry.connectors.transport import github_rest_transport
-    from foundry.db.base import create_all, make_engine, make_session_factory
+    from foundry.db.base import init_schema, make_engine, make_session_factory
     from foundry.catalog.sync import CatalogSync, CatalogSyncError
 
     settings = Settings.load(os.environ.get("FOUNDRY_CONFIG"), env=os.environ)
@@ -85,7 +85,7 @@ def _run_sync(args: argparse.Namespace) -> None:
     )
 
     engine = make_engine(settings.database_url)
-    create_all(engine)
+    init_schema(engine)
     session_factory = make_session_factory(engine)
     transport = github_rest_transport(token)
 

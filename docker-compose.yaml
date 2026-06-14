@@ -5,7 +5,17 @@
 #   Temporal  -> optional: `docker compose --profile temporal up`
 #
 # Put secrets in a `.env` file next to this one (compose reads it
-# automatically); behavioural config lives in ./foundry.yaml (mounted in).
+# automatically); behavioural config is a YAML file mounted in.
+#
+# Out of the box this mounts the committed `foundry.example.yaml`, so a bare
+# `docker compose up` boots with no copy step. To customise, copy it and point
+# the mount below at your own file:
+#
+#   cp foundry.example.yaml foundry.yaml      # then edit it
+#   # change the api `volumes:` line to ./foundry.yaml:/etc/foundry/foundry.yaml:ro
+#
+# (The entrypoint also tolerates a missing config file and falls back to
+# built-in defaults + the env vars below, so a typo here won't crash-loop.)
 
 services:
   api:
@@ -22,18 +32,32 @@ services:
       FOUNDRY_LINEAR_API_TOKEN: ${FOUNDRY_LINEAR_API_TOKEN:-}
       FOUNDRY_GITHUB_API_TOKEN: ${FOUNDRY_GITHUB_API_TOKEN:-}
       FOUNDRY_CURSOR_API_TOKEN: ${FOUNDRY_CURSOR_API_TOKEN:-}
+      # Jira tracker (set tracker.provider: jira in the YAML to use it).
+      FOUNDRY_JIRA_WEBHOOK_SECRET: ${FOUNDRY_JIRA_WEBHOOK_SECRET:-}
+      FOUNDRY_JIRA_BASE_URL: ${FOUNDRY_JIRA_BASE_URL:-}
+      FOUNDRY_JIRA_EMAIL: ${FOUNDRY_JIRA_EMAIL:-}
+      FOUNDRY_JIRA_API_TOKEN: ${FOUNDRY_JIRA_API_TOKEN:-}
+      # GitLab SCM (webhook at /webhooks/gitlab; token enables diff-aware gates).
+      FOUNDRY_GITLAB_WEBHOOK_SECRET: ${FOUNDRY_GITLAB_WEBHOOK_SECRET:-}
+      FOUNDRY_GITLAB_API_TOKEN: ${FOUNDRY_GITLAB_API_TOKEN:-}
       FOUNDRY_AGENT_PROVIDER: ${FOUNDRY_AGENT_PROVIDER:-}
       FOUNDRY_AGENT_WEBHOOK_URL: ${FOUNDRY_AGENT_WEBHOOK_URL:-}
       FOUNDRY_AGENT_WEBHOOK_SECRET: ${FOUNDRY_AGENT_WEBHOOK_SECRET:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
-      - ./foundry.yaml:/etc/foundry/foundry.yaml:ro
+      # Mounts the committed example so `docker compose up` works on a fresh
+      # clone. Swap to ./foundry.yaml (see the header comment) to customise.
+      - ./foundry.example.yaml:/etc/foundry/foundry.yaml:ro
     depends_on:
       db:
         condition: service_healthy
 
   db:
     image: postgres:16-alpine
+    # Published so `make migrate` (or psql) can reach the DB from the host.
+    # Change the host side (left of the colon) if 5432 is already in use locally.
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_USER: foundry
       POSTGRES_PASSWORD: foundry

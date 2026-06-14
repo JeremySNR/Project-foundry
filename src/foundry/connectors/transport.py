@@ -32,6 +32,7 @@ from typing import Any, Callable
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 GITHUB_API_BASE = "https://api.github.com"
 GITLAB_API_BASE = "https://gitlab.com/api/v4"
+SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 
 _log = logging.getLogger(__name__)
 
@@ -368,6 +369,45 @@ def jira_transport(
                     continue
                 raise TransportError(f"Jira request failed after {_MAX_RETRIES} retries") from exc
         raise TransportError("Jira request failed") from last_exc  # pragma: no cover
+
+    return transport
+
+
+def slack_transport(
+    bot_token: str,
+    channel: str,
+    *,
+    client: Any | None = None,
+    url: str = SLACK_POST_MESSAGE_URL,
+) -> Callable[[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Build the ``transport(text, blocks) -> response`` for ``chat.postMessage``.
+
+    ``text`` is the notification fallback; ``blocks`` is the Block Kit body. The
+    channel is fixed at construction (config), so the notifier never chooses it.
+    No retry: posting a message is non-idempotent, and a blind replay after a
+    502 the server actually processed would double-post a notification.
+
+    Slack answers ``200`` even for logical failures, signalling them with
+    ``{"ok": false, "error": ...}``; we surface those as ``TransportError`` so a
+    misconfigured token/channel fails loudly rather than silently dropping.
+    """
+    get_client = _client_provider(client)
+
+    def transport(text: str, blocks: list[dict[str, Any]]) -> dict[str, Any]:
+        http = get_client()
+        response = http.post(
+            url,
+            json={"channel": channel, "text": text, "blocks": blocks},
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok", False):
+            raise TransportError(f"Slack chat.postMessage error: {payload.get('error')}")
+        return payload
 
     return transport
 

@@ -29,6 +29,7 @@ from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_analysis_comment, state_for
+from foundry.connectors.notify import ApprovalRequest, RunNotifier
 from foundry.observability import traced
 from foundry.audit.events import (
     build_artifact,
@@ -74,6 +75,7 @@ from foundry.schemas.analysis import TicketAnalysis
 from foundry.memory.outcomes import record_outcome
 from foundry.schemas.common import (
     ACTIVE_RUN_STATUSES,
+    PR_OBSERVABLE_STATUSES,
     AgentMode,
     ApprovalRole,
     CIStatus,
@@ -102,9 +104,23 @@ _ARTIFACT_MODELS: dict[ArtifactType, type] = {
 
 _log = logging.getLogger(__name__)
 
-# Run states in which PR webhook events are meaningful for the run.
-_PR_OBSERVABLE_STATUSES = frozenset(
-    {RunStatus.AGENT_RUNNING, RunStatus.PR_OPEN, RunStatus.REVIEW_REQUIRED}
+# Run states in which PR webhook events are meaningful for the run. Defined once
+# in schemas/common.py so the orchestrator and the durable workflow share it.
+_PR_OBSERVABLE_STATUSES = PR_OBSERVABLE_STATUSES
+
+# Status transitions worth pinging a chat surface about: parked, blocked, PR
+# open, merged (and the failure terminals, which an approver wants to hear about
+# as much as a clean block). Routine intermediate states (analysing, approved,
+# agent_running, review_required) are not notified - they would be noise.
+_NOTIFIABLE_STATUSES = frozenset(
+    {
+        RunStatus.NEEDS_CLARIFICATION,
+        RunStatus.BLOCKED,
+        RunStatus.REJECTED,
+        RunStatus.EXECUTION_FAILED,
+        RunStatus.PR_OPEN,
+        RunStatus.COMPLETE,
+    }
 )
 
 # Linear-style issue keys (ENG-123) appearing in branch names or PR titles.
@@ -128,6 +144,7 @@ class FoundryOrchestrator:
         policy_engine: PolicyEngine | None = None,
         provider: CodingAgentProvider | None = None,
         issue_tracker: IssueTracker | None = None,
+        notifier: RunNotifier | None = None,
         max_files_changed: int = 12,
         forbidden_globs: tuple[str, ...] | list[str] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
@@ -145,6 +162,9 @@ class FoundryOrchestrator:
         self._provider = provider or ManualProvider()
         # Optional: when set, Foundry writes progress/state back to the tracker.
         self._tracker = issue_tracker
+        # Optional: when set, Foundry posts approval messages + status updates to
+        # a chat surface (Slack). Best-effort, like the tracker write-back.
+        self._notifier = notifier
         self._max_files_changed = max_files_changed
         self._forbidden_globs = list(
             forbidden_globs if forbidden_globs is not None else DEFAULT_FORBIDDEN_GLOBS
@@ -195,7 +215,21 @@ class FoundryOrchestrator:
         payload = self._policy_input(PolicyAction.START_AGENT, analysis, context, risk)
         decision = self._policy.evaluate(payload)
 
-        status = self._post_plan_status(analysis, risk, decision.allowed)
+        # Distinguish "denied, but a human approval would unlock dispatch" from
+        # "denied no matter who approves" (e.g. DB migrations / prod deploys are
+        # blocked in this version regardless of approvals). Only the latter should
+        # park at BLOCKED; the former is the normal road to WAITING_APPROVAL. We
+        # learn which by re-running the gate with every required approval granted.
+        permanently_blocked = False
+        if not decision.allowed:
+            with_approvals = payload.model_copy(
+                update={
+                    "approval": {role.value: True for role in decision.required_approvals}
+                }
+            )
+            permanently_blocked = not self._policy.evaluate(with_approvals).allowed
+
+        status = self._post_plan_status(analysis, risk, permanently_blocked)
 
         try:
             with self._sf() as session:
@@ -256,14 +290,29 @@ class FoundryOrchestrator:
                         )
                     )
                 elif status is RunStatus.BLOCKED:
-                    session.add(
-                        build_audit_event(
-                            run_id=run_id,
-                            event_type=AuditEventType.RUN_BLOCKED,
-                            actor_type="foundry",
-                            metadata={"category": "unroutable"},
+                    # Two routes to BLOCKED at intake: the work couldn't be scoped
+                    # to a repo (unroutable), or the policy gate denies it no matter
+                    # who approves (policy_denied). Record the decision in the latter
+                    # case so the trail shows *why* approval was never offered.
+                    if risk.overall_risk is OverallRisk.BLOCKED:
+                        session.add(
+                            build_audit_event(
+                                run_id=run_id,
+                                event_type=AuditEventType.RUN_BLOCKED,
+                                actor_type="foundry",
+                                metadata={"category": "unroutable"},
+                            )
                         )
-                    )
+                    else:
+                        session.add(
+                            build_audit_event(
+                                run_id=run_id,
+                                event_type=AuditEventType.RUN_BLOCKED,
+                                actor_type="foundry",
+                                output_content=decision,
+                                metadata={"category": "policy_denied"},
+                            )
+                        )
                 self._record_outcome_if_terminal(session, run)
                 session.commit()
         except IntegrityError:
@@ -297,6 +346,12 @@ class FoundryOrchestrator:
                     "authoritative but Linear may be stale",
                     ticket.issue_id,
                 )
+        # Mirror the same outcome onto the chat surface: an actionable approval
+        # message when the run parks for approval, else a status notification.
+        if status is RunStatus.WAITING_APPROVAL:
+            self._notify_approval(ticket, analysis, risk, plan)
+        else:
+            self._notify_run_status(ticket.issue_id, ticket.issue_key, status)
         return run_id
 
     def _notify_state(self, issue_id: str, status: RunStatus) -> None:
@@ -309,6 +364,53 @@ class FoundryOrchestrator:
                     issue_id,
                     status.value,
                 )
+        # The intake path notifies chat itself (it has the full plan context for
+        # the approval message); every later transition flows through here.
+        self._notify_run_status(issue_id, None, status)
+
+    def _notify_run_status(
+        self, issue_id: str, issue_key: str | None, status: RunStatus
+    ) -> None:
+        """Post a status update to the chat surface for notable transitions."""
+        if self._notifier is None or status not in _NOTIFIABLE_STATUSES:
+            return
+        try:
+            self._notifier.status_changed(issue_id, issue_key, status)
+        except Exception:
+            _log.exception(
+                "notifier status update failed for issue %s (-> %s)",
+                issue_id,
+                status.value,
+            )
+
+    def _notify_approval(
+        self,
+        ticket: RawTicket,
+        analysis: TicketAnalysis,
+        risk: RiskAssessment,
+        plan: DeliveryPlan,
+    ) -> None:
+        """Post the interactive approval message to the chat surface."""
+        if self._notifier is None:
+            return
+        repo = plan.affected_repositories[0] if plan.affected_repositories else "unknown"
+        request = ApprovalRequest(
+            issue_id=ticket.issue_id,
+            issue_key=ticket.issue_key,
+            title=analysis.title,
+            work_type=analysis.work_type.value,
+            risk=risk.overall_risk.value,
+            agent_mode=risk.allowed_agent_mode.value,
+            repo=repo,
+            acceptance_criteria=tuple(analysis.acceptance_criteria),
+            required_approvals=tuple(r.value for r in risk.required_approvals),
+        )
+        try:
+            self._notifier.approval_requested(request)
+        except Exception:
+            _log.exception(
+                "notifier approval message failed for issue %s", ticket.issue_id
+            )
 
     def _notify_comment(self, issue_id: str, body: str) -> None:
         if self._tracker is not None:
@@ -319,7 +421,9 @@ class FoundryOrchestrator:
 
     @staticmethod
     def _post_plan_status(
-        analysis: TicketAnalysis, risk: RiskAssessment, policy_allowed: bool
+        analysis: TicketAnalysis,
+        risk: RiskAssessment,
+        policy_permanently_blocked: bool,
     ) -> RunStatus:
         # Readiness first: an unclear ticket should be clarified before we worry
         # about anything downstream (it usually also lacks a resolvable repo).
@@ -327,6 +431,11 @@ class FoundryOrchestrator:
             return RunStatus.NEEDS_CLARIFICATION
         # The ticket is clear, but the work still can't be scoped to a repo.
         if risk.overall_risk is OverallRisk.BLOCKED:
+            return RunStatus.BLOCKED
+        # The plan is ready and scoped, but the policy gate will refuse dispatch
+        # no matter who approves it. Park at BLOCKED rather than inviting an
+        # approval that dispatch would only convert to BLOCKED anyway.
+        if policy_permanently_blocked:
             return RunStatus.BLOCKED
         # A ready, scoped plan awaits human approval before any agent runs.
         return RunStatus.WAITING_APPROVAL
@@ -419,6 +528,77 @@ class FoundryOrchestrator:
             self._record_outcome_if_terminal(session, run)
             session.commit()
         self._notify_state(issue_id, status)
+
+    def expire_pending_approval(self, run_id: str) -> RunStatus:
+        """Terminate a run whose approval window elapsed without a decision.
+
+        Called by the durable Temporal driver when ``wait_condition`` for the
+        approval signal times out: instead of letting the workflow fail and
+        strand the run at ``WAITING_APPROVAL`` with no audit row, transition it
+        cleanly to ``BLOCKED`` with a ``run.blocked`` event tagged
+        ``approval_window_expired``. Idempotent — a run that has since been
+        approved/rejected (the signal raced the timeout, or the activity is
+        being retried) is left untouched and its current status returned.
+        """
+        return self._expire_wait(
+            run_id,
+            expected=RunStatus.WAITING_APPROVAL,
+            status=RunStatus.BLOCKED,
+            event_type=AuditEventType.RUN_BLOCKED,
+            category="approval_window_expired",
+        )
+
+    def expire_pending_pr(self, run_id: str) -> RunStatus:
+        """Terminate a dispatched run whose PR never arrived in the wait window.
+
+        The durable counterpart to a silently-stranded ``AGENT_RUNNING`` run:
+        the agent was dispatched but produced no PR within the workflow's PR
+        window, so the run failed to deliver. Transition to ``EXECUTION_FAILED``
+        with an ``agent.failed`` event (consistent with a provider that raises)
+        and cancel any in-flight job so it stops spending. Idempotent — a run
+        that has since opened a PR (or already terminated) is left untouched.
+        """
+        return self._expire_wait(
+            run_id,
+            expected=RunStatus.AGENT_RUNNING,
+            status=RunStatus.EXECUTION_FAILED,
+            event_type=AuditEventType.AGENT_FAILED,
+            category="pr_window_expired",
+        )
+
+    def _expire_wait(
+        self,
+        run_id: str,
+        *,
+        expected: RunStatus,
+        status: RunStatus,
+        event_type: AuditEventType,
+        category: str,
+    ) -> RunStatus:
+        with self._sf() as session:
+            run = self._require_run(session, run_id, lock=True)
+            if run.status is not expected:
+                # The awaited signal won the race, or this expiry is a retry:
+                # nothing to do, never overwrite a run that already moved on.
+                return run.status
+            run.status = status
+            run.current_step = status.value
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=event_type,
+                    actor_type="foundry",
+                    metadata={"category": category},
+                )
+            )
+            # A dispatched-but-undelivered run may still have a job spending;
+            # cancel it best-effort exactly as a human stop would.
+            self._cancel_active_job(session, run_id, user="foundry")
+            issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
+            session.commit()
+        self._notify_state(issue_id, status)
+        return status
 
     def _cancel_active_job(self, session, run_id: str, *, user: str) -> None:
         """Cancel the run's in-flight provider job when a human ends the run.
@@ -528,13 +708,22 @@ class FoundryOrchestrator:
             return run.id if run else None
 
     def find_run_id_for_branch(self, branch: str) -> str | None:
-        """Associate an observed PR back to its run via the agent job's branch."""
+        """Associate an observed PR back to its run via the agent job's branch.
+
+        Only runs in a PR-observable state match, mirroring the issue-key
+        fallback in :meth:`correlate_pr`: a stale or terminal run that once used
+        this branch must not be revived by a late webhook (``record_pr`` would
+        reject it anyway, but filtering here keeps the contract honest and lets
+        the issue-key fallback still find a live run on the same branch name).
+        """
         if not branch:
             return None
         with self._sf() as session:
             job = (
                 session.query(FoundryAgentJob)
+                .join(FoundryRun, FoundryRun.id == FoundryAgentJob.run_id)
                 .filter(FoundryAgentJob.branch == branch)
+                .filter(FoundryRun.status.in_(_PR_OBSERVABLE_STATUSES))
                 .order_by(FoundryAgentJob.started_at.desc())
                 .first()
             )
@@ -832,7 +1021,20 @@ class FoundryOrchestrator:
                     f"run {run_id} is '{run.status.value}'; PR events are only "
                     "recorded for runs with a dispatched agent"
                 )
-            first_observation = run.status is RunStatus.AGENT_RUNNING
+            # The first time we ever see a PR for this run emits PR_OPENED; every
+            # later event (including pushes during remediation, when the status is
+            # AGENT_RUNNING again) emits PR_UPDATED. Keying off the status alone
+            # mis-fired PR_OPENED on each remediation push, so key off whether a
+            # PR_STATE artifact already exists.
+            first_observation = (
+                session.query(FoundryArtifact.id)
+                .filter(
+                    FoundryArtifact.run_id == run_id,
+                    FoundryArtifact.artifact_type == ArtifactType.PR_STATE,
+                )
+                .first()
+                is None
+            )
             self._add(session, run_id, ArtifactType.PR_STATE, pr_state)
             session.add(
                 build_audit_event(

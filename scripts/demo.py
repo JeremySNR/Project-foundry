@@ -14,22 +14,42 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
-from foundry.agents.manual import InMemoryFakeProvider
-from foundry.connectors import InMemoryIssueTracker
-from foundry.db import (
-    FoundryAuditEvent,
-    FoundryPolicyDecision,
-    create_all,
-    make_engine,
-    make_session_factory,
-)
-from foundry.orchestrator import FoundryOrchestrator
-from foundry.schemas.common import CIStatus, PRStatus, ReviewStatus, RunStatus
-from foundry.schemas.pr import PullRequestState
-from foundry.schemas.ticket import RawTicket
+# Run straight from a clone: put the repo's src/ on the path so `import foundry`
+# resolves whether or not `pip install -e .` has been run. The third-party deps
+# (pydantic, sqlalchemy, pyyaml) still need installing - if anything is missing
+# we print a cross-platform install hint instead of a bare ModuleNotFoundError.
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if os.path.isdir(_SRC) and _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+try:
+    from foundry.agents.manual import InMemoryFakeProvider
+    from foundry.connectors import InMemoryIssueTracker
+    from foundry.db import (
+        FoundryAuditEvent,
+        FoundryPolicyDecision,
+        create_all,
+        make_engine,
+        make_session_factory,
+    )
+    from foundry.orchestrator import FoundryOrchestrator
+    from foundry.schemas.common import CIStatus, PRStatus, ReviewStatus, RunStatus
+    from foundry.schemas.pr import PullRequestState
+    from foundry.schemas.ticket import RawTicket
+except ModuleNotFoundError as exc:
+    sys.exit(
+        f"\nThe demo needs Foundry's dependencies installed (missing: {exc.name}).\n\n"
+        "From the repo root, create a virtualenv and install the package:\n\n"
+        "  python -m venv .venv\n"
+        "  .venv\\Scripts\\activate          # Windows\n"
+        "  source .venv/bin/activate        # macOS / Linux\n"
+        "  pip install -e .\n\n"
+        "then re-run:  python scripts/demo.py\n"
+    )
 
 # -- terminal dressing ---------------------------------------------------------
 
