@@ -31,14 +31,16 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
-from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func
 
 from foundry.compliance import (
     DEFAULT_CONTROL_MAPPINGS,
     ControlMapping,
+    build_evidence_archive,
     build_evidence_pack,
+    render_archive_html,
     render_evidence_html,
 )
 from foundry.config import Settings
@@ -681,6 +683,57 @@ def create_app(
             return HTMLResponse(render_evidence_html(pack))
         return pack
 
+    @app.get("/evidence")
+    def evidence_archive(
+        request: Request,
+        format: str = "json",
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = None,
+        days: int | None = None,
+    ) -> Any:
+        """Org-wide compliance evidence export over a date range: every run
+        created in the window, each as the same full pack ``GET /runs/{id}/
+        evidence`` produces, plus a rollup (aggregate integrity, status
+        breakdown, per-control coverage across the range).
+
+        Bound the window with ISO 8601 ``from``/``to`` (``from`` inclusive,
+        ``to`` exclusive; a date-only ``to`` covers the whole day) or with
+        ``days`` (the last N days). With nothing supplied it defaults to the
+        last 90 days. ``?format=html`` renders a standalone page; the default
+        is JSON. Token-gated and fail-closed like ``/runs/{id}/evidence``.
+        """
+        _require_api_token(app, request)
+        if format not in ("json", "html"):
+            raise HTTPException(
+                status_code=422, detail="format must be 'json' or 'html'"
+            )
+        until = (
+            _parse_iso_bound(to, inclusive_day_end=True)
+            if to
+            else datetime.now(timezone.utc)
+        )
+        if from_:
+            since = _parse_iso_bound(from_, inclusive_day_end=False)
+        else:
+            window = 90 if days is None else days
+            if window < 1:
+                raise HTTPException(status_code=422, detail="days must be >= 1")
+            since = until - timedelta(days=window)
+        if since >= until:
+            raise HTTPException(
+                status_code=422, detail="'from' must be before 'to'"
+            )
+        with app.state.session_factory() as session:
+            archive = build_evidence_archive(
+                session,
+                since=since,
+                until=until,
+                control_mappings=app.state.control_mappings,
+            )
+        if format == "html":
+            return HTMLResponse(render_archive_html(archive))
+        return archive
+
     @app.get("/metrics/delivery")
     def metrics_delivery(request: Request, days: int = 90) -> dict[str, Any]:
         """Delivery-memory aggregates: PRs shipped, blocks, time-to-merge,
@@ -871,6 +924,27 @@ def _existing_run(orch: FoundryOrchestrator, issue_id: str) -> dict[str, Any] | 
         return None
     run_id = orch.find_run_id_for_issue(issue_id)
     return _run_to_dict(orch.get_run(run_id)) if run_id else None
+
+
+def _parse_iso_bound(value: str, *, inclusive_day_end: bool) -> datetime:
+    """Parse an ISO 8601 date/datetime query bound into an aware UTC datetime.
+
+    A naive value is assumed UTC. A date-only value (``YYYY-MM-DD``) used as the
+    *end* of a range is bumped to the next midnight so the named day is fully
+    included (the underlying filter is half-open: ``since <= created_at < until``).
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid ISO 8601 date/datetime: {value!r}",
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if inclusive_day_end and len(value) == 10 and "T" not in value:
+        parsed = parsed + timedelta(days=1)
+    return parsed
 
 
 def _require_api_token(app: FastAPI, request: Request) -> None:
