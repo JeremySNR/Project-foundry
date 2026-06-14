@@ -21,9 +21,28 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
+from foundry.compliance.controls import (
+    DEFAULT_CONTROL_MAPPINGS,
+    KNOWN_EVIDENCE_SECTIONS,
+    ControlMapping,
+    mappings_from_config,
+)
+
 _TRUE = {"1", "true", "yes", "on"}
 
-DEFAULT_FORBIDDEN_GLOBS = ("infra/**", "migrations/**", "**/.env*", "**/secrets/**")
+# Root-anchored *and* depth-agnostic variants: `migrations/**` only matches a
+# top-level dir, so the `**/...` siblings ensure a nested `services/api/migrations/`
+# is caught by the sticky forbidden-path block too (not just the softer
+# sensitive-area escalation). `**/.env*` and `**/secrets/**` already match at any
+# depth via the `**/` prefix handling in `glob_match`.
+DEFAULT_FORBIDDEN_GLOBS = (
+    "infra/**",
+    "**/infra/**",
+    "migrations/**",
+    "**/migrations/**",
+    "**/.env*",
+    "**/secrets/**",
+)
 DEFAULT_TRIGGER_LABEL = "foundry:candidate"
 DEFAULT_TRIGGER_STATUS = "Ready for AI Analysis"
 
@@ -70,6 +89,12 @@ class Settings:
     jira_base_url: str | None = None
     jira_email: str | None = None
     jira_api_token: str | None = None
+    # Jira webhook UIs that cannot set request headers can pass the shared
+    # secret as a ?token= query parameter. Query-string secrets leak into
+    # access logs, proxies, and link history, so this is off by default:
+    # the token is header-only (X-Foundry-Webhook-Token) unless explicitly
+    # opted in here (behaviour: yaml).
+    jira_allow_query_token: bool = False
 
     # --- GitLab SCM (secret: env); None => endpoint disabled ---
     # GitLab webhooks send the shared secret verbatim in X-Gitlab-Token.
@@ -94,6 +119,27 @@ class Settings:
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
+    # --- webhook replay protection (behaviour: yaml) ---
+    # How long a processed delivery id is remembered in foundry_webhook_deliveries
+    # for durable, cross-worker dedup. Rows older than this are pruned so the
+    # table stays bounded. None disables pruning (unbounded growth - not advised).
+    webhook_dedup_ttl_seconds: int | None = 86_400
+    # Maximum age of an inbound delivery, validated against a provider-supplied
+    # timestamp (Linear's webhookTimestamp). None = disabled. When set it is
+    # fail-closed (missing/stale timestamp rejected) and must be <= the dedup
+    # TTL, so a delivery can't age out of the dedup table while still replayable.
+    webhook_replay_max_age_seconds: int | None = None
+
+    # --- API rate limiting (behaviour: yaml; operational env overrides) ---
+    # Coarse per-client request caps on the network surfaces. Enabled by
+    # default with generous limits; set rate_limit_enabled: false to turn off.
+    # Two buckets so a flood on one surface can't starve the other:
+    # webhooks (provider deliveries can be bursty) and the API (human/automation).
+    # Per-process, fixed-window; see api/ratelimit.py for the scope caveats.
+    rate_limit_enabled: bool = True
+    rate_limit_webhook_per_minute: int = 120
+    rate_limit_api_per_minute: int = 60
+
     # --- issue tracker (behaviour: yaml) ---
     # "linear" (default), "github_issues" (the issue is the ticket; approvers
     # are then keyed by GitHub login instead of email), or "jira".
@@ -115,8 +161,24 @@ class Settings:
     # same heuristic floor (needs OPENAI_API_KEY).
     risk_provider: str = "heuristic"
     risk_model: str = "gpt-5.5"
+    # Delivery planner backend. "template" renders deterministic
+    # "Satisfy acceptance criterion: X" steps (the no-key default); "llm" adds
+    # an LLM pass that produces file-level steps, test locations and verify
+    # commands from the code-aware context (needs OPENAI_API_KEY, best paired
+    # with context.provider: code). Safety guardrails stay deterministic and an
+    # LLM failure degrades to the template plan.
+    planner_provider: str = "template"
+    planner_model: str = "gpt-5.5"
 
     # --- policy / safety knobs (behaviour: yaml) ---
+    # Policy backend: "local" (the in-process Python LocalPolicyEngine, default)
+    # or "opa" (delegate to an OPA server running the foundry.rego bundle). Both
+    # enforce the same rules - the Rego bundle is held in lock-step by
+    # tests/test_policy_parity.py + scripts/policy_parity.py over shared vectors.
+    policy_provider: str = "local"
+    # OPA decision endpoint base URL (e.g. http://opa:8181). Required when
+    # policy_provider == "opa".
+    policy_opa_url: str | None = None
     repo_confidence_threshold: int = 70
     max_files_changed: int = 12
     forbidden_globs: tuple[str, ...] = DEFAULT_FORBIDDEN_GLOBS
@@ -132,9 +194,14 @@ class Settings:
     # more than max_agent_retries times per run.
     max_agent_retries: int = 2
     retry_on: tuple[str, ...] = ("ci_failed", "changes_requested")
-    # Deny further agent retries once a run's provider-reported spend reaches
-    # this many USD. None = no budget cap.
+    # Deny further agent dispatch once a run's spend reaches this many USD.
+    # Enforced at first dispatch and every retry. None = no budget cap.
     max_cost_per_run: float | None = None
+    # Fallback per-dispatch cost (USD) for providers that don't report spend
+    # (claude_code / webhook / manual). Provider-reported cost still wins where
+    # available; otherwise each dispatched attempt counts this estimate so the
+    # cap can trip. 0 = no estimate (the cap then needs reported cost to bind).
+    estimated_cost_per_dispatch: float = 0.0
 
     # --- triggers (behaviour: yaml) ---
     trigger_label: str = DEFAULT_TRIGGER_LABEL
@@ -145,6 +212,12 @@ class Settings:
     # by the API caller: (email, (role, ...)). A user with no roles can approve
     # ordinary work but cannot satisfy sensitive-area approval requirements.
     approvers: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    # --- compliance evidence packs (behaviour: yaml) ---
+    # Which evidence sections satisfy which compliance control. Config, not
+    # code: override wholesale via ``compliance.control_mappings``. Section
+    # names are validated against the fixed evidence vocabulary at load time.
+    compliance_control_mappings: tuple[ControlMapping, ...] = DEFAULT_CONTROL_MAPPINGS
 
     # --- context enrichment (behaviour: yaml) ---
     context_provider: str = "static"          # "static" | "catalog" | "code"
@@ -188,6 +261,14 @@ class Settings:
         return settings
 
     def _validate(self) -> None:
+        if self.policy_provider not in ("local", "opa"):
+            raise ValueError(
+                f"policy_provider must be 'local' or 'opa', got {self.policy_provider!r}"
+            )
+        if self.policy_provider == "opa" and not self.policy_opa_url:
+            raise ValueError(
+                "policy_opa_url is required when policy_provider is 'opa'"
+            )
         if not (0 <= self.repo_confidence_threshold <= 100):
             raise ValueError(
                 f"repo_confidence_threshold must be 0-100, got {self.repo_confidence_threshold}"
@@ -207,9 +288,45 @@ class Settings:
             raise ValueError(
                 f"max_cost_per_run must be positive, got {self.max_cost_per_run}"
             )
+        if (
+            self.webhook_dedup_ttl_seconds is not None
+            and self.webhook_dedup_ttl_seconds < 1
+        ):
+            raise ValueError(
+                "webhook_dedup_ttl_seconds must be >= 1 (or null to disable "
+                f"pruning), got {self.webhook_dedup_ttl_seconds}"
+            )
+        if self.webhook_replay_max_age_seconds is not None:
+            if self.webhook_replay_max_age_seconds < 1:
+                raise ValueError(
+                    "webhook_replay_max_age_seconds must be >= 1 (or null to "
+                    f"disable), got {self.webhook_replay_max_age_seconds}"
+                )
+            if (
+                self.webhook_dedup_ttl_seconds is not None
+                and self.webhook_replay_max_age_seconds
+                > self.webhook_dedup_ttl_seconds
+            ):
+                raise ValueError(
+                    "webhook_replay_max_age_seconds "
+                    f"({self.webhook_replay_max_age_seconds}) must not exceed "
+                    f"webhook_dedup_ttl_seconds ({self.webhook_dedup_ttl_seconds}): "
+                    "a delivery could otherwise age out of the dedup table "
+                    "while still inside the replay window"
+                )
+        if self.estimated_cost_per_dispatch < 0:
+            raise ValueError(
+                "estimated_cost_per_dispatch must be >= 0, got "
+                f"{self.estimated_cost_per_dispatch}"
+            )
         if self.risk_provider not in ("heuristic", "llm"):
             raise ValueError(
                 f"risk_provider must be 'heuristic' or 'llm', got {self.risk_provider!r}"
+            )
+        if self.planner_provider not in ("template", "llm"):
+            raise ValueError(
+                "planner_provider must be 'template' or 'llm', got "
+                f"{self.planner_provider!r}"
             )
         if self.context_provider not in ("static", "catalog", "code"):
             raise ValueError(
@@ -235,6 +352,24 @@ class Settings:
         if not (0 <= self.memory_confidence_cap <= 100):
             raise ValueError(
                 f"memory_confidence_cap must be 0-100, got {self.memory_confidence_cap}"
+            )
+        for mapping in self.compliance_control_mappings:
+            unknown_sections = set(mapping.evidence) - KNOWN_EVIDENCE_SECTIONS
+            if unknown_sections:
+                raise ValueError(
+                    f"compliance control {mapping.control_id!r} references unknown "
+                    f"evidence section(s): {sorted(unknown_sections)}; valid sections "
+                    f"are {sorted(KNOWN_EVIDENCE_SECTIONS)}"
+                )
+        if self.rate_limit_webhook_per_minute < 1:
+            raise ValueError(
+                "rate_limit_webhook_per_minute must be >= 1, got "
+                f"{self.rate_limit_webhook_per_minute} (use rate_limit_enabled: false to disable)"
+            )
+        if self.rate_limit_api_per_minute < 1:
+            raise ValueError(
+                "rate_limit_api_per_minute must be >= 1, got "
+                f"{self.rate_limit_api_per_minute} (use rate_limit_enabled: false to disable)"
             )
 
     @classmethod
@@ -290,6 +425,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "model" in risk:
         out["risk_model"] = risk["model"]
 
+    planner = data.get("planner", {}) or {}
+    if "provider" in planner:
+        out["planner_provider"] = planner["provider"]
+    if "model" in planner:
+        out["planner_model"] = planner["model"]
+
     agent = data.get("agent", {}) or {}
     if "provider" in agent:
         out["agent_provider"] = agent["provider"]
@@ -301,8 +442,14 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["tracker_provider"] = tracker["provider"]
     if "jira_base_url" in tracker:
         out["jira_base_url"] = tracker["jira_base_url"]
+    if "jira_allow_query_token" in tracker:
+        out["jira_allow_query_token"] = bool(tracker["jira_allow_query_token"])
 
     policy = data.get("policy", {}) or {}
+    if "provider" in policy:
+        out["policy_provider"] = policy["provider"]
+    if "opa_url" in policy:
+        out["policy_opa_url"] = policy["opa_url"]
     if "repo_confidence_threshold" in policy:
         out["repo_confidence_threshold"] = int(policy["repo_confidence_threshold"])
     if "max_files_changed" in policy:
@@ -325,6 +472,20 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "max_cost_per_run" in budget:
         raw_cap = budget["max_cost_per_run"]
         out["max_cost_per_run"] = None if raw_cap is None else float(raw_cap)
+    if "estimated_cost_per_dispatch" in budget:
+        out["estimated_cost_per_dispatch"] = float(
+            budget["estimated_cost_per_dispatch"]
+        )
+
+    webhook = data.get("webhook", {}) or {}
+    if "dedup_ttl_seconds" in webhook:
+        raw_ttl = webhook["dedup_ttl_seconds"]
+        out["webhook_dedup_ttl_seconds"] = None if raw_ttl is None else int(raw_ttl)
+    if "replay_max_age_seconds" in webhook:
+        raw_age = webhook["replay_max_age_seconds"]
+        out["webhook_replay_max_age_seconds"] = (
+            None if raw_age is None else int(raw_age)
+        )
 
     triggers = data.get("triggers", {}) or {}
     if "label" in triggers:
@@ -344,6 +505,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
             (email, ()) for email in approval["authorised_approvers"]
         )
 
+    compliance = data.get("compliance", {}) or {}
+    if "control_mappings" in compliance:
+        out["compliance_control_mappings"] = mappings_from_config(
+            compliance["control_mappings"]
+        )
+
     memory = data.get("memory", {}) or {}
     if "priors_enabled" in memory:
         out["memory_priors_enabled"] = _bool(memory["priors_enabled"], default=True)
@@ -351,6 +518,14 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["memory_min_samples"] = int(memory["min_samples"])
     if "confidence_cap" in memory:
         out["memory_confidence_cap"] = int(memory["confidence_cap"])
+
+    rate_limit = data.get("rate_limit", {}) or {}
+    if "enabled" in rate_limit:
+        out["rate_limit_enabled"] = _bool(rate_limit["enabled"], default=True)
+    if "webhook_per_minute" in rate_limit:
+        out["rate_limit_webhook_per_minute"] = int(rate_limit["webhook_per_minute"])
+    if "api_per_minute" in rate_limit:
+        out["rate_limit_api_per_minute"] = int(rate_limit["api_per_minute"])
 
     notifications = data.get("notifications", {}) or {}
     if "slack_channel" in notifications:
@@ -412,14 +587,26 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_OPENAI_MODEL": "openai_model",
         "FOUNDRY_RISK_PROVIDER": "risk_provider",
         "FOUNDRY_RISK_MODEL": "risk_model",
+        "FOUNDRY_PLANNER_PROVIDER": "planner_provider",
+        "FOUNDRY_PLANNER_MODEL": "planner_model",
         "TEMPORAL_ADDRESS": "temporal_address",
         "FOUNDRY_TASK_QUEUE": "task_queue",
         "FOUNDRY_CONTEXT_PROVIDER": "context_provider",
         "FOUNDRY_CONTEXT_ORG": "context_org",
+        "FOUNDRY_POLICY_PROVIDER": "policy_provider",
+        "FOUNDRY_POLICY_OPA_URL": "policy_opa_url",
     }
     for env_key, field_name in mapping.items():
         if env_key in env:
             out[field_name] = env[env_key]
     if "FOUNDRY_USE_OPENAI_ANALYZER" in env:
         out["use_openai_analyzer"] = _bool(env["FOUNDRY_USE_OPENAI_ANALYZER"])
+    if "FOUNDRY_RATE_LIMIT_ENABLED" in env:
+        out["rate_limit_enabled"] = _bool(env["FOUNDRY_RATE_LIMIT_ENABLED"])
+    if "FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE" in env:
+        out["rate_limit_webhook_per_minute"] = int(
+            env["FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE"]
+        )
+    if "FOUNDRY_RATE_LIMIT_API_PER_MINUTE" in env:
+        out["rate_limit_api_per_minute"] = int(env["FOUNDRY_RATE_LIMIT_API_PER_MINUTE"])
     return out

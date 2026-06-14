@@ -20,6 +20,7 @@ from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.schemas.common import ApprovalRole
 from foundry.schemas.pr import PullRequestState
 from foundry.schemas.ticket import RawTicket
+from foundry.workflows.decisions import WaitPhase
 
 
 class FoundryActivities:
@@ -33,11 +34,22 @@ class FoundryActivities:
     @activity.defn
     def intake_and_plan(self, params: dict[str, Any]) -> dict[str, Any]:
         ticket = RawTicket.model_validate(params["ticket"])
-        run_id = self._orch.intake_and_plan(
-            ticket,
-            trigger_type=params.get("trigger_type", "unknown"),
-            created_by=params.get("created_by"),
-        )
+        try:
+            run_id = self._orch.intake_and_plan(
+                ticket,
+                trigger_type=params.get("trigger_type", "unknown"),
+                created_by=params.get("created_by"),
+            )
+        except OrchestratorError:
+            # Idempotent under Temporal's at-least-once retries: a prior attempt
+            # of *this* activity already created the run, then timed out before
+            # returning. Re-running intake would raise "already has an active
+            # run" and fail the workflow despite a healthy run existing - so
+            # attach to that run instead of creating a duplicate.
+            existing = self._orch.find_active_run_id_for_issue(ticket.issue_id)
+            if existing is None:
+                raise
+            run_id = existing
         return {"run_id": run_id, "status": self._status(run_id)}
 
     @activity.defn
@@ -72,6 +84,22 @@ class FoundryActivities:
         status = self._orch.record_pr(params["run_id"], pr_state)
         return {"run_id": params["run_id"], "status": status.value}
 
+    @activity.defn
+    def expire(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Cleanly terminate a run whose durable wait window elapsed.
+
+        ``phase`` is ``"approval"`` (no decision arrived) or ``"pr"`` (the agent
+        produced no PR). Idempotent: a run that has since moved on is untouched.
+        """
+        phase = params["phase"]
+        if phase == WaitPhase.APPROVAL.value:
+            status = self._orch.expire_pending_approval(params["run_id"])
+        elif phase == WaitPhase.PR.value:
+            status = self._orch.expire_pending_pr(params["run_id"])
+        else:
+            raise ValueError(f"unknown wait phase '{phase}'")
+        return {"run_id": params["run_id"], "status": status.value}
+
     def all(self) -> list:
         """Convenience: the bound activity callables to register with the worker."""
         return [
@@ -81,4 +109,5 @@ class FoundryActivities:
             self.reject,
             self.stop,
             self.record_pr,
+            self.expire,
         ]

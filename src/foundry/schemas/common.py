@@ -129,6 +129,18 @@ ACTIVE_RUN_STATUSES = frozenset(
     }
 )
 
+# Run states in which PR webhook events are meaningful for the run: an agent is
+# dispatched and the diff/CI guardrails are still being re-evaluated on every
+# push. The orchestrator and the durable Temporal driver share this set so the
+# "keep observing the PR" loop can never drift from ``record_pr``'s own guard.
+PR_OBSERVABLE_STATUSES = frozenset(
+    {
+        RunStatus.AGENT_RUNNING,
+        RunStatus.PR_OPEN,
+        RunStatus.REVIEW_REQUIRED,
+    }
+)
+
 # Run states that are finished. A run in one of these states never re-enters an
 # active state (a fresh trigger starts a *new* run), which is what makes a
 # single recorded outcome per run sound.

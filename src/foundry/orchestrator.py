@@ -69,12 +69,14 @@ from foundry.policy.engine import (
     PolicyRetry,
     PolicyRisk,
     PolicyTicket,
+    required_approvals,
 )
 from foundry.schemas.agent import CodingAgentJob, CodingAgentJobInput, JobConstraints
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.memory.outcomes import record_outcome
 from foundry.schemas.common import (
     ACTIVE_RUN_STATUSES,
+    PR_OBSERVABLE_STATUSES,
     AgentMode,
     ApprovalRole,
     CIStatus,
@@ -103,10 +105,9 @@ _ARTIFACT_MODELS: dict[ArtifactType, type] = {
 
 _log = logging.getLogger(__name__)
 
-# Run states in which PR webhook events are meaningful for the run.
-_PR_OBSERVABLE_STATUSES = frozenset(
-    {RunStatus.AGENT_RUNNING, RunStatus.PR_OPEN, RunStatus.REVIEW_REQUIRED}
-)
+# Run states in which PR webhook events are meaningful for the run. Defined once
+# in schemas/common.py so the orchestrator and the durable workflow share it.
+_PR_OBSERVABLE_STATUSES = PR_OBSERVABLE_STATUSES
 
 # Status transitions worth pinging a chat surface about: parked, blocked, PR
 # open, merged (and the failure terminals, which an approver wants to hear about
@@ -151,6 +152,7 @@ class FoundryOrchestrator:
         max_agent_retries: int = 2,
         retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
         max_cost_per_run: float | None = None,
+        estimated_cost_per_dispatch: float = 0.0,
     ) -> None:
         self._sf = session_factory
         self._analyzer = analyzer or HeuristicAnalyzer()
@@ -184,6 +186,7 @@ class FoundryOrchestrator:
         self._max_agent_retries = max_agent_retries
         self._retry_on = frozenset(retry_on)
         self._max_cost_per_run = max_cost_per_run
+        self._estimated_cost_per_dispatch = estimated_cost_per_dispatch
 
     # -- intake + planning ----------------------------------------------------
 
@@ -213,7 +216,21 @@ class FoundryOrchestrator:
         payload = self._policy_input(PolicyAction.START_AGENT, analysis, context, risk)
         decision = self._policy.evaluate(payload)
 
-        status = self._post_plan_status(analysis, risk, decision.allowed)
+        # Distinguish "denied, but a human approval would unlock dispatch" from
+        # "denied no matter who approves" (e.g. DB migrations / prod deploys are
+        # blocked in this version regardless of approvals). Only the latter should
+        # park at BLOCKED; the former is the normal road to WAITING_APPROVAL. We
+        # learn which by re-running the gate with every required approval granted.
+        permanently_blocked = False
+        if not decision.allowed:
+            with_approvals = payload.model_copy(
+                update={
+                    "approval": {role.value: True for role in decision.required_approvals}
+                }
+            )
+            permanently_blocked = not self._policy.evaluate(with_approvals).allowed
+
+        status = self._post_plan_status(analysis, risk, permanently_blocked)
 
         try:
             with self._sf() as session:
@@ -274,14 +291,29 @@ class FoundryOrchestrator:
                         )
                     )
                 elif status is RunStatus.BLOCKED:
-                    session.add(
-                        build_audit_event(
-                            run_id=run_id,
-                            event_type=AuditEventType.RUN_BLOCKED,
-                            actor_type="foundry",
-                            metadata={"category": "unroutable"},
+                    # Two routes to BLOCKED at intake: the work couldn't be scoped
+                    # to a repo (unroutable), or the policy gate denies it no matter
+                    # who approves (policy_denied). Record the decision in the latter
+                    # case so the trail shows *why* approval was never offered.
+                    if risk.overall_risk is OverallRisk.BLOCKED:
+                        session.add(
+                            build_audit_event(
+                                run_id=run_id,
+                                event_type=AuditEventType.RUN_BLOCKED,
+                                actor_type="foundry",
+                                metadata={"category": "unroutable"},
+                            )
                         )
-                    )
+                    else:
+                        session.add(
+                            build_audit_event(
+                                run_id=run_id,
+                                event_type=AuditEventType.RUN_BLOCKED,
+                                actor_type="foundry",
+                                output_content=decision,
+                                metadata={"category": "policy_denied"},
+                            )
+                        )
                 self._record_outcome_if_terminal(session, run)
                 session.commit()
         except IntegrityError:
@@ -390,7 +422,9 @@ class FoundryOrchestrator:
 
     @staticmethod
     def _post_plan_status(
-        analysis: TicketAnalysis, risk: RiskAssessment, policy_allowed: bool
+        analysis: TicketAnalysis,
+        risk: RiskAssessment,
+        policy_permanently_blocked: bool,
     ) -> RunStatus:
         # Readiness first: an unclear ticket should be clarified before we worry
         # about anything downstream (it usually also lacks a resolvable repo).
@@ -398,6 +432,11 @@ class FoundryOrchestrator:
             return RunStatus.NEEDS_CLARIFICATION
         # The ticket is clear, but the work still can't be scoped to a repo.
         if risk.overall_risk is OverallRisk.BLOCKED:
+            return RunStatus.BLOCKED
+        # The plan is ready and scoped, but the policy gate will refuse dispatch
+        # no matter who approves it. Park at BLOCKED rather than inviting an
+        # approval that dispatch would only convert to BLOCKED anyway.
+        if policy_permanently_blocked:
             return RunStatus.BLOCKED
         # A ready, scoped plan awaits human approval before any agent runs.
         return RunStatus.WAITING_APPROVAL
@@ -413,6 +452,26 @@ class FoundryOrchestrator:
             if run.status is not RunStatus.WAITING_APPROVAL:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}', not awaiting approval"
+                )
+            # Pre-validate the approver's roles against what this run's risk
+            # actually requires. Recording an approval the policy gate will only
+            # refuse at dispatch writes a *void* APPROVAL_GRANTED into the audit
+            # trail and shows tracker users an approve->blocked whiplash (issue
+            # #18). Refuse up front, before anything is written, so the timeline
+            # never shows an approval for work that was actually denied.
+            risk = self._load(session, run_id, ArtifactType.RISK_ASSESSMENT)
+            required = required_approvals(
+                PolicyRisk(
+                    overall_risk=risk.overall_risk,
+                    **risk.sensitive_areas.model_dump(),
+                )
+            )
+            missing = [role for role in required if role not in granted_roles]
+            if missing:
+                raise OrchestratorError(
+                    f"approval refused: '{user}' lacks the required role(s) "
+                    f"({', '.join(role.value for role in missing)}) for this run; "
+                    f"required: {', '.join(role.value for role in required)}"
                 )
             approval_record = {
                 "user": user,
@@ -490,6 +549,77 @@ class FoundryOrchestrator:
             self._record_outcome_if_terminal(session, run)
             session.commit()
         self._notify_state(issue_id, status)
+
+    def expire_pending_approval(self, run_id: str) -> RunStatus:
+        """Terminate a run whose approval window elapsed without a decision.
+
+        Called by the durable Temporal driver when ``wait_condition`` for the
+        approval signal times out: instead of letting the workflow fail and
+        strand the run at ``WAITING_APPROVAL`` with no audit row, transition it
+        cleanly to ``BLOCKED`` with a ``run.blocked`` event tagged
+        ``approval_window_expired``. Idempotent — a run that has since been
+        approved/rejected (the signal raced the timeout, or the activity is
+        being retried) is left untouched and its current status returned.
+        """
+        return self._expire_wait(
+            run_id,
+            expected=RunStatus.WAITING_APPROVAL,
+            status=RunStatus.BLOCKED,
+            event_type=AuditEventType.RUN_BLOCKED,
+            category="approval_window_expired",
+        )
+
+    def expire_pending_pr(self, run_id: str) -> RunStatus:
+        """Terminate a dispatched run whose PR never arrived in the wait window.
+
+        The durable counterpart to a silently-stranded ``AGENT_RUNNING`` run:
+        the agent was dispatched but produced no PR within the workflow's PR
+        window, so the run failed to deliver. Transition to ``EXECUTION_FAILED``
+        with an ``agent.failed`` event (consistent with a provider that raises)
+        and cancel any in-flight job so it stops spending. Idempotent — a run
+        that has since opened a PR (or already terminated) is left untouched.
+        """
+        return self._expire_wait(
+            run_id,
+            expected=RunStatus.AGENT_RUNNING,
+            status=RunStatus.EXECUTION_FAILED,
+            event_type=AuditEventType.AGENT_FAILED,
+            category="pr_window_expired",
+        )
+
+    def _expire_wait(
+        self,
+        run_id: str,
+        *,
+        expected: RunStatus,
+        status: RunStatus,
+        event_type: AuditEventType,
+        category: str,
+    ) -> RunStatus:
+        with self._sf() as session:
+            run = self._require_run(session, run_id, lock=True)
+            if run.status is not expected:
+                # The awaited signal won the race, or this expiry is a retry:
+                # nothing to do, never overwrite a run that already moved on.
+                return run.status
+            run.status = status
+            run.current_step = status.value
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=event_type,
+                    actor_type="foundry",
+                    metadata={"category": category},
+                )
+            )
+            # A dispatched-but-undelivered run may still have a job spending;
+            # cancel it best-effort exactly as a human stop would.
+            self._cancel_active_job(session, run_id, user="foundry")
+            issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
+            session.commit()
+        self._notify_state(issue_id, status)
+        return status
 
     def _cancel_active_job(self, session, run_id: str, *, user: str) -> None:
         """Cancel the run's in-flight provider job when a human ends the run.
@@ -599,13 +729,22 @@ class FoundryOrchestrator:
             return run.id if run else None
 
     def find_run_id_for_branch(self, branch: str) -> str | None:
-        """Associate an observed PR back to its run via the agent job's branch."""
+        """Associate an observed PR back to its run via the agent job's branch.
+
+        Only runs in a PR-observable state match, mirroring the issue-key
+        fallback in :meth:`correlate_pr`: a stale or terminal run that once used
+        this branch must not be revived by a late webhook (``record_pr`` would
+        reject it anyway, but filtering here keeps the contract honest and lets
+        the issue-key fallback still find a live run on the same branch name).
+        """
         if not branch:
             return None
         with self._sf() as session:
             job = (
                 session.query(FoundryAgentJob)
+                .join(FoundryRun, FoundryRun.id == FoundryAgentJob.run_id)
                 .filter(FoundryAgentJob.branch == branch)
+                .filter(FoundryRun.status.in_(_PR_OBSERVABLE_STATUSES))
                 .order_by(FoundryAgentJob.started_at.desc())
                 .first()
             )
@@ -683,8 +822,22 @@ class FoundryOrchestrator:
             approval = self._load_raw(session, run_id, ArtifactType.APPROVAL_RECORD)
 
             granted = set(approval.get("granted_roles", [])) if approval else set()
+            # Enforce the budget cap at first dispatch too (issue #29): no job
+            # has spent yet, so the projected cost is just this dispatch's
+            # estimate - enough to refuse a run whose single attempt already
+            # exceeds the cap.
+            self._refresh_job_costs(session, run_id)
             payload = self._policy_input(
-                PolicyAction.START_AGENT, analysis, context, risk, approvals=granted
+                PolicyAction.START_AGENT,
+                analysis,
+                context,
+                risk,
+                approvals=granted,
+                budget=PolicyBudget(
+                    cost_usd=self._accumulated_cost(session, run_id),
+                    pending_cost_usd=self._estimated_cost_per_dispatch,
+                    max_cost_usd=self._max_cost_per_run,
+                ),
             )
             decision = self._policy.evaluate(payload)
             session.add(
@@ -889,7 +1042,20 @@ class FoundryOrchestrator:
                     f"run {run_id} is '{run.status.value}'; PR events are only "
                     "recorded for runs with a dispatched agent"
                 )
-            first_observation = run.status is RunStatus.AGENT_RUNNING
+            # The first time we ever see a PR for this run emits PR_OPENED; every
+            # later event (including pushes during remediation, when the status is
+            # AGENT_RUNNING again) emits PR_UPDATED. Keying off the status alone
+            # mis-fired PR_OPENED on each remediation push, so key off whether a
+            # PR_STATE artifact already exists.
+            first_observation = (
+                session.query(FoundryArtifact.id)
+                .filter(
+                    FoundryArtifact.run_id == run_id,
+                    FoundryArtifact.artifact_type == ArtifactType.PR_STATE,
+                )
+                .first()
+                is None
+            )
             self._add(session, run_id, ArtifactType.PR_STATE, pr_state)
             session.add(
                 build_audit_event(
@@ -995,12 +1161,12 @@ class FoundryOrchestrator:
             attempt = prior_jobs  # attempt N = N-th re-dispatch
 
             # Refresh provider-reported spend before the budget check so the
-            # decision is made on the freshest numbers we can get.
+            # decision is made on the freshest numbers we can get. Jobs whose
+            # provider reports no cost fall back to the per-dispatch estimate
+            # (issue #29), and the upcoming retry counts as pending spend so the
+            # gate blocks *before* overspending, not after.
             self._refresh_job_costs(session, run_id)
-            run_cost = sum(
-                job.cost_usd or 0.0
-                for job in session.query(FoundryAgentJob).filter_by(run_id=run_id)
-            )
+            run_cost = self._accumulated_cost(session, run_id)
 
             payload = self._policy_input(
                 PolicyAction.RETRY_AGENT,
@@ -1012,7 +1178,9 @@ class FoundryOrchestrator:
                     attempt=attempt, max_attempts=self._max_agent_retries
                 ),
                 budget=PolicyBudget(
-                    cost_usd=run_cost, max_cost_usd=self._max_cost_per_run
+                    cost_usd=run_cost,
+                    pending_cost_usd=self._estimated_cost_per_dispatch,
+                    max_cost_usd=self._max_cost_per_run,
                 ),
             )
             decision = self._policy.evaluate(payload)
@@ -1167,6 +1335,40 @@ class FoundryOrchestrator:
                 continue
             if status.cost_usd is not None:
                 job.cost_usd = status.cost_usd
+
+    def _accumulated_cost(self, session, run_id: str) -> float:
+        """Spend recorded across a run's jobs so far.
+
+        Provider-reported ``cost_usd`` is authoritative; for any job whose
+        provider reported nothing (``claude_code`` / ``webhook`` / ``manual``)
+        the configured ``estimated_cost_per_dispatch`` stands in as a proxy so
+        the budget cap can still bind. With the estimate at 0 (the default) an
+        unreported job contributes nothing, preserving prior behaviour.
+        """
+        total = 0.0
+        for job in session.query(FoundryAgentJob).filter_by(run_id=run_id):
+            total += (
+                job.cost_usd
+                if job.cost_usd is not None
+                else self._estimated_cost_per_dispatch
+            )
+        return total
+
+    def budget_snapshot(self, run_id: str) -> dict[str, float | None]:
+        """Recorded spend vs the configured cap, for the timeline / dashboard.
+
+        Read-only: never calls the provider (no network), so it is safe on the
+        token-gated timeline endpoint. ``consumed_usd`` uses the same
+        estimate-fallback as the budget gate so the surfaced number matches the
+        figure the gate would compare against.
+        """
+        with self._sf() as session:
+            consumed = self._accumulated_cost(session, run_id)
+        return {
+            "consumed_usd": round(consumed, 4),
+            "cap_usd": self._max_cost_per_run,
+            "estimated_cost_per_dispatch": self._estimated_cost_per_dispatch,
+        }
 
     @staticmethod
     def _remediation_instructions(reason: str, pr_state: PullRequestState) -> str:

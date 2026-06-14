@@ -87,11 +87,11 @@ def main() -> None:
 
 def _session_factory():
     from foundry.config import Settings
-    from foundry.db.base import create_all, make_engine, make_session_factory
+    from foundry.db.base import init_schema, make_engine, make_session_factory
 
     settings = Settings.load(os.environ.get("FOUNDRY_CONFIG"), env=os.environ)
     engine = make_engine(settings.database_url)
-    create_all(engine)
+    init_schema(engine)
     return settings, make_session_factory(engine)
 
 

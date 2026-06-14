@@ -95,6 +95,34 @@ def test_analysis_is_deterministic() -> None:
     assert a == b
 
 
+def test_ac_heading_requires_word_boundary() -> None:
+    # "ac:" must not match inside "Mac:"/"Tarmac:" and open a phantom
+    # acceptance-criteria section that flips readiness to READY.
+    ticket = RawTicket(
+        issue_id="i",
+        issue_key="LIN-AC",
+        title="Repave the apron",
+        description="Tarmac: needs repaving\n- lay new asphalt\n",
+    )
+    analysis = HeuristicAnalyzer().analyse(ticket)
+    assert analysis.acceptance_criteria == []
+    assert "acceptance criteria" in analysis.missing_information
+    assert analysis.is_ready_to_build is False
+
+
+def test_ac_abbreviation_heading_still_detected() -> None:
+    # The legitimate "AC:" abbreviation must still open the section.
+    ticket = RawTicket(
+        issue_id="i",
+        issue_key="LIN-AC2",
+        title="Add favourites",
+        description="AC:\n- it works\n- it persists\n",
+        known_repositories=["customer-web"],
+    )
+    analysis = HeuristicAnalyzer().analyse(ticket)
+    assert analysis.acceptance_criteria == ["it works", "it persists"]
+
+
 # -- enrichment ---------------------------------------------------------------
 
 
@@ -125,6 +153,32 @@ def test_catalog_keyword_match() -> None:
     enricher = StaticContextEnricher(repo_catalog={"customer-web": ["favourites"]})
     context = enricher.enrich(ticket, analysis)
     assert any(c.repo == "customer-web" for c in context.candidate_repositories)
+
+
+def test_explicit_association_outranks_heavy_keyword_match() -> None:
+    # A pile of coincidental keyword hits is capped below the explicit-association
+    # tier (90), so an explicitly-associated repo always wins the routing.
+    ticket = RawTicket(
+        issue_id="i",
+        issue_key="LIN-OUT",
+        title="favourites wishlist basket",
+        description=(
+            "Acceptance Criteria:\n"
+            "- favourites wishlist basket cart checkout all work together\n"
+        ),
+        known_repositories=["explicit-repo"],
+    )
+    analysis = HeuristicAnalyzer().analyse(ticket)
+    enricher = StaticContextEnricher(
+        repo_catalog={
+            "keyword-repo": ["favourites", "wishlist", "basket", "cart", "checkout"],
+        }
+    )
+    context = enricher.enrich(ticket, analysis)
+    by_repo = {c.repo: c.confidence for c in context.candidate_repositories}
+    assert by_repo["explicit-repo"] == 90
+    assert by_repo["keyword-repo"] <= 89
+    assert context.best_repository.repo == "explicit-repo"
 
 
 def test_linked_pr_surfaces_related_pr() -> None:

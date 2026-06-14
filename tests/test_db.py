@@ -10,6 +10,7 @@ from foundry.db import (
     AuditEventType,
     FoundryRun,
     create_all,
+    init_schema,
     make_engine,
     make_session_factory,
 )
@@ -24,6 +25,35 @@ def session():
     factory = make_session_factory(engine)
     with factory() as s:
         yield s
+
+
+def test_init_schema_creates_tables_on_sqlite() -> None:
+    """SQLite dev/test DBs have no migration step, so init_schema bootstraps them."""
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    init_schema(engine)
+    factory = make_session_factory(engine)
+    with factory() as s:
+        # Querying a mapped table only succeeds if the schema was created.
+        assert s.query(FoundryRun).count() == 0
+
+
+def test_init_schema_skips_non_sqlite(monkeypatch) -> None:
+    """On Postgres, Alembic is the single schema owner; init_schema must not
+    run create_all (that would create tables without stamping alembic_version,
+    stranding a later `alembic upgrade head`)."""
+    calls = []
+    monkeypatch.setattr(
+        "foundry.db.base.create_all", lambda engine: calls.append(engine)
+    )
+
+    class _FakeDialect:
+        name = "postgresql"
+
+    class _FakeEngine:
+        dialect = _FakeDialect()
+
+    init_schema(_FakeEngine())
+    assert calls == []
 
 
 def test_run_persists_with_artifacts_and_events(

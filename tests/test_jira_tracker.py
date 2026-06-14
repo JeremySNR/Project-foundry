@@ -180,8 +180,41 @@ def test_labeled_issue_starts_run(client) -> None:
     assert run["created_by"] == "priya@example.com"
 
 
-def test_token_via_query_param_accepted(client) -> None:
+def test_token_via_query_param_rejected_by_default(client) -> None:
+    # The Jira token is an approver-level credential and query-string secrets
+    # leak into access logs/proxies; header-only is the default posture.
     resp = post_jira(client, load("jira_issue_labeled.json"), via_query=True)
+    assert resp.status_code == 401
+    assert client.get("/runs").json()["runs"] == []
+
+
+def _query_token_client() -> TestClient:
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+    orch = FoundryOrchestrator(sf, provider=InMemoryFakeProvider())
+    return TestClient(
+        create_app(
+            webhook_secret="linear-secret-unused-here",
+            session_factory=sf,
+            orchestrator=orch,
+            approvers={"lead@example.com": ["engineering"]},
+            jira_webhook_secret=SECRET,
+            jira_allow_query_token=True,
+        )
+    )
+
+
+def test_token_via_query_param_accepted_when_opted_in() -> None:
+    client = _query_token_client()
+    resp = post_jira(client, load("jira_issue_labeled.json"), via_query=True)
+    assert resp.json()["status"] == "started"
+
+
+def test_header_token_still_works_when_query_opted_in() -> None:
+    # Opting into query delivery does not disable the header path.
+    client = _query_token_client()
+    resp = post_jira(client, load("jira_issue_labeled.json"))
     assert resp.json()["status"] == "started"
 
 
