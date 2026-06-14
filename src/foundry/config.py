@@ -94,6 +94,16 @@ class Settings:
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
+    # --- API rate limiting (behaviour: yaml; operational env overrides) ---
+    # Coarse per-client request caps on the network surfaces. Enabled by
+    # default with generous limits; set rate_limit_enabled: false to turn off.
+    # Two buckets so a flood on one surface can't starve the other:
+    # webhooks (provider deliveries can be bursty) and the API (human/automation).
+    # Per-process, fixed-window; see api/ratelimit.py for the scope caveats.
+    rate_limit_enabled: bool = True
+    rate_limit_webhook_per_minute: int = 120
+    rate_limit_api_per_minute: int = 60
+
     # --- issue tracker (behaviour: yaml) ---
     # "linear" (default), "github_issues" (the issue is the ticket; approvers
     # are then keyed by GitHub login instead of email), or "jira".
@@ -236,6 +246,16 @@ class Settings:
             raise ValueError(
                 f"memory_confidence_cap must be 0-100, got {self.memory_confidence_cap}"
             )
+        if self.rate_limit_webhook_per_minute < 1:
+            raise ValueError(
+                "rate_limit_webhook_per_minute must be >= 1, got "
+                f"{self.rate_limit_webhook_per_minute} (use rate_limit_enabled: false to disable)"
+            )
+        if self.rate_limit_api_per_minute < 1:
+            raise ValueError(
+                "rate_limit_api_per_minute must be >= 1, got "
+                f"{self.rate_limit_api_per_minute} (use rate_limit_enabled: false to disable)"
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -352,6 +372,14 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "confidence_cap" in memory:
         out["memory_confidence_cap"] = int(memory["confidence_cap"])
 
+    rate_limit = data.get("rate_limit", {}) or {}
+    if "enabled" in rate_limit:
+        out["rate_limit_enabled"] = _bool(rate_limit["enabled"], default=True)
+    if "webhook_per_minute" in rate_limit:
+        out["rate_limit_webhook_per_minute"] = int(rate_limit["webhook_per_minute"])
+    if "api_per_minute" in rate_limit:
+        out["rate_limit_api_per_minute"] = int(rate_limit["api_per_minute"])
+
     notifications = data.get("notifications", {}) or {}
     if "slack_channel" in notifications:
         out["slack_channel"] = notifications["slack_channel"]
@@ -422,4 +450,12 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
             out[field_name] = env[env_key]
     if "FOUNDRY_USE_OPENAI_ANALYZER" in env:
         out["use_openai_analyzer"] = _bool(env["FOUNDRY_USE_OPENAI_ANALYZER"])
+    if "FOUNDRY_RATE_LIMIT_ENABLED" in env:
+        out["rate_limit_enabled"] = _bool(env["FOUNDRY_RATE_LIMIT_ENABLED"])
+    if "FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE" in env:
+        out["rate_limit_webhook_per_minute"] = int(
+            env["FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE"]
+        )
+    if "FOUNDRY_RATE_LIMIT_API_PER_MINUTE" in env:
+        out["rate_limit_api_per_minute"] = int(env["FOUNDRY_RATE_LIMIT_API_PER_MINUTE"])
     return out
