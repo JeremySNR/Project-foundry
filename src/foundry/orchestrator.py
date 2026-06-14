@@ -845,6 +845,33 @@ class FoundryOrchestrator:
                 .all()
             )
 
+    def list_epics(self) -> list[FoundryRun]:
+        """Every epic *root* run, oldest first (issue #35).
+
+        An epic is a parent run that other runs point at via ``parent_run_id``;
+        an ordinary single-repo run (one with no children) is not an epic and is
+        omitted. Resolving children for the rollup is left to :meth:`child_runs`
+        / :func:`epics.compute_epic_rollup` so the lifecycle logic lives in one
+        place. Because epics are a single level (the orchestrator refuses to
+        nest), every referenced parent is itself a root.
+        """
+        with self._sf() as session:
+            parent_ids = [
+                pid
+                for (pid,) in session.query(FoundryRun.parent_run_id)
+                .filter(FoundryRun.parent_run_id.isnot(None))
+                .distinct()
+                .all()
+            ]
+            if not parent_ids:
+                return []
+            return list(
+                session.query(FoundryRun)
+                .filter(FoundryRun.id.in_(parent_ids))
+                .order_by(FoundryRun.created_at)
+                .all()
+            )
+
     def epic_root_id(self, run_id: str) -> str | None:
         """Resolve the epic root for ``run_id``: its parent if it is a child,
         else itself. ``None`` if the run does not exist.

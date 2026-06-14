@@ -3,13 +3,13 @@
 Read-only visibility over the audit data that already exists: a live fleet
 strip (runs in flight / approval queue / spend in flight, from the current run
 states), the delivery metrics strip, a delivery-trend-over-time table, the
-agent scorecards, the run list (with an approval-queue filter) and, per run,
-the full decision timeline (artifacts, audit events, policy decisions, agent
-jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
-``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
-``GET /metrics/agents`` and ``GET /runs/{id}/timeline``; the calls carry the
-bearer token the user pastes once (kept in localStorage, never sent anywhere
-but this API).
+agent scorecards, an epic board (multi-repo runs rolled up, issue #35), the run
+list (with an approval-queue filter) and, per run, the full decision timeline
+(artifacts, audit events, policy decisions, agent jobs). All data comes from
+``GET /runs``, ``GET /metrics/fleet``, ``GET /metrics/delivery``,
+``GET /metrics/delivery/trends``, ``GET /metrics/agents``, ``GET /epics`` and
+``GET /runs/{id}/timeline``; the calls carry the bearer token the user pastes
+once (kept in localStorage, never sent anywhere but this API).
 
 Served only when an API token is configured - same fail-closed posture as the
 approval endpoint.
@@ -91,7 +91,7 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #fleet, #metrics, #agents, #trends {
+  #fleet, #metrics, #agents, #trends, #epics {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
@@ -117,6 +117,15 @@ DASHBOARD_HTML = """<!doctype html>
     border-radius: 2px; vertical-align: middle; min-width: 1px;
   }
   #trends .bar.blocked { background: var(--red); }
+  #epics summary { color: var(--text); cursor: pointer; }
+  .epic { padding: 8px 0; border-bottom: 1px dashed var(--border); }
+  .epic:last-child { border-bottom: none; }
+  .epic-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px; }
+  .epic-head .key { font-weight: 600; cursor: pointer; }
+  .epic-head .key:hover { color: var(--accent); }
+  .epic-kids { margin: 6px 0 0 12px; display: flex; flex-wrap: wrap; gap: 10px; }
+  .epic-child { color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .epic-child:hover { color: var(--text); }
   .queue-filter {
     display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border);
     background: var(--panel); position: sticky; top: 0; z-index: 1;
@@ -141,6 +150,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
+<div id="epics"></div>
 <main>
   <div id="runs"></div>
   <div id="detail"><div class="empty">Select a run to see its full decision timeline.</div></div>
@@ -157,6 +167,12 @@ const STATUS_BADGE = {
   needs_clarification: "b-amber", approved: "b-blue", plan_ready: "b-blue",
   analysing: "b-muted", blocked: "b-red", rejected: "b-red",
   execution_failed: "b-red",
+};
+
+// Rolled-up epic status -> badge class (mirrors EpicStatus in epics.py).
+const EPIC_BADGE = {
+  complete: "b-green", in_progress: "b-purple", partial: "b-amber",
+  failed: "b-red", empty: "b-muted",
 };
 
 function authHeaders() {
@@ -467,12 +483,53 @@ async function loadTrends() {
   }
 }
 
+async function loadEpics() {
+  const el = $("#epics");
+  if (!localStorage.getItem("foundry_token")) {
+    el.style.display = "none";  // no token: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("epics", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const data = await resp.json();
+    const epics = data.epics || [];
+    if (!epics.length) { el.style.display = "none"; return; }  // no epics: hide
+    const rows = epics.map((e) => {
+      const r = e.run;
+      const ro = e.rollup || {};
+      const c = ro.counts || {};
+      const kids = (e.children || []).map((ch) => `
+        <span class="epic-child" data-id="${esc(ch.id)}" title="open timeline">
+          ${esc(ch.linear_issue_key)}${badge(ch.status)}</span>`).join("");
+      return `<div class="epic">
+        <div class="epic-head">
+          <span class="key" data-id="${esc(r.id)}" title="open timeline">${esc(r.linear_issue_key)}</span>
+          <span class="badge ${EPIC_BADGE[ro.status] || "b-muted"}">${esc(ro.status)}</span>
+          <span class="kv">${ro.total || 0} child runs &middot;
+            ${c.complete || 0} merged &middot; ${c.active || 0} in flight &middot;
+            ${c.unsuccessful || 0} unsuccessful</span>
+        </div>
+        <div class="epic-kids">${kids || '<span class="kv">no child runs yet</span>'}</div>
+      </div>`;
+    }).join("");
+    el.innerHTML = `<details open><summary>epics &mdash; multi-repo runs rolled up (${epics.length})</summary>${rows}</details>`;
+    el.style.display = "block";
+    el.querySelectorAll("[data-id]").forEach((node) => {
+      node.addEventListener("click", () => loadTimeline(node.dataset.id));
+    });
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 function refresh() {
   loadRuns();
   loadFleet();
   loadMetrics();
   loadTrends();
   loadAgents();
+  loadEpics();
 }
 
 $("#save").addEventListener("click", () => {
