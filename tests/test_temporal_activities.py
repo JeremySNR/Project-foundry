@@ -127,3 +127,22 @@ def test_expire_activity_unknown_phase_raises(activities: FoundryActivities) -> 
     run_id = activities.intake_and_plan(_ticket_params())["run_id"]
     with pytest.raises(ValueError):
         activities.expire({"run_id": run_id, "phase": "nonsense"})
+
+
+def test_fail_run_activity_marks_run_failed(activities: FoundryActivities) -> None:
+    # Compensation for an irrecoverable workflow error (issue #37): a dispatched
+    # run is auto-failed rather than stranded at agent_running.
+    run_id = activities.intake_and_plan(_ticket_params())["run_id"]
+    activities.approve({"run_id": run_id, "user": "lead@example.com", "roles": []})
+    activities.dispatch_agent(run_id)
+    result = activities.fail_run({"run_id": run_id, "reason": "boom"})
+    assert result["status"] == "execution_failed"
+
+
+def test_fail_run_activity_is_idempotent(activities: FoundryActivities) -> None:
+    # At-least-once delivery: a retried compensation on an already-terminal run
+    # is a no-op returning the surviving status, never an overwrite.
+    run_id = activities.intake_and_plan(_ticket_params())["run_id"]
+    activities.reject({"run_id": run_id, "user": "lead@example.com"})
+    result = activities.fail_run({"run_id": run_id})
+    assert result["status"] == "rejected"

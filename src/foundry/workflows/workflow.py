@@ -21,10 +21,14 @@ Retries & failure compensation (made explicit, issue #37):
 - Compensation for an elapsed *durable wait* is the audited ``expire`` activity:
   no approval -> ``BLOCKED``, no PR -> ``EXECUTION_FAILED``. A policy block at
   dispatch is reported cleanly (``BLOCKED``), never a crash.
-- An activity that exhausts its retries surfaces as a workflow failure and leaves
-  the run row in its last state for inspection / re-trigger - deliberate, not a
-  silent stop. (Auto-marking such a run failed via a compensation activity is a
-  noted follow-up on #37.)
+- An activity that exhausts its retries (a non-retryable deterministic error, or
+  ``maximum_attempts`` reached on a transient one) raises ``ActivityError``. The
+  workflow catches it and runs the ``fail_run`` compensation activity, which
+  marks the run ``EXECUTION_FAILED`` (audited, idempotent) and cancels any
+  in-flight job so it stops spending, *then re-raises* so the workflow itself
+  still surfaces as Failed for operators. Without this the run would strand in
+  its last active state (e.g. ``agent_running``) - active forever, never
+  recorded, distorting the fleet snapshot and routing priors.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from foundry.schemas.common import RunStatus
@@ -89,32 +94,58 @@ class TicketToPrWorkflow:
 
     @workflow.run
     async def run(self, params: dict[str, Any]) -> dict[str, Any]:
-        intake = await workflow.execute_activity_method(
-            FoundryActivities.intake_and_plan,
-            params,
-            **_opts(FoundryActivities.intake_and_plan),
+        try:
+            intake = await workflow.execute_activity_method(
+                FoundryActivities.intake_and_plan,
+                params,
+                **_opts(FoundryActivities.intake_and_plan),
+            )
+            self._run_id = intake["run_id"]
+            self._status = intake["status"]
+
+            phase = phase_after_intake(RunStatus(self._status))
+
+            if phase is Phase.AWAIT_APPROVAL:
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._decision is not None, timeout=_APPROVAL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    # The approval window closed with no decision: terminate
+                    # cleanly (audited) instead of failing the workflow and
+                    # stranding the run.
+                    await self._expire(WaitPhase.APPROVAL)
+                    return self._result()
+                phase = await self._handle_decision()
+
+            if phase is Phase.AWAIT_PR:
+                await self._observe_pr()
+
+            return self._result()
+        except ActivityError:
+            # An activity exhausted its retry budget: it will never succeed on
+            # its own. Compensate so the run row doesn't strand in its last
+            # active state - mark it failed (audited, idempotent) and cancel any
+            # in-flight job - then re-raise so the workflow still surfaces as
+            # Failed for operators. Skip compensation if intake itself failed
+            # before returning a run id (there is no run row to fail).
+            if self._run_id is not None:
+                await self._compensate()
+            raise
+
+    async def _compensate(self) -> None:
+        """Mark the run failed after an irrecoverable activity error (issue #37).
+
+        Runs as its own (retryable) activity so the terminal transition is
+        durable even if it was an earlier activity that crashed; idempotent, so a
+        run that already terminated is left untouched.
+        """
+        result = await workflow.execute_activity_method(
+            FoundryActivities.fail_run,
+            {"run_id": self._run_id, "reason": "workflow activity exhausted retries"},
+            **_opts(FoundryActivities.fail_run),
         )
-        self._run_id = intake["run_id"]
-        self._status = intake["status"]
-
-        phase = phase_after_intake(RunStatus(self._status))
-
-        if phase is Phase.AWAIT_APPROVAL:
-            try:
-                await workflow.wait_condition(
-                    lambda: self._decision is not None, timeout=_APPROVAL_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                # The approval window closed with no decision: terminate cleanly
-                # (audited) instead of failing the workflow and stranding the run.
-                await self._expire(WaitPhase.APPROVAL)
-                return self._result()
-            phase = await self._handle_decision()
-
-        if phase is Phase.AWAIT_PR:
-            await self._observe_pr()
-
-        return self._result()
+        self._status = result["status"]
 
     async def _handle_decision(self) -> Phase:
         decision = self._decision

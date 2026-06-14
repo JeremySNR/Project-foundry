@@ -100,6 +100,19 @@ class FoundryActivities:
             raise ValueError(f"unknown wait phase '{phase}'")
         return {"run_id": params["run_id"], "status": status.value}
 
+    @activity.defn
+    def fail_run(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Compensation: mark a run failed after an irrecoverable workflow error.
+
+        Called by the workflow when an activity exhausts its retry budget, so
+        the run row doesn't strand in its last active state (e.g.
+        ``agent_running``). Idempotent: a run that already terminated (a human
+        stop, a sticky forbidden-path block, or a delivered PR) is untouched and
+        its current status returned.
+        """
+        status = self._orch.fail_run(params["run_id"], reason=params.get("reason"))
+        return {"run_id": params["run_id"], "status": status.value}
+
     def all(self) -> list:
         """Convenience: the bound activity callables to register with the worker."""
         return [
@@ -110,4 +123,5 @@ class FoundryActivities:
             self.stop,
             self.record_pr,
             self.expire,
+            self.fail_run,
         ]
