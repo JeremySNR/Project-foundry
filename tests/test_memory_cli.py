@@ -136,3 +136,20 @@ def test_show_priors_empty_database(monkeypatch, capsys, db_url) -> None:
     create_all(engine)
     _run_cli(monkeypatch, db_url, "show-priors")
     assert "No routed outcomes" in capsys.readouterr().out
+
+
+def test_show_scorecards_prints_provider(monkeypatch, capsys, db_url) -> None:
+    _seed_merged_run(db_url, wipe_memory=False)
+    _run_cli(monkeypatch, db_url, "show-scorecards")
+    out = capsys.readouterr().out
+    # InMemoryFakeProvider dispatches as the "fake" provider.
+    assert "fake" in out
+    assert "1/1 merged" in out
+    assert "customer-web" in out
+
+
+def test_show_scorecards_empty_database(monkeypatch, capsys, db_url) -> None:
+    engine = make_engine(db_url)
+    create_all(engine)
+    _run_cli(monkeypatch, db_url, "show-scorecards")
+    assert "No dispatched outcomes" in capsys.readouterr().out

@@ -22,23 +22,17 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Full test suite
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: Install and test
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test,workflow]"
-          pytest -q
+  # Gate the release on the full CI suite (lint, offline tests, Postgres +
+  # migrations, Docker build + smoke, OPA policy tests) by reusing ci.yml
+  # rather than re-running a weaker pytest-only check. The release publishes
+  # with exactly the checks a branch push gets.
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
 
   image:
     name: Publish image to GHCR
-    needs: test
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read

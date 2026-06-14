@@ -155,6 +155,9 @@ def derive_outcome(session, run: FoundryRun) -> FoundryRunOutcome:
     )
     costs = [j.cost_usd for j in jobs if j.cost_usd is not None]
     repo = next((j.repo for j in reversed(jobs) if j.repo), None)
+    # The agent that shipped it: the latest dispatched job's provider. NULL when
+    # no agent ever ran (parked / rejected at intake), same as ``repo``.
+    provider = next((j.provider for j in reversed(jobs) if j.provider), None)
 
     event_counts = dict(
         session.query(FoundryAuditEvent.event_type, func.count(FoundryAuditEvent.id))
@@ -213,6 +216,7 @@ def derive_outcome(session, run: FoundryRun) -> FoundryRunOutcome:
         issue_key_prefix=issue_key_prefix(run.linear_issue_key),
         outcome=outcome,
         repo=repo,
+        provider=provider,
         routed_confidence=routed_confidence,
         work_type=analysis.get("work_type") if analysis else None,
         labels_json=json.dumps(snapshot.get("labels", []) if snapshot else []),
@@ -244,6 +248,7 @@ def _outcome_summary(row: FoundryRunOutcome) -> dict:
         "run_id": row.run_id,
         "outcome": row.outcome,
         "repo": row.repo,
+        "provider": row.provider,
         "routed_confidence": row.routed_confidence,
         "work_type": row.work_type,
         "issue_key_prefix": row.issue_key_prefix,

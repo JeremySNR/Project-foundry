@@ -4,11 +4,14 @@ Usage::
 
     foundry-memory backfill [--recompute]
     foundry-memory show-priors
+    foundry-memory show-scorecards
 
 ``backfill`` derives outcome rows for terminal runs that finished before the
 ``foundry_run_outcomes`` table existed (or that a fail-soft hook missed);
-``--recompute`` re-derives every terminal run from the audit trail. Settings
-come from ``FOUNDRY_CONFIG`` and the usual environment variable overrides.
+``--recompute`` re-derives every terminal run from the audit trail.
+``show-priors`` prints the mined routing priors; ``show-scorecards`` prints
+per-provider agent performance. Settings come from ``FOUNDRY_CONFIG`` and the
+usual environment variable overrides.
 """
 
 from __future__ import annotations
@@ -36,12 +39,17 @@ def main() -> None:
     )
 
     sub.add_parser("show-priors", help="Print the mined routing priors.")
+    sub.add_parser(
+        "show-scorecards", help="Print per-provider agent scorecards."
+    )
 
     args = parser.parse_args()
     if args.command == "backfill":
         _run_backfill(args)
     elif args.command == "show-priors":
         _run_show_priors()
+    elif args.command == "show-scorecards":
+        _run_show_scorecards()
 
 
 def _session_factory():
@@ -100,3 +108,39 @@ def _run_show_priors() -> None:
             f"{prefix:<8} {(work_type or '-'):<14} {repo:<40} "
             f"{f'{merged}/{routed}':<14} {conf}"
         )
+
+
+def _run_show_scorecards() -> None:
+    from foundry.memory.scorecards import agent_scorecards
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = agent_scorecards(session)
+    providers = report["providers"]
+    if not providers:
+        print(
+            "No dispatched outcomes recorded yet - "
+            "run 'foundry-memory backfill' first."
+        )
+        return
+
+    def _cost(stat: dict) -> str:
+        return "-" if stat["total_cost_usd"] is None else f"${stat['total_cost_usd']}"
+
+    for card in providers:
+        flag = "" if card["meets_min_samples"] else "  (below min samples)"
+        print(
+            f"\n{card['provider']}: {card['merged']}/{card['runs']} merged "
+            f"(conf {card['smoothed_success']}), {card['retries_consumed']} retries, "
+            f"{_cost(card)} spend{flag}"
+        )
+        for wt in card["by_work_type"]:
+            print(
+                f"    {(wt['work_type'] or '-'):<16} "
+                f"{wt['merged']}/{wt['runs']} merged  conf {wt['smoothed_success']}"
+            )
+        for repo in card["by_repo"]:
+            print(
+                f"    @ {(repo['repo'] or '-'):<38} "
+                f"{repo['merged']}/{repo['runs']} merged  conf {repo['smoothed_success']}"
+            )

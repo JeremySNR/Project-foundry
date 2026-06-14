@@ -16,7 +16,7 @@ from foundry.db import (
     make_engine,
     make_session_factory,
 )
-from foundry.db.models import ArtifactType, FoundryRunOutcome
+from foundry.db.models import AgentJobStatus, ArtifactType, FoundryRunOutcome
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.schemas.common import (
     ApprovalRole,
@@ -966,3 +966,298 @@ def test_reject_before_dispatch_records_no_cancellation(session_factory) -> None
     orch.reject(run_id, user="lead@example.com")
     assert _status(session_factory, run_id) is RunStatus.REJECTED
     assert _cancellation_events(session_factory, run_id) == []
+
+
+# -- audit integrity on provider dispatch failure (issue #13) -------------------
+
+
+class _RaisingProvider(InMemoryFakeProvider):
+    """Fake provider whose dispatch raises, like a real provider's HTTP call
+    timing out or the secret-leak guard tripping."""
+
+    name = "raising"
+
+    def _dispatch(self, job_input):  # type: ignore[override]
+        raise RuntimeError("provider API unreachable")
+
+
+def _events_of_type(session_factory, run_id, event_type):
+    from foundry.db.models import FoundryAuditEvent
+
+    with session_factory() as s:
+        return [
+            e
+            for e in s.query(FoundryAuditEvent).filter_by(run_id=run_id)
+            if e.event_type is event_type
+        ]
+
+
+def test_provider_failure_at_dispatch_is_audited_not_swallowed(session_factory) -> None:
+    """A provider exception during the first dispatch must leave a trail: the
+    recorded policy ALLOW decision survives, an AGENT_FAILED event is written,
+    and the run lands in a definite (failed) status - never stranded as APPROVED
+    with a live authorisation but no agent (issue #13)."""
+    from foundry.db.models import AuditEventType
+
+    orch = _orch(session_factory, provider=_RaisingProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+
+    with pytest.raises(RuntimeError):
+        orch.dispatch_agent(run_id)
+
+    # The run did not silently stay APPROVED.
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    # The policy decision that authorised the (failed) dispatch is on the trail.
+    with session_factory() as s:
+        decisions = s.query(FoundryPolicyDecision).filter_by(run_id=run_id).all()
+    assert any(d.allowed for d in decisions), "the allow decision was lost"
+    # The failure itself is recorded.
+    failed = _events_of_type(session_factory, run_id, AuditEventType.AGENT_FAILED)
+    assert len(failed) == 1
+    # No phantom AGENT_STARTED event for an agent that never started, and no job row.
+    assert _events_of_type(session_factory, run_id, AuditEventType.AGENT_STARTED) == []
+    assert _job_count(session_factory, run_id) == 0
+
+
+def test_failed_dispatch_run_is_re_triggerable(session_factory) -> None:
+    """A dispatch that failed at the provider is terminal, so a fresh intake for
+    the same issue is allowed to start a new run (not refused as still-active)."""
+    orch = _orch(session_factory, provider=_RaisingProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    with pytest.raises(RuntimeError):
+        orch.dispatch_agent(run_id)
+
+    # The same issue can be picked up again.
+    assert orch.find_active_run_id_for_issue("i-1") is None
+    new_run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert new_run_id != run_id
+
+
+def test_provider_failure_during_remediation_hands_pr_to_human(session_factory) -> None:
+    """If re-dispatch to fix a failing PR raises at the provider, the RETRY policy
+    decision is still recorded, the failure is audited, and the PR is parked for
+    a human (REVIEW_REQUIRED) rather than left at PR_OPEN with the gate row lost."""
+    from foundry.db.models import AuditEventType
+
+    # Dispatch the first job successfully, then swap in a provider that fails so
+    # the *remediation* dispatch is the one that raises.
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    orch._provider = _RaisingProvider()
+    failing = _pr(files_changed=[], ci_status=CIStatus.FAILING, summary="2 failed")
+    with pytest.raises(RuntimeError):
+        orch.record_pr(run_id, failing)
+
+    assert _status(session_factory, run_id) is RunStatus.REVIEW_REQUIRED
+    # The RETRY_AGENT allow decision was committed before the provider call.
+    with session_factory() as s:
+        decisions = s.query(FoundryPolicyDecision).filter_by(run_id=run_id).all()
+    assert any(d.allowed for d in decisions)
+    # The failed remediation is audited and no second job row was created.
+    assert _events_of_type(session_factory, run_id, AuditEventType.AGENT_FAILED)
+    assert _job_count(session_factory, run_id) == 1
+
+
+# -- custom forbidden_globs config is honoured end-to-end -----------------------
+
+
+def test_custom_forbidden_globs_block_a_matching_diff(session_factory) -> None:
+    """A configured (non-default) forbidden glob hard-blocks a matching PR."""
+    orch, run_id = _dispatched_run(
+        session_factory, orch_kwargs={"forbidden_globs": ("config/**",)}
+    )
+    pr = _pr(files_changed=["config/feature_flags.yaml"])
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+    # Sticky: a clean follow-up push cannot revive the forbidden-path block.
+    with pytest.raises(OrchestratorError):
+        orch.record_pr(run_id, _pr())
+
+
+def test_custom_forbidden_globs_replace_the_defaults(session_factory) -> None:
+    """Passing forbidden_globs overrides the defaults: a path that the default
+    list would hard-block (migrations/**) is no longer forbidden once a custom
+    list is supplied. (It may still escalate via the sensitive-area gate, but it
+    is not the sticky BLOCK the forbidden list promises.)"""
+    orch, run_id = _dispatched_run(
+        session_factory, orch_kwargs={"forbidden_globs": ("config/**",)}
+    )
+    pr = _pr(files_changed=["migrations/0001_add_table.sql"])
+    assert orch.record_pr(run_id, pr) is not RunStatus.BLOCKED
+
+
+# -- retry cap boundary: max_agent_retries == 0 ---------------------------------
+
+
+def test_zero_retry_cap_denies_first_remediation(session_factory) -> None:
+    """With the cap at 0, the very first CI-failure remediation is denied by the
+    gate (attempt 1 > cap 0): the run parks for a human and no agent re-dispatches."""
+    tracker = InMemoryIssueTracker()
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory, issue_tracker=tracker, max_agent_retries=0
+    )
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    failing = _pr(ci_status=CIStatus.FAILING, summary="pytest: 1 failed")
+    assert orch.record_pr(run_id, failing) is RunStatus.REVIEW_REQUIRED
+    assert _job_count(session_factory, run_id) == 1  # no re-dispatch
+    assert any("could not remediate" in c for c in tracker.comments["i-1"])
+
+
+# -- intent: a merged PR completes without a separate mark_complete gate --------
+
+
+def test_merged_pr_completes_with_no_mark_complete_policy_decision(session_factory) -> None:
+    """Completion is an orchestrator state transition governed by the upfront
+    START_AGENT gate, not a distinct MARK_COMPLETE/OPEN_PR policy evaluation.
+    This pins current intent: only START_AGENT (and RETRY_AGENT) decisions are
+    ever recorded, so a future change that adds a completion gate is deliberate.
+    """
+    import json
+
+    orch, run_id = _dispatched_run(session_factory)
+    orch.record_pr(run_id, _pr())
+    assert orch.record_pr(run_id, _pr(status=PRStatus.MERGED)) is RunStatus.COMPLETE
+
+    with session_factory() as s:
+        actions = {
+            json.loads(d.input_json)["action"]
+            for d in s.query(FoundryPolicyDecision).filter_by(run_id=run_id)
+        }
+    # Only the autonomous-work gate ran; no branch/PR/complete sub-gates.
+    assert actions == {"start_agent"}
+    assert "mark_complete" not in actions
+    assert "open_pr" not in actions
+    assert "create_branch" not in actions
+
+
+# -- locked state transitions: "blocked stays blocked" under races (issue #10) ----
+
+
+class _StopDuringDispatchProvider(InMemoryFakeProvider):
+    """Simulates a human ``stop()`` landing between a dispatch's phase-1 commit
+    and its phase-3 job record by stopping the run from *inside* ``create_job``.
+
+    The provider call is the one moment a (re)dispatch holds no row lock, so it
+    is exactly where a concurrent terminal transition can slip in (issue #10).
+    Arm it (``armed = True``) immediately before the dispatch under test.
+    """
+
+    def __init__(self, orch_box, run_box, *, user="lead@example.com") -> None:
+        super().__init__()
+        self._orch_box = orch_box
+        self._run_box = run_box
+        self._user = user
+        self.armed = False
+
+    def create_job(self, job_input):
+        if self.armed:
+            self.armed = False
+            self._orch_box[0].stop(self._run_box[0], user=self._user)
+        return super().create_job(job_input)
+
+
+def test_remediation_bails_when_run_no_longer_pr_open(session_factory) -> None:
+    """A run stopped after record_pr committed PR_OPEN must not be revived: the
+    remediation re-reads status under the row lock and bails (issue #10)."""
+    orch, run_id = _dispatched_run(session_factory)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+    orch.stop(run_id, user="lead@example.com")  # human ends the run out of band
+    before = _job_count(session_factory, run_id)
+
+    result = orch._attempt_remediation(
+        run_id, reason="ci_failed", pr_state=_pr(ci_status=CIStatus.FAILING)
+    )
+
+    assert result is RunStatus.BLOCKED
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _job_count(session_factory, run_id) == before  # no re-dispatch
+
+
+def test_duplicate_remediation_delivery_does_not_double_dispatch(session_factory) -> None:
+    """Once a remediation claims the run (phase 1 flips it to AGENT_RUNNING under
+    the lock), a duplicate CI-failure delivery re-reads a non-PR_OPEN status and
+    bails - no second job, no retry-cap undercount (issue #10)."""
+    orch, run_id = _dispatched_run(session_factory)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+    failing = _pr(ci_status=CIStatus.FAILING)
+    assert orch.record_pr(run_id, failing) is RunStatus.AGENT_RUNNING
+    after_first = _job_count(session_factory, run_id)  # original + 1 remediation
+
+    # A duplicate delivery of the same failure event arrives while the run is
+    # already AGENT_RUNNING from the first remediation.
+    result = orch._attempt_remediation(run_id, reason="ci_failed", pr_state=failing)
+
+    assert result is RunStatus.AGENT_RUNNING
+    assert _job_count(session_factory, run_id) == after_first  # no extra dispatch
+
+
+def test_stop_during_remediation_dispatch_is_not_reverted(session_factory) -> None:
+    """A human stop that wins the row lock while the remediation provider call is
+    in flight must stick: the run stays BLOCKED and the just-launched job is
+    cancelled so it stops spending (issue #10)."""
+    orch_box, run_box = [], []
+    provider = _StopDuringDispatchProvider(orch_box, run_box)
+    orch = _orch(session_factory, provider=provider, issue_tracker=InMemoryIssueTracker())
+    orch_box.append(orch)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    run_box.append(run_id)
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+    orch.record_pr(run_id, _pr())
+
+    provider.armed = True  # the remediation's create_job will stop the run
+    result = orch.record_pr(run_id, _pr(ci_status=CIStatus.FAILING))
+
+    assert result is RunStatus.BLOCKED
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    with session_factory() as s:
+        latest = (
+            s.query(FoundryAgentJob)
+            .filter_by(run_id=run_id)
+            .order_by(FoundryAgentJob.started_at)
+            .all()[-1]
+        )
+        assert latest.status is AgentJobStatus.CANCELLED
+
+
+def test_stop_during_initial_dispatch_is_not_reverted(session_factory) -> None:
+    """Same race on the first dispatch: a stop between phase 1 and phase 3 keeps
+    the run BLOCKED rather than flipping it to AGENT_RUNNING (issue #10)."""
+    orch_box, run_box = [], []
+    provider = _StopDuringDispatchProvider(orch_box, run_box)
+    orch = _orch(session_factory, provider=provider)
+    orch_box.append(orch)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    run_box.append(run_id)
+    orch.approve(run_id, user="lead@example.com")
+
+    provider.armed = True  # the dispatch's create_job will stop the run
+    orch.dispatch_agent(run_id)
+
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    with session_factory() as s:
+        row = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+        assert row.status is AgentJobStatus.CANCELLED
+
+
+def test_audit_events_unique_run_sequence_index_present(session_factory) -> None:
+    """The per-run sequence is the audit trail's guaranteed order; a unique index
+    makes a duplicate fail loudly instead of silently corrupting it (issue #10)."""
+    from sqlalchemy import inspect
+
+    with session_factory() as s:
+        indexes = inspect(s.get_bind()).get_indexes("foundry_audit_events")
+    unique_seq = [
+        i for i in indexes
+        if i["unique"] and set(i["column_names"]) == {"run_id", "sequence"}
+    ]
+    assert unique_seq, f"missing unique (run_id, sequence) index; have {indexes}"

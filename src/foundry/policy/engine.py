@@ -147,6 +147,17 @@ _ADVISORY_ACTIONS = frozenset(
 )
 
 
+def _action_str(action: object) -> str:
+    """Render an action for a reason string.
+
+    ``PolicyInput.action`` is a typed :class:`PolicyAction` on the happy path,
+    but the default-deny branch must also cope with an unrecognised value that
+    bypassed the enum (e.g. ``model_construct`` or a future non-enum caller) -
+    otherwise the safety net would crash on ``.value`` instead of denying.
+    """
+    return action.value if isinstance(action, PolicyAction) else str(action)
+
+
 def _required_approvals(risk: PolicyRisk) -> list[ApprovalRole]:
     """Derive required approval roles from the sensitive areas in play."""
     required: list[ApprovalRole] = []
@@ -189,8 +200,8 @@ class LocalPolicyEngine:
                 policy_name=self.policy_name,
                 allowed=False,
                 reasons=[
-                    f"action '{payload.action.value}' may never run autonomously "
-                    "in this version"
+                    f"action '{_action_str(payload.action)}' may never run "
+                    "autonomously in this version"
                 ],
                 allowed_agent_mode=AgentMode.HUMAN_ONLY,
                 required_approvals=required,
@@ -202,7 +213,9 @@ class LocalPolicyEngine:
             return PolicyDecision(
                 policy_name=self.policy_name,
                 allowed=True,
-                reasons=[f"action '{payload.action.value}' is read-only / advisory"],
+                reasons=[
+                    f"action '{_action_str(payload.action)}' is read-only / advisory"
+                ],
                 allowed_agent_mode=self._allowed_mode(payload, blocked=False),
                 required_approvals=required,
             )
@@ -213,7 +226,7 @@ class LocalPolicyEngine:
                 policy_name=self.policy_name,
                 allowed=False,
                 reasons=[
-                    f"action '{payload.action.value}' is not covered by this "
+                    f"action '{_action_str(payload.action)}' is not covered by this "
                     "policy; denying by default"
                 ],
                 allowed_agent_mode=AgentMode.HUMAN_ONLY,
@@ -283,28 +296,56 @@ class LocalPolicyEngine:
         return AgentMode.HUMAN_ONLY
 
 
+def _urllib_http_post(url: str, body: dict) -> dict:  # pragma: no cover - network
+    """Minimal stdlib JSON POST used as the default OPA transport.
+
+    Kept on stdlib (``urllib``) so wiring an OPA server adds no dependency. Tests
+    never reach this path - they inject a fake ``http_post`` (see invariant #3).
+    """
+    import json
+    import urllib.request
+
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+        return json.loads(response.read().decode("utf-8"))
+
+
 class OpaPolicyEngine:
     """Delegates decisions to an OPA HTTP server (production backend).
 
     The OPA bundle lives alongside this module (``foundry.rego``). This class is
     intentionally thin; the network client is injected so it stays testable and
     so the core foundation has no hard dependency on a running OPA instance.
+
+    Wired via ``policy.provider: opa`` (+ ``policy.opa_url``) in config; the
+    Python ``LocalPolicyEngine`` remains the default. The configurable
+    ``repo_confidence_threshold`` is injected into the payload so the Rego bundle
+    evaluates against the *same* threshold as the Python engine instead of its
+    hardcoded fallback - the two backends cannot silently diverge on it.
     """
 
     policy_name = "foundry.ticket_to_pr.v1"
 
-    def __init__(self, *, base_url: str, http_post=None) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        repo_confidence_threshold: int = REPO_CONFIDENCE_THRESHOLD,
+        http_post=None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._http_post = http_post
+        self._repo_confidence_threshold = repo_confidence_threshold
+        self._http_post = http_post or _urllib_http_post
 
     def evaluate(self, payload: PolicyInput) -> PolicyDecision:
-        if self._http_post is None:  # pragma: no cover - requires injected client
-            raise RuntimeError(
-                "OpaPolicyEngine requires an injected http_post callable to reach OPA"
-            )
         url = f"{self._base_url}/v1/data/foundry/ticket_to_pr/decision"
+        opa_input = payload.model_dump(mode="json")
+        opa_input["repo_confidence_threshold"] = self._repo_confidence_threshold
         try:
-            response = self._http_post(url, {"input": payload.model_dump(mode="json")})
+            response = self._http_post(url, {"input": opa_input})
             result = response.get("result")
             if not result:
                 raise ValueError("OPA returned no decision result")

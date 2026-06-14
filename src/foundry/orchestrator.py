@@ -29,6 +29,7 @@ from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_analysis_comment, state_for
+from foundry.connectors.notify import ApprovalRequest, RunNotifier
 from foundry.observability import traced
 from foundry.audit.events import (
     build_artifact,
@@ -107,6 +108,21 @@ _PR_OBSERVABLE_STATUSES = frozenset(
     {RunStatus.AGENT_RUNNING, RunStatus.PR_OPEN, RunStatus.REVIEW_REQUIRED}
 )
 
+# Status transitions worth pinging a chat surface about: parked, blocked, PR
+# open, merged (and the failure terminals, which an approver wants to hear about
+# as much as a clean block). Routine intermediate states (analysing, approved,
+# agent_running, review_required) are not notified - they would be noise.
+_NOTIFIABLE_STATUSES = frozenset(
+    {
+        RunStatus.NEEDS_CLARIFICATION,
+        RunStatus.BLOCKED,
+        RunStatus.REJECTED,
+        RunStatus.EXECUTION_FAILED,
+        RunStatus.PR_OPEN,
+        RunStatus.COMPLETE,
+    }
+)
+
 # Linear-style issue keys (ENG-123) appearing in branch names or PR titles.
 _ISSUE_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
 
@@ -128,6 +144,7 @@ class FoundryOrchestrator:
         policy_engine: PolicyEngine | None = None,
         provider: CodingAgentProvider | None = None,
         issue_tracker: IssueTracker | None = None,
+        notifier: RunNotifier | None = None,
         max_files_changed: int = 12,
         forbidden_globs: tuple[str, ...] | list[str] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
@@ -144,6 +161,9 @@ class FoundryOrchestrator:
         self._provider = provider or ManualProvider()
         # Optional: when set, Foundry writes progress/state back to the tracker.
         self._tracker = issue_tracker
+        # Optional: when set, Foundry posts approval messages + status updates to
+        # a chat surface (Slack). Best-effort, like the tracker write-back.
+        self._notifier = notifier
         self._max_files_changed = max_files_changed
         self._forbidden_globs = list(
             forbidden_globs if forbidden_globs is not None else DEFAULT_FORBIDDEN_GLOBS
@@ -324,6 +344,12 @@ class FoundryOrchestrator:
                     "authoritative but Linear may be stale",
                     ticket.issue_id,
                 )
+        # Mirror the same outcome onto the chat surface: an actionable approval
+        # message when the run parks for approval, else a status notification.
+        if status is RunStatus.WAITING_APPROVAL:
+            self._notify_approval(ticket, analysis, risk, plan)
+        else:
+            self._notify_run_status(ticket.issue_id, ticket.issue_key, status)
         return run_id
 
     def _notify_state(self, issue_id: str, status: RunStatus) -> None:
@@ -336,6 +362,53 @@ class FoundryOrchestrator:
                     issue_id,
                     status.value,
                 )
+        # The intake path notifies chat itself (it has the full plan context for
+        # the approval message); every later transition flows through here.
+        self._notify_run_status(issue_id, None, status)
+
+    def _notify_run_status(
+        self, issue_id: str, issue_key: str | None, status: RunStatus
+    ) -> None:
+        """Post a status update to the chat surface for notable transitions."""
+        if self._notifier is None or status not in _NOTIFIABLE_STATUSES:
+            return
+        try:
+            self._notifier.status_changed(issue_id, issue_key, status)
+        except Exception:
+            _log.exception(
+                "notifier status update failed for issue %s (-> %s)",
+                issue_id,
+                status.value,
+            )
+
+    def _notify_approval(
+        self,
+        ticket: RawTicket,
+        analysis: TicketAnalysis,
+        risk: RiskAssessment,
+        plan: DeliveryPlan,
+    ) -> None:
+        """Post the interactive approval message to the chat surface."""
+        if self._notifier is None:
+            return
+        repo = plan.affected_repositories[0] if plan.affected_repositories else "unknown"
+        request = ApprovalRequest(
+            issue_id=ticket.issue_id,
+            issue_key=ticket.issue_key,
+            title=analysis.title,
+            work_type=analysis.work_type.value,
+            risk=risk.overall_risk.value,
+            agent_mode=risk.allowed_agent_mode.value,
+            repo=repo,
+            acceptance_criteria=tuple(analysis.acceptance_criteria),
+            required_approvals=tuple(r.value for r in risk.required_approvals),
+        )
+        try:
+            self._notifier.approval_requested(request)
+        except Exception:
+            _log.exception(
+                "notifier approval message failed for issue %s", ticket.issue_id
+            )
 
     def _notify_comment(self, issue_id: str, body: str) -> None:
         if self._tracker is not None:
@@ -372,7 +445,7 @@ class FoundryOrchestrator:
     ) -> None:
         granted_roles = granted_roles or set()
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             if run.status is not RunStatus.WAITING_APPROVAL:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}', not awaiting approval"
@@ -428,7 +501,7 @@ class FoundryOrchestrator:
         event_type: AuditEventType,
     ) -> None:
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             self._refuse_if_terminal(run)
             run.status = status
             run.current_step = status.value
@@ -511,6 +584,29 @@ class FoundryOrchestrator:
                 metadata=metadata,
             )
         )
+
+    def _cancel_superseded_job(self, run_id: str, job: CodingAgentJob, job_row) -> None:
+        """Cancel a job we launched for a run that has since left our control.
+
+        A (re)dispatch commits its gate decision, calls the provider, then
+        records the job in a third transaction. If a human ``stop``/``reject``
+        wins the run's row lock in that window, the agent is live but unwanted.
+        Best-effort cancel it (failure-isolated like :meth:`_cancel_active_job`)
+        and reflect the outcome on the freshly-recorded ``job_row`` so the trail
+        is honest about what ran and what we did about it."""
+        if job.provider != self._provider.name or not job.job_id:
+            return
+        try:
+            self._provider.cancel_job(job.job_id)
+            job_row.status = AgentJobStatus.CANCELLED
+            job_row.completed_at = datetime.now(timezone.utc)
+        except Exception as exc:  # never let cancellation break the commit
+            job_row.error = str(exc) or exc.__class__.__name__
+            _log.exception(
+                "cancel of superseded job %s (run %s) failed; it may keep running",
+                job.job_id,
+                run_id,
+            )
 
     # -- read helpers (used by the API) ---------------------------------------
 
@@ -605,9 +701,21 @@ class FoundryOrchestrator:
 
     @traced("foundry.dispatch_agent")
     def dispatch_agent(self, run_id: str) -> CodingAgentJob:
-        """Re-check policy with the recorded approvals, then launch the provider."""
+        """Re-check policy with the recorded approvals, then launch the provider.
+
+        The dispatch is split into three phases so the audit trail can never be
+        out of step with reality (issue #13):
+
+        1. evaluate the gate and **commit** the policy decision *before* any
+           provider side effect — a recorded authorisation must not be able to
+           vanish just because the provider call later fails;
+        2. call the provider; a failure here is captured as an ``AGENT_FAILED``
+           event in its own transaction rather than silently rolling back;
+        3. record the now-live job and flip the run to ``AGENT_RUNNING``.
+        """
+        # -- phase 1: gate decision, durably recorded ------------------------
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             if run.status is not RunStatus.APPROVED:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}', not approved"
@@ -649,20 +757,32 @@ class FoundryOrchestrator:
                 )
 
             job_input = self._build_job_input(run_id, ticket, plan, context)
-            job = self._provider.create_job(job_input)
+            issue_id = run.linear_issue_id
+            # Commit the allow decision now; the provider call in phase 2 is a
+            # side effect that must not be able to erase the recorded gate row.
+            session.commit()
 
-            session.add(
-                FoundryAgentJob(
-                    id=new_id("job"),
-                    run_id=run_id,
-                    provider=job.provider,
-                    provider_job_id=job.job_id,
-                    status=AgentJobStatus.RUNNING,
-                    repo=job_input.repo,
-                    branch=job_input.branch_name,
-                    started_at=datetime.now(timezone.utc),
-                )
+        # -- phase 2: the external side effect -------------------------------
+        # A dispatch that never even starts the agent ends the run (failed runs
+        # are re-triggerable by a fresh intake).
+        job = self._dispatch_to_provider(
+            run_id, job_input, failure_status=RunStatus.EXECUTION_FAILED
+        )
+
+        # -- phase 3: record the running job ---------------------------------
+        with self._sf() as session:
+            run = self._require_run(session, run_id, lock=True)
+            job_row = FoundryAgentJob(
+                id=new_id("job"),
+                run_id=run_id,
+                provider=job.provider,
+                provider_job_id=job.job_id,
+                status=AgentJobStatus.RUNNING,
+                repo=job_input.repo,
+                branch=job_input.branch_name,
+                started_at=datetime.now(timezone.utc),
             )
+            session.add(job_row)
             session.add(
                 build_audit_event(
                     run_id=run_id,
@@ -671,19 +791,95 @@ class FoundryOrchestrator:
                     metadata={"provider": job.provider, "job_id": job.job_id},
                 )
             )
-            run.status = RunStatus.AGENT_RUNNING
-            run.current_step = "agent_running"
-            issue_id = run.linear_issue_id
-            session.commit()
-        self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
+            # A human stop()/reject() can win the row lock between phase 1's
+            # commit and here. The provider job is already live, but the run is
+            # no longer ours to advance: record the job for the audit/cost trail,
+            # cancel it so a stopped run stops spending, and never overwrite the
+            # new status ("blocked stays blocked", issue #10).
+            if run.status is RunStatus.APPROVED:
+                run.status = RunStatus.AGENT_RUNNING
+                run.current_step = "agent_running"
+                final_status = RunStatus.AGENT_RUNNING
+            else:
+                self._cancel_superseded_job(run_id, job, job_row)
+                final_status = run.status
+                _log.warning(
+                    "dispatch of run %s launched job %s but the run is now '%s'; "
+                    "leaving the status unchanged and cancelling the job",
+                    run_id,
+                    job.job_id,
+                    run.status.value,
+                )
+            try:
+                session.commit()
+            except Exception:
+                # The provider job is already live; surface the orphan loudly so
+                # it is discoverable for reconciliation (issue #13).
+                _log.exception(
+                    "dispatch of run %s created provider job %s (%s) but the "
+                    "job/audit commit failed; the agent is running without a "
+                    "DB record",
+                    run_id,
+                    job.job_id,
+                    job.provider,
+                )
+                raise
+        self._notify_state(issue_id, final_status)
         return job
+
+    def _dispatch_to_provider(
+        self,
+        run_id: str,
+        job_input: CodingAgentJobInput,
+        *,
+        failure_status: RunStatus,
+    ) -> CodingAgentJob:
+        """Call the provider, recording an ``AGENT_FAILED`` event if it raises.
+
+        The provider call is the one external side effect of a dispatch. Wrapping
+        it here guarantees a provider exception leaves an audit trail and moves
+        the run to a definite status, instead of rolling back the surrounding
+        transaction and stranding the run with a recorded gate decision but no
+        agent and no failure event (issue #13). The original exception is
+        re-raised so callers see the failure unchanged.
+        """
+        try:
+            return self._provider.create_job(job_input)
+        except Exception as exc:
+            self._record_dispatch_failure(run_id, failure_status, reason=str(exc))
+            raise
+
+    def _record_dispatch_failure(
+        self, run_id: str, failure_status: RunStatus, *, reason: str
+    ) -> None:
+        """Persist an ``AGENT_FAILED`` event for a provider dispatch that raised.
+
+        Runs in its own transaction so the record survives the exception the
+        caller is about to re-raise.
+        """
+        with self._sf() as session:
+            run = self._require_run(session, run_id, lock=True)
+            run.status = failure_status
+            run.current_step = "dispatch_failed"
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.AGENT_FAILED,
+                    actor_type="foundry",
+                    metadata={"reason": "provider dispatch failed", "error": reason},
+                )
+            )
+            issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
+            session.commit()
+        self._notify_state(issue_id, failure_status)
 
     # -- PR monitoring --------------------------------------------------------
 
     def mark_agent_failed(self, run_id: str, *, reason: str = "agent error") -> None:
         """Mark a run as failed when the agent crashes without creating a PR."""
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             self._refuse_if_terminal(run)
             run.status = RunStatus.EXECUTION_FAILED
             run.current_step = "failed"
@@ -732,7 +928,7 @@ class FoundryOrchestrator:
         state without weakening a prior file-based decision.
         """
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
             if run.status not in _PR_OBSERVABLE_STATUSES:
                 raise OrchestratorError(
                     f"run {run_id} is '{run.status.value}'; PR events are only "
@@ -829,7 +1025,16 @@ class FoundryOrchestrator:
             return RunStatus.PR_OPEN
 
         with self._sf() as session:
-            run = self._require_run(session, run_id)
+            run = self._require_run(session, run_id, lock=True)
+            # record_pr committed PR_OPEN in a *separate* transaction before
+            # calling us, so the run may have moved since: a human stop(), a
+            # closed PR, or a concurrent delivery's remediation that already
+            # advanced it. Re-read under the row lock and bail unless it is
+            # genuinely still an open PR awaiting remediation — counting jobs and
+            # re-dispatching off a stale PR_OPEN is exactly the double-dispatch /
+            # retry-cap-undercount / revive-a-stopped-run bug (issue #10).
+            if run.status is not RunStatus.PR_OPEN:
+                return run.status
             ticket = self._load(session, run_id, ArtifactType.TICKET_SNAPSHOT)
             analysis = self._load(session, run_id, ArtifactType.TICKET_ANALYSIS)
             context = self._load(session, run_id, ArtifactType.CONTEXT_BUNDLE)
@@ -908,19 +1113,38 @@ class FoundryOrchestrator:
                 branch=pr_state.branch or None,
                 extra_instructions=self._remediation_instructions(reason, pr_state),
             )
-            job = self._provider.create_job(job_input)
-            session.add(
-                FoundryAgentJob(
-                    id=new_id("job"),
-                    run_id=run_id,
-                    provider=job.provider,
-                    provider_job_id=job.job_id,
-                    status=AgentJobStatus.RUNNING,
-                    repo=job_input.repo,
-                    branch=job_input.branch_name,
-                    started_at=datetime.now(timezone.utc),
-                )
+            issue_id = run.linear_issue_id
+            # Claim the run for this remediation *under the row lock*, before the
+            # provider call. A concurrent delivery's remediation then re-reads a
+            # non-PR_OPEN status at the top of this method and bails, so duplicate
+            # CI-failure events can neither double-dispatch nor undercount the
+            # retry cap by both counting the same prior_jobs (issue #10).
+            run.status = RunStatus.AGENT_RUNNING
+            run.current_step = "remediating"
+            # Commit the allow decision (and the claim) before the provider side
+            # effect so the recorded gate row survives even if create_job raises
+            # (issue #13).
+            session.commit()
+
+        # The PR already exists, so a failed re-dispatch hands the PR back to a
+        # human (REVIEW_REQUIRED) rather than ending the run.
+        job = self._dispatch_to_provider(
+            run_id, job_input, failure_status=RunStatus.REVIEW_REQUIRED
+        )
+
+        with self._sf() as session:
+            run = self._require_run(session, run_id, lock=True)
+            job_row = FoundryAgentJob(
+                id=new_id("job"),
+                run_id=run_id,
+                provider=job.provider,
+                provider_job_id=job.job_id,
+                status=AgentJobStatus.RUNNING,
+                repo=job_input.repo,
+                branch=job_input.branch_name,
+                started_at=datetime.now(timezone.utc),
             )
+            session.add(job_row)
             session.add(
                 build_audit_event(
                     run_id=run_id,
@@ -935,12 +1159,37 @@ class FoundryOrchestrator:
                     },
                 )
             )
-            run.status = RunStatus.AGENT_RUNNING
-            run.current_step = "remediating"
-            issue_id = run.linear_issue_id
-            session.commit()
-        self._notify_state(issue_id, RunStatus.AGENT_RUNNING)
-        return RunStatus.AGENT_RUNNING
+            # phase 1 already flipped the run to AGENT_RUNNING under the lock. If
+            # it is no longer AGENT_RUNNING, a human stop()/reject() won the race
+            # while the provider call was in flight: keep the new status, cancel
+            # the now-unwanted job, and never revert it (issue #10).
+            if run.status is RunStatus.AGENT_RUNNING:
+                run.current_step = "remediating"
+                final_status = RunStatus.AGENT_RUNNING
+            else:
+                self._cancel_superseded_job(run_id, job, job_row)
+                final_status = run.status
+                _log.warning(
+                    "remediation of run %s launched job %s but the run is now "
+                    "'%s'; leaving the status unchanged and cancelling the job",
+                    run_id,
+                    job.job_id,
+                    run.status.value,
+                )
+            try:
+                session.commit()
+            except Exception:
+                _log.exception(
+                    "remediation of run %s created provider job %s (%s) but the "
+                    "job/audit commit failed; the agent is running without a "
+                    "DB record",
+                    run_id,
+                    job.job_id,
+                    job.provider,
+                )
+                raise
+        self._notify_state(issue_id, final_status)
+        return final_status
 
     def _record_outcome_if_terminal(self, session, run: FoundryRun) -> None:
         """Distill a finished run into its delivery-memory outcome row.
@@ -1178,8 +1427,16 @@ class FoundryOrchestrator:
         )
 
     @staticmethod
-    def _require_run(session, run_id: str) -> FoundryRun:
-        run = session.get(FoundryRun, run_id)
+    def _require_run(session, run_id: str, *, lock: bool = False) -> FoundryRun:
+        """Load the run row, optionally taking a ``SELECT ... FOR UPDATE`` lock.
+
+        Every method that does a check-then-write on run status passes
+        ``lock=True`` so concurrent transitions serialise on the row instead of
+        racing (issue #10). The lock is held until the surrounding session
+        commits. On SQLite the dialect ignores ``FOR UPDATE``, which is correct:
+        the dev DB is single-connection, the production guarantee is Postgres's.
+        """
+        run = session.get(FoundryRun, run_id, with_for_update=lock)
         if run is None:
             raise OrchestratorError(f"run {run_id} not found")
         return run
