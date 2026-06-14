@@ -231,3 +231,84 @@ def test_list_epics_empty_when_no_children(session_factory) -> None:
     orch = _orch(session_factory)
     orch.intake_and_plan(_ready_ticket("solo", "LIN-1"), trigger_type="label")
     assert orch.list_epics() == []
+
+
+# -- decomposition producer (intake_epic) -------------------------------------
+
+EPIC_DESC = (
+    "Add favourites across our surfaces.\n\n"
+    "Repositories:\n"
+    "- customer-web: add the favourites button\n"
+    "- mobile-app: add the favourites button\n\n"
+    "Acceptance Criteria:\n"
+    "- A favourites button exists\n"
+    "- Favourites persist across sessions\n"
+)
+
+
+def _epic_ticket() -> RawTicket:
+    return RawTicket(
+        issue_id="epic-99",
+        issue_key="LIN-900",
+        title="Add favourites everywhere",
+        description=EPIC_DESC,
+    )
+
+
+def test_intake_epic_opens_parent_and_one_child_per_repo(session_factory) -> None:
+    orch = _orch(session_factory)
+    result = orch.intake_epic(_epic_ticket(), trigger_type="label")
+
+    assert result.is_epic is True
+    assert len(result.child_run_ids) == 2
+    # Children are linked under the parent and discoverable as an epic.
+    children = orch.child_runs(result.parent_run_id)
+    assert {c.id for c in children} == set(result.child_run_ids)
+    assert all(c.parent_run_id == result.parent_run_id for c in children)
+    assert [r.id for r in orch.list_epics()] == [result.parent_run_id]
+
+
+def test_intake_epic_children_are_independently_gated(session_factory) -> None:
+    orch = _orch(session_factory)
+    result = orch.intake_epic(_epic_ticket(), trigger_type="label")
+
+    # Each scoped child is ready + routable + low risk, so it parks for its
+    # own approval - the gate ran once per child, not once for the epic.
+    for child_id in result.child_run_ids:
+        assert orch.get_run(child_id).status is RunStatus.WAITING_APPROVAL
+    rollup = orch.epic_rollup(result.parent_run_id)
+    assert rollup["status"] == EpicStatus.IN_PROGRESS.value
+    assert rollup["counts"]["active"] == 2
+
+
+def test_intake_epic_children_approve_independently(session_factory) -> None:
+    orch = _orch(session_factory)
+    result = orch.intake_epic(_epic_ticket(), trigger_type="label")
+    first, second = result.child_run_ids
+
+    # Approving one child does not touch the other - independent gating.
+    orch.approve(first, user="lead@example.com")
+    assert orch.get_run(first).status is RunStatus.APPROVED
+    assert orch.get_run(second).status is RunStatus.WAITING_APPROVAL
+    assert orch.epic_rollup(result.parent_run_id)["counts"]["active"] == 2
+
+
+def test_intake_epic_non_epic_degrades_to_single_run(session_factory) -> None:
+    orch = _orch(session_factory)
+    result = orch.intake_epic(_ready_ticket("solo", "LIN-1"), trigger_type="label")
+
+    assert result.is_epic is False
+    assert result.child_run_ids == []
+    assert orch.child_runs(result.parent_run_id) == []
+    assert orch.list_epics() == []
+    # The single run still went through intake normally.
+    assert orch.get_run(result.parent_run_id).status is RunStatus.WAITING_APPROVAL
+
+
+def test_intake_epic_rejects_duplicate_active_epic(session_factory) -> None:
+    orch = _orch(session_factory)
+    orch.intake_epic(_epic_ticket(), trigger_type="label")
+    # The parent's issue already has an active run; re-triggering fails loudly
+    # on the one-active-run-per-issue guard before any new child is created.
+    with pytest.raises(OrchestratorError, match="already has an active run"):
+        orch.intake_epic(_epic_ticket(), trigger_type="label")
