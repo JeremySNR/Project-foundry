@@ -60,6 +60,7 @@ from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
 from .dashboard import DASHBOARD_HTML
+from .dedup import WebhookDeduplicator, webhook_timestamp_fresh
 from .mapping import linear_payload_to_ticket
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
@@ -160,6 +161,9 @@ def create_app(
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
+    webhook_dedup_ttl_seconds: int | None = 86_400,
+    webhook_replay_max_age_seconds: int | None = None,
+    clock: Callable[[], datetime] | None = None,
     rate_limit_enabled: bool = True,
     rate_limit_webhook_per_minute: int = 120,
     rate_limit_api_per_minute: int = 60,
@@ -197,8 +201,17 @@ def create_app(
     app.state.gitlab_connector = gitlab_connector or GitLabConnector()
     app.state.trigger_label = trigger_label
     app.state.trigger_status = trigger_status
-    # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
-    app.state.processed_events = set()
+    # Replay defences. Dedup is durable (DB-backed, atomic across workers,
+    # TTL-pruned) - it replaces the old per-process set that was lost on
+    # restart and unbounded. Replay-age validation is opt-in: only providers
+    # that actually carry a timestamp (Linear's webhookTimestamp) can use it.
+    app.state.clock = clock or (lambda: datetime.now(timezone.utc))
+    app.state.deduplicator = WebhookDeduplicator(
+        session_factory,
+        ttl_seconds=webhook_dedup_ttl_seconds,
+        clock=app.state.clock,
+    )
+    app.state.webhook_replay_max_age_seconds = webhook_replay_max_age_seconds
 
     # Per-client request caps on the network surfaces. Two buckets so a flood on
     # one surface cannot starve the other. Per-process (like the dedup set);
@@ -278,11 +291,27 @@ def create_app(
 
         payload = await request.json()
         orch: FoundryOrchestrator = app.state.orchestrator
-        event_id = _extract_event_id(payload, delivery_id)
 
+        # Replay-age guard (opt-in): a captured, validly-signed delivery still
+        # fails once it is older than the window. Linear sends webhookTimestamp
+        # (epoch ms); fail-closed when the check is on but no timestamp is sent.
+        max_age = app.state.webhook_replay_max_age_seconds
+        if max_age is not None and not webhook_timestamp_fresh(
+            payload.get("webhookTimestamp"),
+            now=app.state.clock(),
+            max_age_seconds=max_age,
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="stale or missing webhook timestamp (possible replay)",
+            )
+
+        event_id = _extract_event_id(payload, delivery_id)
         ticket = app.state.ticket_mapper(payload)
 
-        if event_id and event_id in app.state.processed_events:
+        # Durable dedup: marks the delivery processed and tells us if it was
+        # already seen (across workers and restarts), then we branch on intent.
+        if app.state.deduplicator.seen("linear", event_id):
             return {"status": "duplicate", "run": _existing_run(orch, ticket.issue_id)}
 
         # Approval commands arrive as Linear comments. The webhook signature
@@ -292,8 +321,6 @@ def create_app(
         body_text = data.get("body") or payload.get("body") or ""
         command = parse_command(body_text)
         if command and command.command in {"approve", "reject", "stop"}:
-            if event_id:
-                app.state.processed_events.add(event_id)
             return _handle_linear_decision(
                 app, orch, ticket.issue_id, command.command, payload
             )
@@ -301,8 +328,6 @@ def create_app(
         if not _is_trigger(
             payload, label=app.state.trigger_label, status=app.state.trigger_status
         ):
-            if event_id:
-                app.state.processed_events.add(event_id)
             return {"status": "ignored", "reason": "no trigger condition matched"}
 
         if not ticket.issue_id:
@@ -313,8 +338,6 @@ def create_app(
         # ticket can be re-analysed with a fresh trigger.
         active_id = orch.find_active_run_id_for_issue(ticket.issue_id)
         if active_id is not None:
-            if event_id:
-                app.state.processed_events.add(event_id)
             return {"status": "exists", "run": _run_to_dict(orch.get_run(active_id))}
 
         run_id = app.state.driver.start(
@@ -322,8 +345,6 @@ def create_app(
             trigger_type=_trigger_type(payload, status=app.state.trigger_status),
             created_by=(data.get("actor") or {}).get("name"),
         )
-        if event_id:
-            app.state.processed_events.add(event_id)
         return {"status": "started", "run": _run_to_dict(orch.get_run(run_id))}
 
     @app.post("/webhooks/github", status_code=202)
@@ -342,15 +363,18 @@ def create_app(
 
         payload = await request.json()
 
+        # Durable dedup spans every GitHub delivery, not just intake: a
+        # replayed pull_request / check_run event re-drives real state
+        # (re-dispatch, status flips), so dedup before any of those paths.
+        # GitHub carries no timestamp, only the X-GitHub-Delivery UUID, so this
+        # delivery-id dedup *is* GitHub's replay protection.
+        if app.state.deduplicator.seen("github", delivery_id):
+            return {"status": "duplicate"}
+
         # GitHub Issues as the tracker: the issue is the ticket, the label is
         # the trigger, and /foundry commands work in issue comments.
         if event in {"issues", "issue_comment"}:
-            if delivery_id and delivery_id in app.state.processed_events:
-                return {"status": "duplicate"}
-            result = _handle_github_issue_event(app, event, payload)
-            if delivery_id:
-                app.state.processed_events.add(delivery_id)
-            return result
+            return _handle_github_issue_event(app, event, payload)
 
         # Best-effort: keep catalog staleness detection live between sweeps.
         _nudge_catalog_pushed_at(app, payload)
@@ -1183,6 +1207,8 @@ def app_from_settings(settings: Settings) -> FastAPI:
         slack_signing_secret=settings.slack_signing_secret,
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
+        webhook_dedup_ttl_seconds=settings.webhook_dedup_ttl_seconds,
+        webhook_replay_max_age_seconds=settings.webhook_replay_max_age_seconds,
         rate_limit_enabled=settings.rate_limit_enabled,
         rate_limit_webhook_per_minute=settings.rate_limit_webhook_per_minute,
         rate_limit_api_per_minute=settings.rate_limit_api_per_minute,

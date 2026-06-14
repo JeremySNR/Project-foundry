@@ -106,6 +106,17 @@ class Settings:
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
+    # --- webhook replay protection (behaviour: yaml) ---
+    # How long a processed delivery id is remembered in foundry_webhook_deliveries
+    # for durable, cross-worker dedup. Rows older than this are pruned so the
+    # table stays bounded. None disables pruning (unbounded growth - not advised).
+    webhook_dedup_ttl_seconds: int | None = 86_400
+    # Maximum age of an inbound delivery, validated against a provider-supplied
+    # timestamp (Linear's webhookTimestamp). None = disabled. When set it is
+    # fail-closed (missing/stale timestamp rejected) and must be <= the dedup
+    # TTL, so a delivery can't age out of the dedup table while still replayable.
+    webhook_replay_max_age_seconds: int | None = None
+
     # --- API rate limiting (behaviour: yaml; operational env overrides) ---
     # Coarse per-client request caps on the network surfaces. Enabled by
     # default with generous limits; set rate_limit_enabled: false to turn off.
@@ -250,6 +261,32 @@ class Settings:
             raise ValueError(
                 f"max_cost_per_run must be positive, got {self.max_cost_per_run}"
             )
+        if (
+            self.webhook_dedup_ttl_seconds is not None
+            and self.webhook_dedup_ttl_seconds < 1
+        ):
+            raise ValueError(
+                "webhook_dedup_ttl_seconds must be >= 1 (or null to disable "
+                f"pruning), got {self.webhook_dedup_ttl_seconds}"
+            )
+        if self.webhook_replay_max_age_seconds is not None:
+            if self.webhook_replay_max_age_seconds < 1:
+                raise ValueError(
+                    "webhook_replay_max_age_seconds must be >= 1 (or null to "
+                    f"disable), got {self.webhook_replay_max_age_seconds}"
+                )
+            if (
+                self.webhook_dedup_ttl_seconds is not None
+                and self.webhook_replay_max_age_seconds
+                > self.webhook_dedup_ttl_seconds
+            ):
+                raise ValueError(
+                    "webhook_replay_max_age_seconds "
+                    f"({self.webhook_replay_max_age_seconds}) must not exceed "
+                    f"webhook_dedup_ttl_seconds ({self.webhook_dedup_ttl_seconds}): "
+                    "a delivery could otherwise age out of the dedup table "
+                    "while still inside the replay window"
+                )
         if self.estimated_cost_per_dispatch < 0:
             raise ValueError(
                 "estimated_cost_per_dispatch must be >= 0, got "
@@ -390,6 +427,16 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "estimated_cost_per_dispatch" in budget:
         out["estimated_cost_per_dispatch"] = float(
             budget["estimated_cost_per_dispatch"]
+        )
+
+    webhook = data.get("webhook", {}) or {}
+    if "dedup_ttl_seconds" in webhook:
+        raw_ttl = webhook["dedup_ttl_seconds"]
+        out["webhook_dedup_ttl_seconds"] = None if raw_ttl is None else int(raw_ttl)
+    if "replay_max_age_seconds" in webhook:
+        raw_age = webhook["replay_max_age_seconds"]
+        out["webhook_replay_max_age_seconds"] = (
+            None if raw_age is None else int(raw_age)
         )
 
     triggers = data.get("triggers", {}) or {}

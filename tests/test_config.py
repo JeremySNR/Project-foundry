@@ -231,6 +231,53 @@ def test_invalid_remediation_and_budget_rejected(tmp_path) -> None:
             Settings.load(str(config), env={})
 
 
+def test_webhook_yaml_parsing(tmp_path) -> None:
+    config = tmp_path / "foundry.yaml"
+    config.write_text(
+        "webhook:\n"
+        "  dedup_ttl_seconds: 3600\n"
+        "  replay_max_age_seconds: 300\n"
+    )
+    settings = Settings.load(str(config), env={})
+    assert settings.webhook_dedup_ttl_seconds == 3600
+    assert settings.webhook_replay_max_age_seconds == 300
+
+
+def test_webhook_defaults_when_block_absent() -> None:
+    s = Settings.from_env({})
+    assert s.webhook_dedup_ttl_seconds == 86_400
+    assert s.webhook_replay_max_age_seconds is None
+
+
+def test_webhook_null_disables(tmp_path) -> None:
+    config = tmp_path / "foundry.yaml"
+    config.write_text(
+        "webhook:\n"
+        "  dedup_ttl_seconds: null\n"
+        "  replay_max_age_seconds: null\n"
+    )
+    settings = Settings.load(str(config), env={})
+    assert settings.webhook_dedup_ttl_seconds is None
+    assert settings.webhook_replay_max_age_seconds is None
+
+
+def test_invalid_webhook_config_rejected(tmp_path) -> None:
+    import pytest
+
+    cases = [
+        # replay window wider than the dedup TTL: a delivery could age out of
+        # the dedup table while still inside the replay window.
+        "webhook:\n  dedup_ttl_seconds: 100\n  replay_max_age_seconds: 200\n",
+        "webhook:\n  dedup_ttl_seconds: 0\n",
+        "webhook:\n  replay_max_age_seconds: 0\n",
+    ]
+    for i, content in enumerate(cases):
+        config = tmp_path / f"bad-wh-{i}.yaml"
+        config.write_text(content)
+        with pytest.raises(ValueError):
+            Settings.load(str(config), env={})
+
+
 _CONTEXT_YAML = """
 context:
   provider: catalog
