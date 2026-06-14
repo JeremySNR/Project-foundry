@@ -30,7 +30,7 @@ from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_analysis_comment, state_for
 from foundry.connectors.notify import ApprovalRequest, RunNotifier
-from foundry.engines.decomposition import decompose_epic
+from foundry.engines.decomposition import EpicDecomposer, HeuristicDecomposer
 from foundry.epics import EpicIntakeResult, compute_epic_rollup
 from foundry.observability import traced
 from foundry.audit.events import (
@@ -144,6 +144,7 @@ class FoundryOrchestrator:
         risk_classifier: RiskClassifier | None = None,
         diff_risk_classifier: DiffRiskClassifier | None = None,
         planner: DeliveryPlanner | None = None,
+        decomposer: EpicDecomposer | None = None,
         policy_engine: PolicyEngine | None = None,
         provider: CodingAgentProvider | None = None,
         issue_tracker: IssueTracker | None = None,
@@ -162,6 +163,10 @@ class FoundryOrchestrator:
         self._enricher = enricher or StaticContextEnricher()
         self._risk = risk_classifier or HeuristicRiskClassifier()
         self._planner = planner or TemplatePlanner()
+        # Epic-producer seam (issue #35): deterministic by default; the LLM
+        # decomposer (decomposition.provider: llm) recovers prose-described
+        # epics, keeping the deterministic decomposer as a non-overridable floor.
+        self._decomposer = decomposer or HeuristicDecomposer()
         self._policy = policy_engine or LocalPolicyEngine()
         self._provider = provider or ManualProvider()
         # Optional: when set, Foundry writes progress/state back to the tracker.
@@ -397,10 +402,11 @@ class FoundryOrchestrator:
         """Decompose an epic ticket into a parent run + per-repo child runs.
 
         The *producer* half of the parent/child run model (issue #35): a ticket
-        that spans several repositories is split (deterministically, by
-        :func:`engines.decomposition.decompose_epic`) into one independently
-        gated child run per repo, grouped under a single parent run for the
-        epic ticket itself.
+        that spans several repositories is split (by the configured
+        :class:`~foundry.engines.decomposition.EpicDecomposer` - deterministic by
+        default, or the LLM-assisted decomposer behind ``decomposition.provider``)
+        into one independently gated child run per repo, grouped under a single
+        parent run for the epic ticket itself.
 
         Each child is an ordinary :meth:`intake_and_plan` run linked via
         ``parent_run_id`` - it is analysed, risk-classified, planned and
@@ -415,7 +421,7 @@ class FoundryOrchestrator:
         root; if the parent loses the one-active-run-per-issue race or is
         otherwise rejected, the error surfaces before any child is created.
         """
-        decomposition = decompose_epic(ticket)
+        decomposition = self._decomposer.decompose(ticket)
         parent_run_id = self.intake_and_plan(
             ticket, trigger_type=trigger_type, created_by=created_by
         )
