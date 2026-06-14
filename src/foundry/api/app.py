@@ -566,6 +566,31 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **delivery_metrics(session, since=since)}
 
+    @app.get("/metrics/delivery/trends")
+    def metrics_delivery_trends(
+        request: Request, days: int = 90, bucket: str = "week"
+    ) -> dict[str, Any]:
+        """Delivery outcomes bucketed over time (PRs shipped, blocks, spend per
+        period) - the trend the single-window ``/metrics/delivery`` can't show.
+        Token-gated and fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS, delivery_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **delivery_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/agents")
     def metrics_agents(request: Request, days: int = 90) -> dict[str, Any]:
         """Per-provider agent scorecards: merge rate, retries and spend, broken
