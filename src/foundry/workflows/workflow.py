@@ -12,6 +12,19 @@ Signals:
 
 Query:
 - ``current_status()`` - the latest known run status.
+
+Retries & failure compensation (made explicit, issue #37):
+- Every activity uses an explicit per-activity timeout + retry policy from
+  ``activity_options.py`` rather than one blanket rule. Deterministic failures
+  (``ValueError`` / ``ValidationError`` / ``OrchestratorError``) are classified
+  non-retryable so they fail fast; idempotent steps retry patiently.
+- Compensation for an elapsed *durable wait* is the audited ``expire`` activity:
+  no approval -> ``BLOCKED``, no PR -> ``EXECUTION_FAILED``. A policy block at
+  dispatch is reported cleanly (``BLOCKED``), never a crash.
+- An activity that exhausts its retries surfaces as a workflow failure and leaves
+  the run row in its last state for inspection / re-trigger - deliberate, not a
+  silent stop. (Auto-marking such a run failed via a compensation activity is a
+  noted follow-up on #37.)
 """
 
 from __future__ import annotations
@@ -26,6 +39,7 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from foundry.schemas.common import RunStatus
     from foundry.workflows.activities import FoundryActivities
+    from foundry.workflows.activity_options import options_for
     from foundry.workflows.decisions import (
         HumanDecision,
         Phase,
@@ -40,10 +54,24 @@ with workflow.unsafe.imports_passed_through():
 _APPROVAL_TIMEOUT = timedelta(days=7)
 _PR_TIMEOUT = timedelta(days=3)
 
-_ACTIVITY_OPTS: dict[str, Any] = {
-    "start_to_close_timeout": timedelta(minutes=5),
-    "retry_policy": RetryPolicy(maximum_attempts=3),
-}
+
+def _opts(method: Any) -> dict[str, Any]:
+    """Build ``execute_activity`` kwargs from the explicit per-activity policy.
+
+    Each activity gets its own timeout + retry policy (``activity_options.py``)
+    rather than one blanket rule: deterministic failures fail fast, idempotent
+    steps retry patiently, and the heaviest step gets a longer budget.
+    """
+    spec = options_for(method.__name__)
+    return {
+        "start_to_close_timeout": spec.start_to_close_timeout,
+        "retry_policy": RetryPolicy(
+            initial_interval=spec.initial_retry_interval,
+            backoff_coefficient=spec.backoff_coefficient,
+            maximum_attempts=spec.maximum_attempts,
+            non_retryable_error_types=list(spec.non_retryable_error_types),
+        ),
+    }
 
 
 @workflow.defn
@@ -62,7 +90,9 @@ class TicketToPrWorkflow:
     @workflow.run
     async def run(self, params: dict[str, Any]) -> dict[str, Any]:
         intake = await workflow.execute_activity_method(
-            FoundryActivities.intake_and_plan, params, **_ACTIVITY_OPTS
+            FoundryActivities.intake_and_plan,
+            params,
+            **_opts(FoundryActivities.intake_and_plan),
         )
         self._run_id = intake["run_id"]
         self._status = intake["status"]
@@ -92,10 +122,14 @@ class TicketToPrWorkflow:
 
         if decision is HumanDecision.APPROVE:
             await workflow.execute_activity_method(
-                FoundryActivities.approve, {**base, "roles": self._roles}, **_ACTIVITY_OPTS
+                FoundryActivities.approve,
+                {**base, "roles": self._roles},
+                **_opts(FoundryActivities.approve),
             )
             dispatched = await workflow.execute_activity_method(
-                FoundryActivities.dispatch_agent, self._run_id, **_ACTIVITY_OPTS
+                FoundryActivities.dispatch_agent,
+                self._run_id,
+                **_opts(FoundryActivities.dispatch_agent),
             )
             self._status = dispatched["status"]
             return phase_after_dispatch(RunStatus(self._status))
@@ -109,7 +143,7 @@ class TicketToPrWorkflow:
             else FoundryActivities.stop
         )
         result = await workflow.execute_activity_method(
-            activity_method, base, **_ACTIVITY_OPTS
+            activity_method, base, **_opts(activity_method)
         )
         self._status = result["status"]
         return Phase.DONE
@@ -146,7 +180,7 @@ class TicketToPrWorkflow:
                 result = await workflow.execute_activity_method(
                     FoundryActivities.record_pr,
                     {"run_id": self._run_id, "pr_state": pr_state},
-                    **_ACTIVITY_OPTS,
+                    **_opts(FoundryActivities.record_pr),
                 )
                 self._status = result["status"]
             if not keep_observing_pr(RunStatus(self._status)):
@@ -156,7 +190,7 @@ class TicketToPrWorkflow:
         result = await workflow.execute_activity_method(
             FoundryActivities.expire,
             {"run_id": self._run_id, "phase": phase.value},
-            **_ACTIVITY_OPTS,
+            **_opts(FoundryActivities.expire),
         )
         self._status = result["status"]
 
