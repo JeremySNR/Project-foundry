@@ -5,13 +5,18 @@ Usage::
     foundry-memory backfill [--recompute]
     foundry-memory show-priors
     foundry-memory show-scorecards
+    foundry-memory recommend-agent [--work-type T] [--repo R] [--candidates a,b]
+                                   [--min-samples N] [--days D]
 
 ``backfill`` derives outcome rows for terminal runs that finished before the
 ``foundry_run_outcomes`` table existed (or that a fail-soft hook missed);
 ``--recompute`` re-derives every terminal run from the audit trail.
 ``show-priors`` prints the mined routing priors; ``show-scorecards`` prints
-per-provider agent performance. Settings come from ``FOUNDRY_CONFIG`` and the
-usual environment variable overrides.
+per-provider agent performance; ``recommend-agent`` turns those scorecards into
+a single, explainable provider recommendation for a piece of work (the
+decision-support read behind the future ``agent.provider: auto`` - reporting
+only). Settings come from ``FOUNDRY_CONFIG`` and the usual environment variable
+overrides.
 """
 
 from __future__ import annotations
@@ -43,6 +48,32 @@ def main() -> None:
         "show-scorecards", help="Print per-provider agent scorecards."
     )
 
+    rec_p = sub.add_parser(
+        "recommend-agent",
+        help="Recommend the agent provider with the best track record for given work.",
+    )
+    rec_p.add_argument(
+        "--work-type", default=None, help="Work type to score for (e.g. feature, bug)."
+    )
+    rec_p.add_argument("--repo", default=None, help="Narrow the recommendation to a repo.")
+    rec_p.add_argument(
+        "--candidates",
+        default=None,
+        help="Comma-separated provider allow-list (only recommend these).",
+    )
+    rec_p.add_argument(
+        "--min-samples",
+        type=int,
+        default=None,
+        help="Runs a provider needs before it is eligible (default 3).",
+    )
+    rec_p.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Only consider outcomes from the last N days (default: all history).",
+    )
+
     args = parser.parse_args()
     if args.command == "backfill":
         _run_backfill(args)
@@ -50,6 +81,8 @@ def main() -> None:
         _run_show_priors()
     elif args.command == "show-scorecards":
         _run_show_scorecards()
+    elif args.command == "recommend-agent":
+        _run_recommend(args)
 
 
 def _session_factory():
@@ -143,4 +176,53 @@ def _run_show_scorecards() -> None:
             print(
                 f"    @ {(repo['repo'] or '-'):<38} "
                 f"{repo['merged']}/{repo['runs']} merged  conf {repo['smoothed_success']}"
+            )
+
+
+def _run_recommend(args: argparse.Namespace) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from foundry.memory.scorecards import DEFAULT_MIN_SAMPLES, recommend_provider
+
+    candidates = (
+        [c.strip() for c in args.candidates.split(",") if c.strip()]
+        if args.candidates
+        else None
+    )
+    since = None
+    if args.days is not None:
+        if args.days < 1:
+            print("error: --days must be >= 1", file=sys.stderr)
+            sys.exit(2)
+        since = datetime.now(timezone.utc) - timedelta(days=args.days)
+    min_samples = (
+        args.min_samples if args.min_samples is not None else DEFAULT_MIN_SAMPLES
+    )
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = recommend_provider(
+            session,
+            work_type=args.work_type,
+            repo=args.repo,
+            candidates=candidates,
+            since=since,
+            min_samples=min_samples,
+        )
+
+    print(f"Scope: {report['scope']}  (min samples {report['min_samples']})")
+    if report["recommended"]:
+        print(f"Recommended: {report['reason']}")
+    else:
+        print(f"Recommended: none - {report['reason']}")
+
+    if report["ranked"]:
+        print(f"\n{'provider':<20} {'merged/runs':<12} {'conf':<5} {'avg $':<8} eligible")
+        for card in report["ranked"]:
+            cost = "-" if card["avg_cost_usd"] is None else f"${card['avg_cost_usd']}"
+            tally = f"{card['merged']}/{card['runs']}"
+            conf = str(card["smoothed_success"] if card["smoothed_success"] is not None else "-")
+            print(
+                f"{card['provider']:<20} {tally:<12} {conf:<5} {cost:<8} "
+                f"{'yes' if card['eligible'] else 'no'}"
             )

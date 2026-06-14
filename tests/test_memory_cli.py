@@ -148,6 +148,36 @@ def test_show_scorecards_prints_provider(monkeypatch, capsys, db_url) -> None:
     assert "customer-web" in out
 
 
+def test_recommend_agent_empty_database(monkeypatch, capsys, db_url) -> None:
+    engine = make_engine(db_url)
+    create_all(engine)
+    _run_cli(monkeypatch, db_url, "recommend-agent", "--work-type", "feature")
+    out = capsys.readouterr().out
+    assert "Recommended: none" in out
+    assert "not enough evidence" in out
+
+
+def test_recommend_agent_with_lowered_floor(monkeypatch, capsys, db_url) -> None:
+    _seed_merged_run(db_url, wipe_memory=False)
+    # One merged run; lower the floor so it qualifies.
+    _run_cli(monkeypatch, db_url, "recommend-agent", "--min-samples", "1")
+    out = capsys.readouterr().out
+    assert "Recommended:" in out
+    assert "fake" in out
+    assert "yes" in out  # the eligible column
+
+
+def test_recommend_agent_rejects_bad_window(monkeypatch, db_url) -> None:
+    engine = make_engine(db_url)
+    create_all(engine)
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr("sys.argv", ["foundry-memory", "recommend-agent", "--days", "0"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+
+
 def test_show_scorecards_empty_database(monkeypatch, capsys, db_url) -> None:
     engine = make_engine(db_url)
     create_all(engine)
