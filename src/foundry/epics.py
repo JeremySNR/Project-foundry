@@ -21,7 +21,30 @@ from collections import Counter
 from enum import Enum
 from typing import Iterable
 
+from pydantic import BaseModel, ConfigDict, Field
+
+from foundry.engines.decomposition import EpicDecomposition
 from foundry.schemas.common import ACTIVE_RUN_STATUSES, RunStatus
+
+
+class EpicIntakeResult(BaseModel):
+    """Outcome of :meth:`FoundryOrchestrator.intake_epic` (issue #35).
+
+    Whether or not the ticket decomposed, ``parent_run_id`` is the run for the
+    epic ticket itself. For a real epic, ``child_run_ids`` holds the
+    independently-gated child runs (oldest first); for a ticket that did not
+    decompose it is empty and the run is an ordinary single-repo run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    parent_run_id: str
+    child_run_ids: list[str] = Field(default_factory=list)
+    decomposition: EpicDecomposition
+
+    @property
+    def is_epic(self) -> bool:
+        return self.decomposition.is_epic
 
 
 class EpicStatus(str, Enum):

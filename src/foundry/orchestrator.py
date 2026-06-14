@@ -30,7 +30,8 @@ from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
 from foundry.connectors.comments import format_analysis_comment, state_for
 from foundry.connectors.notify import ApprovalRequest, RunNotifier
-from foundry.epics import compute_epic_rollup
+from foundry.engines.decomposition import decompose_epic
+from foundry.epics import EpicIntakeResult, compute_epic_rollup
 from foundry.observability import traced
 from foundry.audit.events import (
     build_artifact,
@@ -384,6 +385,59 @@ class FoundryOrchestrator:
         else:
             self._notify_run_status(ticket.issue_id, ticket.issue_key, status)
         return run_id
+
+    @traced("foundry.intake_epic")
+    def intake_epic(
+        self,
+        ticket: RawTicket,
+        *,
+        trigger_type: str,
+        created_by: str | None = None,
+    ) -> EpicIntakeResult:
+        """Decompose an epic ticket into a parent run + per-repo child runs.
+
+        The *producer* half of the parent/child run model (issue #35): a ticket
+        that spans several repositories is split (deterministically, by
+        :func:`engines.decomposition.decompose_epic`) into one independently
+        gated child run per repo, grouped under a single parent run for the
+        epic ticket itself.
+
+        Each child is an ordinary :meth:`intake_and_plan` run linked via
+        ``parent_run_id`` - it is analysed, risk-classified, planned and
+        policy-gated on its own, parks for its own approval, and rolls up into
+        the epic's status. **No gate is weakened**: this only opens more
+        normal runs through the existing path.
+
+        A ticket that does not decompose (fewer than two distinct repos) degrades
+        to a single ordinary run with no children, so a caller can always route
+        through ``intake_epic`` safely. The parent run is created first (and
+        committed) so the children's ``parent_run_id`` validation finds a
+        root; if the parent loses the one-active-run-per-issue race or is
+        otherwise rejected, the error surfaces before any child is created.
+        """
+        decomposition = decompose_epic(ticket)
+        parent_run_id = self.intake_and_plan(
+            ticket, trigger_type=trigger_type, created_by=created_by
+        )
+        if not decomposition.is_epic:
+            return EpicIntakeResult(
+                parent_run_id=parent_run_id, decomposition=decomposition
+            )
+        child_run_ids: list[str] = []
+        for child in decomposition.children:
+            child_run_ids.append(
+                self.intake_and_plan(
+                    child,
+                    trigger_type=trigger_type,
+                    created_by=created_by,
+                    parent_run_id=parent_run_id,
+                )
+            )
+        return EpicIntakeResult(
+            parent_run_id=parent_run_id,
+            child_run_ids=child_run_ids,
+            decomposition=decomposition,
+        )
 
     def _notify_state(self, issue_id: str, status: RunStatus) -> None:
         if self._tracker is not None:
