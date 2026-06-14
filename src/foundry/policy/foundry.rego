@@ -135,7 +135,19 @@ deny_reasons contains msg if {
 	pending := object.get(input, ["budget", "pending_cost_usd"], 0)
 	projected := cost + pending
 	projected >= max_cost
-	msg := sprintf("projected run spend $%.2f would reach the budget cap of $%.2f", [projected, max_cost])
+	msg := sprintf("projected run spend $%s would reach the budget cap of $%s", [usd(projected), usd(max_cost)])
+}
+
+# Format a non-negative dollar amount with exactly two decimals, matching the
+# Python engine's f"{x:.2f}". sprintf's "%.2f" verb cannot be used directly:
+# OPA normalises whole-number arithmetic results (e.g. cost + pending) to ints,
+# and "%.2f" rejects an int, rendering "%!f(int=5)". Formatting via integer
+# cents keeps the two engines byte-for-byte in parity (AGENTS.md invariant #2).
+usd(amount) := s if {
+	cents := round(amount * 100)
+	whole := floor(cents / 100)
+	rem := cents - (whole * 100)
+	s := sprintf("%d.%02d", [whole, rem])
 }
 
 deny_reasons contains msg if {
