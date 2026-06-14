@@ -59,7 +59,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | --- | --- |
 | `schemas/` | Pydantic contracts for every artifact a run produces (`extra="forbid"` — changes here are API changes; update consumers in the same PR) |
 | `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam + `llm_risk.py` escalate-only LLM risk classifiers |
-| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, forbidden globs, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally) |
+| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally). **Forbidden-path blocking is *not* here** — it lives in `orchestrator._forbidden_violations()` (diff-aware, sticky `BLOCKED`) and has no Rego mirror, so invariant #2 doesn't apply to it |
 | `policy/foundry.rego` | OPA mirror of the Python engine — **must change in lock-step**, tests on both sides |
 | `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows |
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |
@@ -73,8 +73,9 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | `audit/` | SHA-256 content hashing for artifacts and events |
 | `config.py` | Layering: built-in defaults → YAML (`FOUNDRY_CONFIG`) → env vars. Behaviour in YAML (committed), secrets in env (never committed). Example: `foundry.example.yaml` |
 
-Other locations: `tests/fixtures/` (recorded webhook payloads pinning every payload
-mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
+Other locations: `tests/fixtures/` (webhook payloads — spec-derived from the
+providers' webhook docs, replaceable by redacted live captures — pinning every
+payload mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
 `examples/claude-code-runner.yml` (reference agent workflow), `scripts/demo.py`
 (offline narrated end-to-end demo — the fastest way to see the whole loop).
 
@@ -102,7 +103,7 @@ mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
 ## Dev commands
 
 ```bash
-pip install -e ".[test]" && pytest          # full offline suite (~320 tests)
+pip install -e ".[test]" && pytest          # full offline suite (~500 tests)
 ruff check src tests                        # lint
 opa test src/foundry/policy -v              # Rego tests (needs opa CLI)
 python scripts/demo.py                      # offline end-to-end demo

@@ -1,7 +1,9 @@
-# Recorded webhook fixtures
+# Webhook fixtures (spec-derived)
 
 Realistic webhook payloads, one JSON file per event, exercised by
-`tests/test_webhook_fixtures.py` through the real signed API endpoints.
+`tests/test_webhook_fixtures.py` through the real signed API endpoints. They are
+**spec-derived** (written from the providers' webhook documentation), not yet
+captured from live traffic - see the provenance note below.
 
 Why they exist: the payload mappings (`src/foundry/api/mapping.py`, the
 connectors) are where live integrations break first, and fixing them should
@@ -17,7 +19,7 @@ The fixtures below were written from the providers' webhook documentation;
 payloads captured from live traffic are strictly better and welcome as
 replacements.
 
-## Recorded GitHub REST responses (catalog code facts)
+## GitHub REST responses (catalog code facts)
 
 `github_tree_recursive.json` / `github_tree_truncated.json` mirror the Git
 Trees API (`GET /repos/{repo}/git/trees/{ref}?recursive=1`), and the

@@ -105,7 +105,7 @@ The tracker and the SCM are seams too, not assumptions:
 - **Jira** (`tracker.provider: jira`) - same trigger/command semantics over Jira Cloud webhooks (`/webhooks/jira`). Jira keys (`ACME-42`) already match the correlation pattern. `set_state` fires the matching workflow transition when one exists and otherwise leaves your workflow alone.
 - **GitLab** - point a project webhook at `/webhooks/gitlab` (merge request + pipeline events, `X-Gitlab-Token` auth) and merge requests close the loop exactly like GitHub PRs, including CI-failure remediation. Set `FOUNDRY_GITLAB_API_TOKEN` so MR diffs are fetched and the same file-based gates (forbidden paths, oversize, sensitive areas) apply; without it GitLab MRs are diff-blind, just as GitHub PRs are without `FOUNDRY_GITHUB_API_TOKEN`.
 
-The webhook payload shapes are pinned by recorded fixtures in `tests/fixtures/` - if a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
+The webhook payload shapes are pinned by fixtures in `tests/fixtures/` - spec-derived from the providers' webhook docs today, and meant to be replaced by redacted live captures over time. If a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
 
 ### The feedback loop
 
@@ -311,7 +311,7 @@ src/foundry/
   audit/           content hashing + the verifiable trail
   api/             the FastAPI app, webhook security, payload mapping, dashboard
 tests/             one module per package, plus the gated Temporal/Postgres/E2E tests
-tests/fixtures/    recorded webhook payloads pinning every payload mapping
+tests/fixtures/    spec-derived webhook payloads pinning every payload mapping
 migrations/        Alembic migrations (Postgres prod; SQLite dev uses create_all)
 examples/          reference Claude Code runner workflow
 scripts/           demo.py (offline narrated demo) + the live E2E smoke test

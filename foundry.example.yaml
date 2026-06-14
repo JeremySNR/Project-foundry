@@ -135,7 +135,9 @@ context:
   # How many file-tree paths to store per repo (shallowest kept first; trees
   # beyond the cap are marked truncated). Minimum 100.
   tree_max_paths: 2000
-  # Optional manual keyword hints, merged with catalog scoring (catalog/code providers only).
+  # Repo -> keyword hints. With provider: static (the default) this map IS the
+  # routing catalog the enricher scores tickets against; with provider:
+  # catalog / code it's merged into the synced org catalog as manual hints.
   # repo_keywords:
   #   acme/billing-service: ["invoice", "stripe"]
 
