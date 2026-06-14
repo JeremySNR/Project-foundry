@@ -44,6 +44,16 @@ def test_issue_key_matches_correlation_pattern() -> None:
         assert pattern.fullmatch(key), key
 
 
+def test_issue_keys_for_similarly_named_repos_do_not_collide() -> None:
+    """Repos that normalise to the same alnum prefix must get distinct keys."""
+    # Same number, different repos that previously both became MYAPP-7 / WEB-7.
+    assert github_issue_key("acme/my-app", 7) != github_issue_key("acme/myapp", 7)
+    assert github_issue_key("acme/web", 7) != github_issue_key("beta/web", 7)
+    # Deterministic: same input always yields the same key (correlation relies
+    # on regenerating the identical key when a PR is observed).
+    assert github_issue_key("acme/web", 7) == github_issue_key("acme/web", 7)
+
+
 def test_split_issue_id_roundtrip() -> None:
     assert split_issue_id("acme/customer-web#42") == ("acme/customer-web", "42")
     with pytest.raises(ValueError):
@@ -89,12 +99,35 @@ def test_connector_post_comment_and_set_state() -> None:
 
     gh.issue["labels"].append({"name": "foundry:status:in-progress"})
     connector.set_state("acme/customer-web#42", "Foundry: Waiting Approval")
-    method, path, body = gh.calls[-1]
-    assert (method, path) == ("PUT", "/repos/acme/customer-web/issues/42/labels")
-    # Old status label replaced, non-status labels kept.
-    assert "foundry:status:in-progress" not in body["labels"]
-    assert "foundry:candidate" in body["labels"]
-    assert any(lab.startswith("foundry:status:") for lab in body["labels"])
+
+    # Additive POST of the new status label, never a whole-set PUT (which would
+    # clobber a concurrent edit to an unrelated label).
+    assert (
+        "POST",
+        "/repos/acme/customer-web/issues/42/labels",
+        {"labels": ["foundry:status:waiting-approval"]},
+    ) in gh.calls
+    assert not any(method == "PUT" for method, _, _ in gh.calls)
+    # The stale status label is removed by a targeted DELETE; non-status labels
+    # (foundry:candidate, repo:customer-web) are never touched.
+    deletes = [path for method, path, _ in gh.calls if method == "DELETE"]
+    assert deletes == [
+        "/repos/acme/customer-web/issues/42/labels/foundry%3Astatus%3Ain-progress"
+    ]
+
+
+def test_set_state_first_status_label_makes_no_delete() -> None:
+    """With no prior foundry:status: label there is nothing to remove."""
+    gh = FakeGitHub()  # issue starts with candidate + repo labels only
+    GitHubIssuesConnector(transport=gh).set_state(
+        "acme/customer-web#42", "Foundry: Waiting Approval"
+    )
+    assert not any(method == "DELETE" for method, _, _ in gh.calls)
+    assert (
+        "POST",
+        "/repos/acme/customer-web/issues/42/labels",
+        {"labels": ["foundry:status:waiting-approval"]},
+    ) in gh.calls
 
 
 # -- payload mapping ---------------------------------------------------------------
@@ -191,7 +224,7 @@ def test_comment_on_labelled_issue_does_not_restart_run(client) -> None:
 
 
 def test_pr_correlates_back_via_synthesised_key(client) -> None:
-    """A delegated agent embeds CUSTOMERWE-42 in its branch; the loop closes."""
+    """A delegated agent embeds the synthesised issue key in its title; loop closes."""
     post_github(client, load("github_issue_labeled.json"), event="issues", delivery="d1")
     post_github(
         client,

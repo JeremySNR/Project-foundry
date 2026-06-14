@@ -33,7 +33,10 @@ Point the `claude_code` provider at Fable 5 (or `cursor_*` at Cursor's agents, o
 
 ```bash
 git clone https://github.com/JeremySNR/Project-foundry && cd Project-foundry
-python -m venv .venv && source .venv/bin/activate && pip install -e .
+python -m venv .venv
+source .venv/bin/activate     # macOS / Linux
+# .venv\Scripts\activate      # Windows (PowerShell or cmd)
+pip install -e .
 python scripts/demo.py
 ```
 
@@ -76,7 +79,7 @@ The whole governed loop is built and tested, with swappable parts at every layer
 | `foundry.workflows` | The Temporal version of the loop: crash-proof, retries, and it'll happily wait days for an approval. |
 | `foundry.agents` | The coding-agent abstraction. Foundry doesn't mind which blaster you bring: `manual`, a test fake, **Cursor** two ways, **Claude Code** via GitHub Actions, or *any* agent behind a signed webhook (see below). |
 | `foundry.connectors` | Adapters for the tools Foundry talks to. Trackers: **Linear**, **GitHub Issues**, **Jira**. SCMs: **GitHub** and **GitLab** (watch the PR/MR, pull failing check summaries). |
-| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, approval commands, run status, the per-run decision timeline, and the dashboard. |
+| `foundry.api` | FastAPI app: signed Linear/GitHub/Jira/GitLab webhooks, Slack interactivity approvals, approval commands, run status, the per-run decision timeline, and the dashboard. |
 | `foundry.config` | The customisation story: a YAML file plus environment variables (see below). |
 
 ### The Cursor handoff (the nice bit)
@@ -98,11 +101,15 @@ Every provider goes through the same `create_job` path, so the secret-leak guard
 The tracker and the SCM are seams too, not assumptions:
 
 - **Linear** (default) - the original flow: signed webhook in, comments and state back.
-- **GitHub Issues** (`tracker.provider: github_issues`) - the issue *is* the ticket. Trigger with the `foundry:candidate` label, approve with a `/foundry approve` comment, and Foundry writes its analysis back as comments and tracks pipeline position with `foundry:status:` labels. Approvers are keyed by GitHub login (the webhook signature plus GitHub's own identity authenticates the actor). Issue keys are synthesised (`CUSTOMERWE-42`) so PR correlation works unchanged.
+- **GitHub Issues** (`tracker.provider: github_issues`) - the issue *is* the ticket. Trigger with the `foundry:candidate` label, approve with a `/foundry approve` comment, and Foundry writes its analysis back as comments and tracks pipeline position with `foundry:status:` labels. Approvers are keyed by GitHub login (the webhook signature plus GitHub's own identity authenticates the actor). Issue keys are synthesised from the repo name plus a short hash of the full `owner/repo` path (`CUSTOMEREB-42`) so PR correlation works unchanged and similarly-named repos never collide.
 - **Jira** (`tracker.provider: jira`) - same trigger/command semantics over Jira Cloud webhooks (`/webhooks/jira`). Jira keys (`ACME-42`) already match the correlation pattern. `set_state` fires the matching workflow transition when one exists and otherwise leaves your workflow alone.
-- **GitLab** - point a project webhook at `/webhooks/gitlab` (merge request + pipeline events, `X-Gitlab-Token` auth) and merge requests close the loop exactly like GitHub PRs, including CI-failure remediation.
+- **GitLab** - point a project webhook at `/webhooks/gitlab` (merge request + pipeline events, `X-Gitlab-Token` auth) and merge requests close the loop exactly like GitHub PRs, including CI-failure remediation. Set `FOUNDRY_GITLAB_API_TOKEN` so MR diffs are fetched and the same file-based gates (forbidden paths, oversize, sensitive areas) apply; without it GitLab MRs are diff-blind, just as GitHub PRs are without `FOUNDRY_GITHUB_API_TOKEN`.
 
-The webhook payload shapes are pinned by recorded fixtures in `tests/fixtures/` - if a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
+Approvals don't have to happen in the tracker, either:
+
+- **Slack** - approvers who live in chat can approve/reject/stop from an interactive message. Point Slack interactivity at `/webhooks/slack` and set `FOUNDRY_SLACK_SIGNING_SECRET`; each button click is verified against Slack's v0 request signature (with replay-age protection) and then driven through the *same* policy gate, role checks, and audit writes as every other surface. The actor is the Slack-signed `user.id`, so key approvers by Slack user id (as GitHub Issues keys them by login). Fail-closed: no signing secret, no endpoint. (Posting the interactive message and pushing run-status notifications back into Slack is the next slice — see issue #32.)
+
+The webhook payload shapes are pinned by fixtures in `tests/fixtures/` - spec-derived from the providers' webhook docs today, and meant to be replaced by redacted live captures over time. If a live integration ever disagrees with the mapping, the fix is a redacted capture plus a test, no credentials needed.
 
 ### The feedback loop
 
@@ -110,7 +117,17 @@ A PR that opens and then fails CI used to be where automation stalled. Now: a fa
 
 ### The dashboard
 
-`GET /dashboard` serves a zero-build, read-only page over the audit data: every run with status badges, and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`).
+`GET /dashboard` serves a zero-build, read-only page over the audit data: a **live fleet strip** at the top (runs in flight, the approval-queue depth, agents running, PRs open, and spend committed by runs still in flight - the "what is every agent doing right now" view, backed by `GET /metrics/fleet`), every run with status badges (filterable down to an **approval queue** - just what is waiting on a human right now), a delivery-metrics strip, a **delivery-trend table** (PRs shipped vs blocked, by week), and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`). `GET /metrics/fleet` is a snapshot of the runs' *current* state (no time window), distinct from the historical delivery metrics below, which aggregate finished runs over a window.
+
+### Delivery memory
+
+A run used to end at "PR merged" and the data died there. Now every finished run is distilled into an outcome row - time to merge, retries consumed, escalations, spend, and a block-reason taxonomy - derived entirely from the audit trail (so `foundry-memory backfill` rebuilds it for runs that finished before the table existed). That history feeds back in two ways:
+
+- **Routing priors.** With the catalog enricher, "14 of 16 of this team's feature tickets merged in billing-service" becomes a routing signal with an audit-friendly reason string. It is bounded on every side: a minimum sample size before history speaks at all, a smoothed (never triumphalist) success rate that must clear 50%, and a confidence cap of 89 so an explicit repo association on the ticket (90) always wins. `memory.priors_enabled: false` switches it off.
+- **ROI evidence.** `GET /metrics/delivery?days=90` (token-gated) answers the question a buyer actually asks - PRs shipped, blocked and why, median/p90 time to merge, retries, escalations, total agent spend - plus observed routing precision by confidence band, which is the data you need before moving `policy.repo_confidence_threshold` off its default. The dashboard shows the same numbers in a strip above the run list, and `foundry-memory show-priors` prints the mined history. `GET /metrics/delivery/trends?days=90&bucket=week` (or `bucket=day`) returns the same throughput/blocks/spend bucketed over time - the "is delivery trending up or down?" view - which the dashboard renders as a trend table.
+- **Agent scorecards.** `GET /metrics/agents?days=90` (token-gated) turns the same outcome rows into *which agent* to trust: per provider, broken down by work type and repo, the smoothed merge rate, retries consumed, and spend. GitHub will never tell you Cursor outperforms Copilot on your billing service; Foundry can, with receipts, and it compounds with every run. `foundry-memory show-scorecards` prints it and the dashboard carries it alongside the metrics strip. This is reporting only - acting on it (`agent.provider: auto` learned dispatch) is a deliberately separate, policy-gated change.
+
+Blocks are never auto-judged: a blocked run whose issue later merges in a fresh run is reported as *superseded*, which is the honest proxy for "the gate held and a human fixed the input".
 
 ## Customising it
 
@@ -125,10 +142,14 @@ Copy [`foundry.example.yaml`](./foundry.example.yaml) to `foundry.yaml`, edit it
 analyzer:
   provider: openai          # or "heuristic" for the no-key default
   model: gpt-5.5
+risk:
+  provider: llm             # or "heuristic" (default): keywords + globs, no key.
+                            # "llm" adds cited evidence to the audit trail and can
+                            # only ESCALATE over the deterministic floor, never lower it.
 policy:
   repo_confidence_threshold: 70   # block work we can't confidently place in a repo
   max_files_changed: 12           # bigger PRs go to a human
-  forbidden_globs: ["infra/**", "migrations/**", "**/.env*", "**/secrets/**"]
+  forbidden_globs: ["infra/**", "**/infra/**", "migrations/**", "**/migrations/**", "**/.env*", "**/secrets/**"]
   sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
     auth: ["**/auth/**", "**/login/**", "**/sso/**"]
     payments: ["**/billing/**", "**/stripe/**"]
@@ -164,12 +185,17 @@ Secrets via env:
 | `FOUNDRY_JIRA_WEBHOOK_SECRET` | Enables `/webhooks/jira` (token-compared; endpoint disabled without it). |
 | `FOUNDRY_JIRA_BASE_URL` / `..._EMAIL` / `..._API_TOKEN` | Jira Cloud credentials when the tracker is `jira`. |
 | `FOUNDRY_GITLAB_WEBHOOK_SECRET` | Enables `/webhooks/gitlab` (`X-Gitlab-Token`; endpoint disabled without it). |
-| `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
+| `FOUNDRY_GITLAB_API_TOKEN` / `..._BASE` | Fetches MR diffs so GitLab MRs run the same file-based gates as GitHub PRs (without it, MRs are diff-blind). `..._BASE` overrides the API root for self-managed GitLab. |
+| `FOUNDRY_SLACK_SIGNING_SECRET` | Enables `/webhooks/slack` (Slack v0 request-signing + replay-age; endpoint disabled without it). |
+| `FOUNDRY_SLACK_BOT_TOKEN` / `FOUNDRY_SLACK_CHANNEL` | Enables outbound Slack: posts the interactive approval message + status updates (parked/blocked/PR open/merged). Fail-closed — both (token + channel, the latter also settable via `notifications.slack_channel`) required, else no notifier. |
+| `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API and the dashboard. **Unset = those are disabled** (fail closed); approvals still work via signed Linear comments. |
 | `FOUNDRY_AGENT_PROVIDER` | Overrides `agent.provider` from the YAML. |
 | `FOUNDRY_CURSOR_API_TOKEN` | Needed when the provider is `cursor_cloud`. |
 | `FOUNDRY_AGENT_WEBHOOK_URL` / `..._SECRET` | Needed when the provider is `webhook`; the secret HMAC-signs the job payload. |
 | `OPENAI_API_KEY` | Needed when the analyzer provider is `openai`. |
 | `TEMPORAL_ADDRESS` | The Temporal server, for durable runs. |
+| `FOUNDRY_CONTEXT_PROVIDER` | Overrides `context.provider` (`static`, `catalog` or `code`). |
+| `FOUNDRY_CONTEXT_ORG` | GitHub org for `foundry-catalog sync`; overrides `context.org`. |
 
 The same code runs on a laptop (SQLite, heuristics, no keys) and in production (Postgres, GPT-5.5, live Linear and GitHub) with nothing changing but config. That's the point.
 
@@ -182,7 +208,8 @@ Tagged releases (`vX.Y.Z`) publish a container image to GHCR (`ghcr.io/jeremysnr
 For development:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate     # macOS / Linux; on Windows: .venv\Scripts\activate
 pip install -e ".[test]"
 pytest
 ```
@@ -195,6 +222,25 @@ export FOUNDRY_CONFIG=foundry.yaml
 export FOUNDRY_LINEAR_WEBHOOK_SECRET=...   # and friends
 uvicorn foundry.api.app:app_from_env --factory
 ```
+
+To use the catalog-backed context enricher (`context.provider: catalog`), populate the repo
+catalog first and then keep it fresh with a periodic sweep:
+
+```bash
+export FOUNDRY_GITHUB_API_TOKEN=...
+foundry-catalog sync --org <your-github-org> --bootstrap
+```
+
+Run this on a schedule (e.g. daily cron or a Temporal workflow) so the catalog stays current.
+The sync is stateful and budget-aware: interrupted sweeps resume automatically on the next run.
+
+The code-aware enricher (`context.provider: code`) goes further: the sync also records each
+repo's file tree (one Git Trees API call), test layout, CODEOWNERS rules and root dependency
+manifests — `foundry-catalog sync --code-facts`, implied when the provider is `code`. Routing
+then matches tickets against actual code paths, reason strings cite concrete files and owners
+("Code evidence: src/billing/invoice.py; owners: @org/payments"), and the context bundle carries
+candidate files, the test layout and inferred test commands for the plan. Worst case the sync
+spends 9 API calls per repo instead of 3; the same budget and resume semantics apply.
 
 Optional extras, install what you need:
 
@@ -218,7 +264,8 @@ These are enforced, tested, and not negotiable by a prompt:
 - The policy gate is **default-deny**: an action it doesn't recognise is refused.
 - Auth, payments, PII and customer data need a human approval before an agent goes near them - and the approval has to come from someone whose *configured role* covers it. Roles live in committed YAML; an API caller cannot claim "security" for themselves.
 - Approval surfaces are authenticated, full stop. Linear comments arrive over a signed webhook with the actor identity from Linear; the REST endpoint needs a bearer token and is disabled outright when none is configured.
-- Risk is checked twice: once from the ticket (before dispatch) and again from the **diff** (after the PR opens). A ticket that said "fix the button" whose PR touches `auth/` escalates to human review - and the guardrails re-run on *every push*, so an agent can't open a clean PR and sneak files in later.
+- The network surfaces are rate limited. Signatures stop *unauthorised* callers; a coarse per-client cap (on by default, configurable under `rate_limit:`) stops a flood of authorised-looking ones - a replayed webhook in a loop, a runaway integration, a token brute-force - from exhausting the process. Webhooks and the API get independent budgets so a burst on one can't starve the other.
+- Risk is checked twice: once from the ticket (before dispatch) and again from the **diff** (after the PR opens). A ticket that said "fix the button" whose PR touches `auth/` escalates to human review - and the guardrails re-run on *every push*, so an agent can't open a clean PR and sneak files in later. With `risk.provider: llm`, a model pass writes its cited reasoning into the audit trail ("touches session issuance in `auth/tokens.py`") - and it may only *escalate* over the deterministic keyword/glob floor, never downgrade it.
 - Bigger-than-expected PRs and anything touching forbidden paths get bounced to a human.
 - The agent may retry its own failing PR, but every retry is a fresh policy decision: approvals re-checked, attempts capped, budget capped, all audited. Past the cap, a human takes over. A forbidden-path block is never retried.
 - No auto-merge. Ever, in this version.
@@ -260,6 +307,7 @@ src/foundry/
   observability.py OpenTelemetry spans (no-op without the extra)
   schemas/         the run artifact contracts (+ enums in common.py)
   engines/         analyzer / enrichment / risk / planner, plus the GPT-5.5 analyzer
+                   and the escalate-only LLM risk classifier (llm_risk.py)
   orchestrator.py  the state machine that runs a ticket end to end
   drivers.py       the RunDriver seam (inline today, Temporal attaches here)
   workflows/       decisions.py (pure) + the Temporal workflow, activities, worker
@@ -270,7 +318,7 @@ src/foundry/
   audit/           content hashing + the verifiable trail
   api/             the FastAPI app, webhook security, payload mapping, dashboard
 tests/             one module per package, plus the gated Temporal/Postgres/E2E tests
-tests/fixtures/    recorded webhook payloads pinning every payload mapping
+tests/fixtures/    spec-derived webhook payloads pinning every payload mapping
 migrations/        Alembic migrations (Postgres prod; SQLite dev uses create_all)
 examples/          reference Claude Code runner workflow
 scripts/           demo.py (offline narrated demo) + the live E2E smoke test

@@ -84,3 +84,55 @@ def test_cascade_delete_removes_children(session) -> None:
     from foundry.db import FoundryAuditEvent
 
     assert session.query(FoundryAuditEvent).count() == 0
+
+
+def test_run_outcome_roundtrip_and_upsert(session) -> None:
+    from datetime import datetime, timezone
+
+    from foundry.db.models import FoundryRunOutcome
+
+    run = FoundryRun(
+        id="run-3",
+        linear_issue_id="i3",
+        linear_issue_key="ENG-3",
+        status=RunStatus.COMPLETE,
+        trigger_type="label",
+    )
+    session.add(run)
+    now = datetime.now(timezone.utc)
+    session.add(
+        FoundryRunOutcome(
+            run_id="run-3",
+            linear_issue_id="i3",
+            issue_key_prefix="ENG",
+            outcome="merged",
+            repo="acme/billing-service",
+            trigger_type="label",
+            created_at_run=now,
+            completed_at=now,
+            jobs_count=2,
+        )
+    )
+    session.commit()
+
+    fetched = session.get(FoundryRunOutcome, "run-3")
+    assert fetched.outcome == "merged"
+    assert fetched.jobs_count == 2
+    assert fetched.block_justified is None
+
+    # Upsert by primary key: merge replaces, never duplicates.
+    session.merge(
+        FoundryRunOutcome(
+            run_id="run-3",
+            linear_issue_id="i3",
+            issue_key_prefix="ENG",
+            outcome="blocked",
+            blocked_reason_category="human_stopped",
+            trigger_type="label",
+            created_at_run=now,
+            jobs_count=2,
+        )
+    )
+    session.commit()
+    assert session.query(FoundryRunOutcome).count() == 1
+    assert session.get(FoundryRunOutcome, "run-3").outcome == "blocked"

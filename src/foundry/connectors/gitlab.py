@@ -10,14 +10,29 @@ request as far as the governed loop is concerned. Supported hooks:
 
 GitLab webhooks authenticate with a shared token sent verbatim in
 ``X-Gitlab-Token`` (no HMAC); the endpoint compares it in constant time.
+
+Like the GitHub connector, the changed-file list is enriched via the REST API
+(injected ``transport`` - no network in tests). That list feeds the
+forbidden-path hard block and the oversize/sensitive-area gates; without a
+transport the list is empty and a GitLab MR runs diff-blind, so configure a
+``gitlab_api_token`` in production to get the same gates GitHub PRs get.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from urllib.parse import quote
+from typing import Any, Callable
 
 from foundry.schemas.common import CIStatus, PRStatus, ReviewStatus
 from foundry.schemas.pr import PullRequestState
+
+# transport(method, path) -> parsed JSON
+Transport = Callable[[str, str], Any]
+
+# GitLab paginates the diffs endpoint; the file list feeds the forbidden-path
+# hard block, so a truncated list would let files beyond the first page bypass
+# the gate. Page at the API maximum and loop until a short page.
+_PER_PAGE = 100
 
 _MR_STATE = {
     "opened": PRStatus.OPEN,
@@ -38,6 +53,39 @@ _PIPELINE_STATUS = {
 
 
 class GitLabConnector:
+    def __init__(self, *, transport: Transport | None = None) -> None:
+        self._transport = transport
+
+    def list_mr_files(self, repo: str, iid: int) -> list[str]:
+        """Paths touched by a merge request, for the file-based safety gates.
+
+        Returns an empty list when no transport is configured. Both the new and
+        the old path are collected (deduped, order-preserving) so a rename *out
+        of* a forbidden directory is still caught - strictly more conservative
+        than reporting only the new path.
+        """
+        if self._transport is None:
+            return []
+        project = quote(repo, safe="")
+        files: list[str] = []
+        seen: set[str] = set()
+        page = 1
+        while True:
+            data = self._transport(
+                "GET",
+                f"/projects/{project}/merge_requests/{iid}/diffs"
+                f"?per_page={_PER_PAGE}&page={page}",
+            )
+            batch = data or []
+            for diff in batch:
+                for path in (diff.get("new_path"), diff.get("old_path")):
+                    if path and path not in seen:
+                        seen.add(path)
+                        files.append(path)
+            if len(batch) < _PER_PAGE:
+                return files
+            page += 1
+
     def pr_state_from_event(
         self, event: str, payload: dict[str, Any]
     ) -> PullRequestState | None:
@@ -68,6 +116,7 @@ class GitLabConnector:
         )
         if attrs.get("action") == "approved":
             state.review_status = ReviewStatus.APPROVED
+        state.files_changed = self.list_mr_files(repo, attrs["iid"])
         return state
 
     def _from_pipeline(self, payload: dict[str, Any]) -> PullRequestState | None:

@@ -7,6 +7,8 @@ Tables (from the build plan):
 - ``foundry_audit_events``     - append-only audit trail.
 - ``foundry_policy_decisions`` - every policy gate decision.
 - ``foundry_agent_jobs``       - coding-agent jobs dispatched for a run.
+- ``foundry_repo_catalog``     - per-repo metadata synced from the GitHub org.
+- ``foundry_run_outcomes``     - one denormalized row per *finished* run.
 
 Artifact and audit rows carry a content hash so the immutable input snapshot and
 every decision can be verified after the fact.
@@ -27,10 +29,16 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from foundry.schemas.common import AgentMode, OverallRisk, RunStatus
+from foundry.schemas.common import (
+    ACTIVE_RUN_STATUSES,
+    AgentMode,
+    OverallRisk,
+    RunStatus,
+)
 
 from .base import Base
 
@@ -70,6 +78,7 @@ class AuditEventType(str, enum.Enum):
     APPROVAL_REJECTED = "approval.rejected"
     AGENT_STARTED = "agent.started"
     AGENT_FAILED = "agent.failed"
+    AGENT_CANCELLED = "agent.cancelled"
     AGENT_REMEDIATION_REQUESTED = "agent.remediation_requested"
     PR_OPENED = "pr.opened"
     PR_UPDATED = "pr.updated"
@@ -80,12 +89,32 @@ class AuditEventType(str, enum.Enum):
     RUN_BLOCKED = "run.blocked"
 
 
+# SQLAlchemy's Enum persists member *names* ('ANALYSING', ...), so the index
+# predicate below must use names, not values. Derived from ACTIVE_RUN_STATUSES
+# so the schema can never drift from the lifecycle definition.
+_ACTIVE_STATUS_PREDICATE = "status IN ({})".format(
+    ", ".join(sorted(f"'{s.name}'" for s in ACTIVE_RUN_STATUSES))
+)
+
+
 class FoundryRun(Base):
     __tablename__ = "foundry_runs"
 
-    # NOTE: deliberately no unique constraint on linear_issue_id - a ticket may
+    # NOTE: linear_issue_id is deliberately not unique on its own - a ticket may
     # be re-analysed after clarification, rejection or failure. "At most one
-    # *active* run per issue" is enforced at intake, not by the schema.
+    # *active* run per issue" is enforced by the partial unique index below
+    # (migration 0006 on Postgres; create_all on SQLite dev), which backstops
+    # the intake pre-check against concurrent webhook deliveries.
+    __table_args__ = (
+        Index(
+            "uq_foundry_runs_one_active_per_issue",
+            "linear_issue_id",
+            unique=True,
+            sqlite_where=text(_ACTIVE_STATUS_PREDICATE),
+            postgresql_where=text(_ACTIVE_STATUS_PREDICATE),
+        ),
+    )
+
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     linear_issue_id: Mapped[str] = mapped_column(String(128), index=True)
     linear_issue_key: Mapped[str] = mapped_column(String(64), index=True)
@@ -146,6 +175,17 @@ class FoundryArtifact(Base):
 
 class FoundryAuditEvent(Base):
     __tablename__ = "foundry_audit_events"
+    # The per-run sequence is the audit trail's guaranteed order. A unique
+    # constraint makes a duplicate sequence (e.g. two unlocked sessions both
+    # computing max(sequence)+1 under concurrency) fail loudly at insert rather
+    # than silently corrupting the order (issue #10). State transitions now take
+    # a row lock so this should never trip; if it does, that is a bug surfacing,
+    # not data to keep.
+    __table_args__ = (
+        Index(
+            "uq_audit_event_run_sequence", "run_id", "sequence", unique=True
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("foundry_runs.id"), index=True)
@@ -192,7 +232,9 @@ class FoundryAgentJob(Base):
     status: Mapped[AgentJobStatus] = mapped_column(
         Enum(AgentJobStatus), default=AgentJobStatus.CREATED
     )
-    repo: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 255 to match FoundryRunOutcome.repo / FoundryRepoCatalog.repo - a long
+    # "org/name" must not fail insert here mid-run when it fits everywhere else.
+    repo: Mapped[str | None] = mapped_column(String(255), nullable=True)
     branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(
@@ -206,3 +248,113 @@ class FoundryAgentJob(Base):
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     run: Mapped[FoundryRun] = relationship(back_populates="agent_jobs")
+
+
+class FoundryRunOutcome(Base):
+    """Delivery memory: one denormalized row per finished run.
+
+    Every field is *derived* from rows that already exist (audit events, agent
+    jobs, artifacts), so the row is a reproducible cache, never the source of
+    truth - ``foundry-memory backfill`` can rebuild it for any terminal run.
+    Priors mining and delivery metrics read this table instead of re-joining
+    the audit trail on every request.
+
+    ``outcome`` and the taxonomy columns are plain strings (not sa.Enum) so
+    new values never need a Postgres ALTER TYPE.
+    """
+
+    __tablename__ = "foundry_run_outcomes"
+    __table_args__ = (
+        Index("idx_outcome_priors", "issue_key_prefix", "work_type", "repo", "outcome"),
+        Index("idx_outcome_completed", "completed_at"),
+    )
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("foundry_runs.id"), primary_key=True
+    )
+    linear_issue_id: Mapped[str] = mapped_column(String(128), index=True)
+    # Team proxy: the "ENG" in "ENG-123". RawTicket carries no team field.
+    issue_key_prefix: Mapped[str] = mapped_column(String(16))
+    # Terminal RunStatus mapped to a stable vocabulary:
+    # merged / blocked / rejected / failed / needs_clarification.
+    outcome: Mapped[str] = mapped_column(String(32), index=True)
+    # Where the work landed (latest agent job). NULL = never routed/dispatched.
+    repo: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Which agent shipped it (latest agent job's provider). NULL = never
+    # dispatched. Feeds per-provider scorecards (which agent, by work type/repo).
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Best-candidate confidence at routing time, from the context_bundle
+    # artifact - the raw material for precision-by-confidence-band calibration.
+    routed_confidence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    work_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    labels_json: Mapped[str] = mapped_column(Text, default="[]")
+    risk_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    trigger_type: Mapped[str] = mapped_column(String(64))
+    created_at_run: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # When the run actually finished (terminal audit event time).
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    time_to_merge_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Retries consumed = max(jobs_count - 1, 0).
+    jobs_count: Mapped[int] = mapped_column(Integer, default=0)
+    escalations_count: Mapped[int] = mapped_column(Integer, default=0)
+    ci_failures_count: Mapped[int] = mapped_column(Integer, default=0)
+    # From the latest pr_state artifact; seeds the future plan-vs-diff gate.
+    files_changed_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Block taxonomy: forbidden_paths / pr_closed_unmerged / policy_denied /
+    # human_stopped / unroutable. NULL unless outcome is blocked.
+    blocked_reason_category: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    # Deliberately NULL in v1: justification is derived on read (a later run on
+    # the same issue merging is the supersession proxy), never guessed at write.
+    block_justified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    run: Mapped[FoundryRun] = relationship()
+
+
+class FoundryRepoCatalogEntry(Base):
+    """One row per repository in the org: the metadata the enricher scores against.
+
+    Metadata plus, when code-facts sync is enabled, narrowly-scoped code facts:
+    tree paths (capped), CODEOWNERS rules, and root dependency manifests - never
+    a clone, never arbitrary file contents. ``synced_at`` is when we last
+    deep-fetched; ``pushed_at`` is GitHub's last-push time refreshed on every
+    sweep. ``pushed_at > synced_at`` means the entry is stale.
+    """
+
+    __tablename__ = "foundry_repo_catalog"
+
+    repo: Mapped[str] = mapped_column(String(255), primary_key=True)  # "org/name"
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    topics: Mapped[str] = mapped_column(Text, default="[]")            # JSON list[str]
+    primary_language: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    default_branch: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    readme_head: Mapped[str | None] = mapped_column(Text, nullable=True)   # first 4096 chars
+    top_dirs: Mapped[str] = mapped_column(Text, default="[]")          # JSON list[str]
+    recent_pr_titles: Mapped[str] = mapped_column(Text, default="[]")  # JSON list[str]
+    top_contributors: Mapped[str] = mapped_column(Text, default="[]")  # JSON list[str] of logins
+    # Code facts (populated only when sync runs with code facts enabled).
+    tree_paths: Mapped[str] = mapped_column(Text, default="[]")        # JSON list[str], capped
+    tree_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    test_layout: Mapped[str] = mapped_column(Text, default="[]")       # JSON list[str]
+    codeowners: Mapped[str] = mapped_column(Text, default="[]")        # JSON list[{pattern, owners}]
+    manifests: Mapped[str] = mapped_column(Text, default="[]")         # JSON list[ManifestFacts-shaped]
+    languages: Mapped[str] = mapped_column(Text, default="{}")         # JSON dict ext -> file count
+    pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    etag: Mapped[str | None] = mapped_column(String(128), nullable=True)  # reserved, unused
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

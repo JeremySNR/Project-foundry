@@ -8,7 +8,11 @@ the implementation; that stays with the coding agent (Cursor).
 
 Robustness: the model output is validated against the ``TicketAnalysis`` schema
 and retried with corrective feedback; identity fields are overwritten from the
-ticket so a hallucinated id/title can't slip through.
+ticket so a hallucinated id/title can't slip through. If the LLM is unavailable
+(or persistently returns invalid output), the analyzer degrades to the
+deterministic :class:`HeuristicAnalyzer` and records the degradation in the
+analysis assumptions - mirroring the risk classifiers' degrade-to-floor design -
+so an LLM outage never fails intake.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from pydantic import ValidationError
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.schemas.ticket import RawTicket
 
+from .analyzer import HeuristicAnalyzer, TicketAnalyzer
 from .llm import LLMError, StructuredLLM
 
 _SYSTEM_PROMPT = """\
@@ -51,11 +56,24 @@ def _render_user(ticket: RawTicket) -> str:
 
 
 class OpenAITicketAnalyzer:
-    def __init__(self, llm: StructuredLLM, *, max_attempts: int = 2) -> None:
+    def __init__(
+        self,
+        llm: StructuredLLM,
+        *,
+        max_attempts: int = 2,
+        fallback: TicketAnalyzer | None = None,
+    ) -> None:
         self._llm = llm
         self._max_attempts = max(1, max_attempts)
+        self._fallback = fallback or HeuristicAnalyzer()
 
     def analyse(self, ticket: RawTicket) -> TicketAnalysis:
+        try:
+            return self._llm_analyse(ticket)
+        except LLMError as exc:
+            return self._degraded(ticket, exc)
+
+    def _llm_analyse(self, ticket: RawTicket) -> TicketAnalysis:
         schema = TicketAnalysis.model_json_schema()
         user = _render_user(ticket)
         last_error: Exception | None = None
@@ -79,6 +97,20 @@ class OpenAITicketAnalyzer:
         raise LLMError(
             f"OpenAI analyzer could not produce a valid TicketAnalysis after "
             f"{self._max_attempts} attempts: {last_error}"
+        )
+
+    def _degraded(self, ticket: RawTicket, exc: LLMError) -> TicketAnalysis:
+        """Fall back to the deterministic analyzer, loudly.
+
+        The heuristic baseline is conservative (no acceptance criteria means
+        not buildable), so degrading can only park a run for clarification,
+        never wave unready work through - and the note lands in the persisted
+        TICKET_ANALYSIS artifact so the degradation is auditable.
+        """
+        note = f"LLM analysis unavailable ({exc}); deterministic heuristic analysis used."
+        analysis = self._fallback.analyse(ticket)
+        return analysis.model_copy(
+            update={"assumptions": [*analysis.assumptions, note]}
         )
 
     @staticmethod

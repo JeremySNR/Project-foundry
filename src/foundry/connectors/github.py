@@ -39,6 +39,11 @@ _REVIEW_STATE = {
     "changes_requested": ReviewStatus.CHANGES_REQUESTED,
 }
 
+# GitHub defaults to 30 items per page; the file list feeds the forbidden-path
+# hard block, so truncation would let files beyond the first page bypass the
+# gate. Page at the API maximum and loop until a short page.
+_PER_PAGE = 100
+
 
 class GitHubConnector:
     def __init__(self, *, transport: Transport | None = None) -> None:
@@ -47,8 +52,19 @@ class GitHubConnector:
     def list_pr_files(self, repo: str, number: int) -> list[str]:
         if self._transport is None:
             return []
-        data = self._transport("GET", f"/repos/{repo}/pulls/{number}/files")
-        return [f["filename"] for f in data if f.get("filename")]
+        files: list[str] = []
+        page = 1
+        while True:
+            data = self._transport(
+                "GET",
+                f"/repos/{repo}/pulls/{number}/files"
+                f"?per_page={_PER_PAGE}&page={page}",
+            )
+            batch = data or []
+            files.extend(f["filename"] for f in batch if f.get("filename"))
+            if len(batch) < _PER_PAGE:
+                return files
+            page += 1
 
     def failing_check_summaries(self, repo: str, suite_id: int) -> str:
         """Names + output summaries of failed check runs, for remediation context.
@@ -58,22 +74,29 @@ class GitHubConnector:
         """
         if self._transport is None or not suite_id:
             return ""
-        data = self._transport(
-            "GET", f"/repos/{repo}/check-suites/{suite_id}/check-runs"
-        )
         lines: list[str] = []
-        for check in data.get("check_runs", []) or []:
-            if (check.get("conclusion") or "").lower() not in {
-                "failure",
-                "timed_out",
-                "cancelled",
-            }:
-                continue
-            name = check.get("name", "unnamed check")
-            output = check.get("output") or {}
-            summary = (output.get("summary") or output.get("title") or "").strip()
-            lines.append(f"- {name}: {summary}" if summary else f"- {name}")
-        return "\n".join(lines)
+        page = 1
+        while True:
+            data = self._transport(
+                "GET",
+                f"/repos/{repo}/check-suites/{suite_id}/check-runs"
+                f"?per_page={_PER_PAGE}&page={page}",
+            )
+            batch = (data or {}).get("check_runs") or []
+            for check in batch:
+                if (check.get("conclusion") or "").lower() not in {
+                    "failure",
+                    "timed_out",
+                    "cancelled",
+                }:
+                    continue
+                name = check.get("name", "unnamed check")
+                output = check.get("output") or {}
+                summary = (output.get("summary") or output.get("title") or "").strip()
+                lines.append(f"- {name}: {summary}" if summary else f"- {name}")
+            if len(batch) < _PER_PAGE:
+                return "\n".join(lines)
+            page += 1
 
     def pr_state_from_event(
         self, event: str, payload: dict[str, Any]
@@ -109,6 +132,14 @@ class GitHubConnector:
         return state
 
     def _from_review(self, payload: dict[str, Any]) -> PullRequestState | None:
+        # Only a freshly *submitted* review reports a completed review. A
+        # ``dismissed`` (or ``edited``) action carries a review object whose
+        # state would otherwise fall through to HUMAN_REVIEWED/BOT_REVIEWED -
+        # reading a withdrawn review as a real one. GitHub always sends an
+        # action for this event; a missing one is treated leniently.
+        action = (payload.get("action") or "").lower()
+        if action and action != "submitted":
+            return None
         pr = payload.get("pull_request")
         review = payload.get("review") or {}
         repo = (payload.get("repository") or {}).get("full_name")
@@ -125,15 +156,26 @@ class GitHubConnector:
     def _from_check_suite(self, payload: dict[str, Any]) -> PullRequestState | None:
         suite = payload.get("check_suite") or {}
         repo = (payload.get("repository") or {}).get("full_name")
-        prs = suite.get("pull_requests") or []
-        if not repo or not prs:
+        if not repo:
             return None
-        pr = prs[0]
+        # Pick the PR whose head matches this suite. Fork PRs arrive with an
+        # empty ``pull_requests`` list (GitHub omits PRs living in another repo),
+        # so fall back to the suite's own ``head_branch`` - correlation is by
+        # branch/issue-key, not PR number, and dropping the event would lose CI
+        # status for every fork contribution.
+        head_branch = suite.get("head_branch") or ""
+        prs = suite.get("pull_requests") or []
+        pr = next(
+            (p for p in prs if (p.get("head") or {}).get("ref") == head_branch),
+            prs[0] if prs else None,
+        )
+        if pr is None and not head_branch:
+            return None
         state = PullRequestState(
             repo=repo,
-            pr_number=pr["number"],
-            url=pr.get("url", ""),
-            branch=(pr.get("head") or {}).get("ref", ""),
+            pr_number=(pr or {}).get("number", 0),
+            url=(pr or {}).get("url", ""),
+            branch=((pr or {}).get("head") or {}).get("ref", "") or head_branch,
             status=PRStatus.OPEN,
         )
         conclusion = (suite.get("conclusion") or "").lower()

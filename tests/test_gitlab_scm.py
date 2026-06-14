@@ -61,6 +61,69 @@ def test_approved_action_sets_review_status() -> None:
     assert state.review_status is ReviewStatus.APPROVED
 
 
+# -- changed-file enrichment (the file-based safety gates depend on it) -------
+
+
+def test_mr_files_empty_without_transport() -> None:
+    """No transport => diff-blind, same posture as GitHubConnector unconfigured."""
+    state = GitLabConnector().pr_state_from_event(
+        "Merge Request Hook", load("gitlab_merge_request_opened.json")
+    )
+    assert state.files_changed == []
+
+
+def test_mr_files_enriched_via_transport() -> None:
+    def transport(method: str, path: str):
+        assert method == "GET"
+        assert path == (
+            "/projects/acme%2Fcustomer-web/merge_requests/87/diffs?per_page=100&page=1"
+        )
+        return load("gitlab_mr_diffs.json")
+
+    state = GitLabConnector(transport=transport).pr_state_from_event(
+        "Merge Request Hook", load("gitlab_merge_request_opened.json")
+    )
+    assert state.files_changed == [
+        "src/features/favourites/index.ts",
+        "src/features/favourites/store.ts",
+    ]
+
+
+def test_mr_files_includes_renamed_old_path_deduped() -> None:
+    """A rename reports both new and old path; identical paths collapse to one."""
+
+    def transport(method: str, path: str):
+        return [
+            {"new_path": "src/new.ts", "old_path": "migrations/0001.sql"},
+            {"new_path": "src/keep.ts", "old_path": "src/keep.ts"},
+        ]
+
+    files = GitLabConnector(transport=transport).list_mr_files("acme/web", 87)
+    assert files == ["src/new.ts", "migrations/0001.sql", "src/keep.ts"]
+
+
+def test_list_mr_files_paginates_until_short_page() -> None:
+    """A forbidden file beyond the first page must still reach the gate."""
+    pages = {
+        1: [{"new_path": f"src/file_{i}.py"} for i in range(100)],
+        2: [{"new_path": f"src/more_{i}.py"} for i in range(49)]
+        + [{"new_path": "migrations/0042.py"}],
+    }
+    requested: list[str] = []
+
+    def transport(method: str, path: str):
+        requested.append(path)
+        return pages[int(path.rsplit("page=", 1)[1])]
+
+    files = GitLabConnector(transport=transport).list_mr_files("acme/web", 87)
+    assert len(files) == 150
+    assert "migrations/0042.py" in files
+    assert requested == [
+        "/projects/acme%2Fweb/merge_requests/87/diffs?per_page=100&page=1",
+        "/projects/acme%2Fweb/merge_requests/87/diffs?per_page=100&page=2",
+    ]
+
+
 def test_pipeline_event_maps_ci_failure() -> None:
     state = GitLabConnector().pr_state_from_event(
         "Pipeline Hook", load("gitlab_pipeline_failed.json")
@@ -82,8 +145,7 @@ def test_unknown_event_ignored() -> None:
 # -- the webhook loop ---------------------------------------------------------------
 
 
-@pytest.fixture
-def client() -> TestClient:
+def make_client(gitlab_connector: GitLabConnector | None = None) -> TestClient:
     engine = make_engine("sqlite+pysqlite:///:memory:")
     create_all(engine)
     sf = make_session_factory(engine)
@@ -95,8 +157,14 @@ def client() -> TestClient:
             orchestrator=orch,
             approvers={"lead@example.com": ["engineering"]},
             gitlab_webhook_secret=GITLAB_TOKEN,
+            gitlab_connector=gitlab_connector,
         )
     )
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return make_client()
 
 
 def post_gitlab(client, payload, *, event, token=GITLAB_TOKEN):
@@ -200,6 +268,25 @@ def test_pipeline_failure_triggers_remediation(client) -> None:
     )
     assert resp.json()["status"] == "recorded"
     assert resp.json()["run_status"] == "agent_running"
+
+
+def test_forbidden_path_in_mr_hard_blocks_run() -> None:
+    """A migrations/** file in a GitLab MR hard-blocks, exactly like a GitHub PR.
+
+    This is the bug in #8: without diff enrichment the file-based gate never
+    sees the forbidden path and the MR sails through.
+    """
+
+    def transport(method: str, path: str):
+        return [{"new_path": "migrations/0002_drop_users.sql"}]
+
+    client = make_client(gitlab_connector=GitLabConnector(transport=transport))
+    _dispatched_run(client)
+    resp = post_gitlab(
+        client, load("gitlab_merge_request_opened.json"), event="Merge Request Hook"
+    )
+    assert resp.json()["status"] == "recorded"
+    assert resp.json()["run_status"] == "blocked"
 
 
 def test_unrelated_mr_ignored(client) -> None:

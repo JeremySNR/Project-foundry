@@ -15,8 +15,12 @@ FROM python:3.12-slim
 # Run as an unprivileged user; the app needs no filesystem writes besides /tmp.
 RUN useradd --create-home --shell /usr/sbin/nologin foundry
 
+# Install with the same extras the wheels were built for - the runtime needs
+# uvicorn (server), httpx (http) and psycopg2 (postgres) on PATH, not just the
+# base package, or the uvicorn CMD below fails with "executable not found".
 COPY --from=build /wheels /wheels
-RUN pip install --no-cache-dir --no-index --find-links=/wheels project-foundry && \
+RUN pip install --no-cache-dir --no-index --find-links=/wheels \
+        "project-foundry[server,http,postgres]" && \
     rm -rf /wheels
 
 USER foundry

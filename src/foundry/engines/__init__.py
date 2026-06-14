@@ -8,12 +8,17 @@ slot into the orchestrator without changes elsewhere.
 from __future__ import annotations
 
 from .analyzer import HeuristicAnalyzer, TicketAnalyzer
-from .enrichment import ContextEnricher, StaticContextEnricher
+from .enrichment import CatalogContextEnricher, ContextEnricher, StaticContextEnricher
 from .llm import (
     FakeStructuredLLM,
     LLMError,
     OpenAIStructuredLLM,
     StructuredLLM,
+)
+from .llm_risk import (
+    LlmDiffRiskClassifier,
+    LlmRiskClassifier,
+    build_llm_risk_classifier,
 )
 from .openai_analyzer import OpenAITicketAnalyzer, build_openai_analyzer
 from .planner import (
@@ -22,7 +27,12 @@ from .planner import (
     TemplatePlanner,
     branch_name_for,
 )
-from .risk import HeuristicRiskClassifier, RiskClassifier
+from .risk import (
+    DiffRiskClassifier,
+    GlobDiffRiskClassifier,
+    HeuristicRiskClassifier,
+    RiskClassifier,
+)
 
 __all__ = [
     "TicketAnalyzer",
@@ -35,8 +45,14 @@ __all__ = [
     "LLMError",
     "ContextEnricher",
     "StaticContextEnricher",
+    "CatalogContextEnricher",
     "RiskClassifier",
     "HeuristicRiskClassifier",
+    "DiffRiskClassifier",
+    "GlobDiffRiskClassifier",
+    "LlmRiskClassifier",
+    "LlmDiffRiskClassifier",
+    "build_llm_risk_classifier",
     "DeliveryPlanner",
     "TemplatePlanner",
     "branch_name_for",

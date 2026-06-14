@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from foundry.connectors import (
     InMemoryIssueTracker,
     LinearConnector,
+    LinearWriteError,
     format_analysis_comment,
     format_cursor_delegation,
     state_for,
@@ -78,6 +81,30 @@ def test_set_state_unmapped_is_skipped() -> None:
     transport = RecordingTransport()
     LinearConnector(transport=transport).set_state("uuid-1", "Foundry: Unknown")
     assert transport.calls == []  # no guessing
+
+
+def test_comment_success_false_raises() -> None:
+    """A success:false mutation (no GraphQL errors) must not be silently dropped."""
+    transport = RecordingTransport([{"commentCreate": {"success": False}}])
+    with pytest.raises(LinearWriteError):
+        LinearConnector(transport=transport).post_comment("uuid-1", "hello")
+
+
+def test_set_state_success_false_raises() -> None:
+    transport = RecordingTransport([{"issueUpdate": {"success": False}}])
+    connector = LinearConnector(
+        transport=transport, state_map={"Foundry: Blocked": "state-123"}
+    )
+    with pytest.raises(LinearWriteError):
+        connector.set_state("uuid-1", "Foundry: Blocked")
+
+
+def test_set_state_success_true_is_accepted() -> None:
+    transport = RecordingTransport([{"issueUpdate": {"success": True}}])
+    connector = LinearConnector(
+        transport=transport, state_map={"Foundry: Blocked": "state-123"}
+    )
+    connector.set_state("uuid-1", "Foundry: Blocked")  # no raise
 
 
 # -- InMemoryIssueTracker -----------------------------------------------------

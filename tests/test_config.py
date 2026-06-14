@@ -116,6 +116,64 @@ def test_api_token_from_env() -> None:
     assert s.api_token == "tok"
 
 
+def test_rate_limit_defaults_on() -> None:
+    s = Settings.from_env({})
+    assert s.rate_limit_enabled is True
+    assert s.rate_limit_webhook_per_minute == 120
+    assert s.rate_limit_api_per_minute == 60
+
+
+def test_rate_limit_from_yaml_and_env(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "rate_limit:\n  enabled: true\n  webhook_per_minute: 300\n  api_per_minute: 30\n"
+    )
+    s = Settings.load(path, env={})
+    assert s.rate_limit_enabled is True
+    assert s.rate_limit_webhook_per_minute == 300
+    assert s.rate_limit_api_per_minute == 30
+    # Env overrides YAML (operational knob).
+    s2 = Settings.load(
+        path,
+        env={
+            "FOUNDRY_RATE_LIMIT_ENABLED": "false",
+            "FOUNDRY_RATE_LIMIT_API_PER_MINUTE": "10",
+        },
+    )
+    assert s2.rate_limit_enabled is False
+    assert s2.rate_limit_api_per_minute == 10
+
+
+def test_rate_limit_invalid_values_rejected() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        Settings.from_env({"FOUNDRY_RATE_LIMIT_API_PER_MINUTE": "0"})
+    with pytest.raises(ValueError):
+        Settings.from_env({"FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE": "0"})
+
+
+def test_slack_notifications_from_env_and_yaml(tmp_path) -> None:
+    # Bot token is env-only; the channel may come from YAML or env (env wins).
+    s = Settings.from_env(
+        {"FOUNDRY_SLACK_BOT_TOKEN": "xoxb-1", "FOUNDRY_SLACK_CHANNEL": "C-env"}
+    )
+    assert s.slack_bot_token == "xoxb-1"
+    assert s.slack_channel == "C-env"
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text("notifications:\n  slack_channel: C-yaml\n")
+    assert Settings.load(path, env={}).slack_channel == "C-yaml"
+    # Env overrides the YAML channel.
+    assert (
+        Settings.load(path, env={"FOUNDRY_SLACK_CHANNEL": "C-env"}).slack_channel
+        == "C-env"
+    )
+    # Default: outbound Slack unconfigured.
+    assert Settings.from_env({}).slack_bot_token is None
+    assert Settings.from_env({}).slack_channel is None
+
+
 def test_env_overrides_yaml(tmp_path) -> None:
     path = tmp_path / "foundry.yaml"
     path.write_text(_YAML)
@@ -168,3 +226,191 @@ def test_invalid_remediation_and_budget_rejected(tmp_path) -> None:
         config.write_text(content)
         with pytest.raises(ValueError):
             Settings.load(str(config), env={})
+
+
+_CONTEXT_YAML = """
+context:
+  provider: catalog
+  org: acme
+  max_catalog_age_days: 14
+  sync_call_budget: 500
+  repo_keywords:
+    acme/billing-service: ["invoice", "stripe"]
+    acme/shipping: ["shipment", "tracking"]
+"""
+
+
+def test_context_yaml_parsing(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(_CONTEXT_YAML)
+    s = Settings.load(path, env={})
+
+    assert s.context_provider == "catalog"
+    assert s.context_org == "acme"
+    assert s.context_max_catalog_age_days == 14
+    assert s.context_sync_call_budget == 500
+    kw = dict(s.context_repo_keywords)
+    assert set(kw["acme/billing-service"]) == {"invoice", "stripe"}
+    assert set(kw["acme/shipping"]) == {"shipment", "tracking"}
+
+
+def test_context_defaults_when_block_absent() -> None:
+    s = Settings.from_env({})
+    assert s.context_provider == "static"
+    assert s.context_org is None
+    assert s.context_max_catalog_age_days == 7
+    assert s.context_sync_call_budget == 3000
+    assert s.context_repo_keywords == ()
+    assert s.context_sync_code_facts is False
+    assert s.context_tree_max_paths == 2000
+
+
+def test_context_code_provider_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "context:\n"
+        "  provider: code\n"
+        "  sync_code_facts: true\n"
+        "  tree_max_paths: 500\n"
+    )
+    s = Settings.load(path, env={})
+    assert s.context_provider == "code"
+    assert s.context_sync_code_facts is True
+    assert s.context_tree_max_paths == 500
+
+
+def test_context_env_overrides(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(_CONTEXT_YAML)
+    s = Settings.load(path, env={"FOUNDRY_CONTEXT_PROVIDER": "static", "FOUNDRY_CONTEXT_ORG": "other"})
+    assert s.context_provider == "static"
+    assert s.context_org == "other"
+
+
+def test_context_invalid_provider_rejected(tmp_path) -> None:
+    import pytest
+
+    path = tmp_path / "bad.yaml"
+    path.write_text("context:\n  provider: unknown\n")
+    with pytest.raises(ValueError, match="context_provider"):
+        Settings.load(path, env={})
+
+
+def test_context_invalid_age_and_budget_rejected(tmp_path) -> None:
+    import pytest
+
+    for i, content in enumerate([
+        "context:\n  max_catalog_age_days: 0\n",
+        "context:\n  sync_call_budget: 0\n",
+        "context:\n  tree_max_paths: 50\n",
+    ]):
+        path = tmp_path / f"bad-ctx-{i}.yaml"
+        path.write_text(content)
+        with pytest.raises(ValueError):
+            Settings.load(path, env={})
+
+
+def test_memory_defaults_and_yaml(tmp_path) -> None:
+    s = Settings.from_env({})
+    assert s.memory_priors_enabled is True
+    assert s.memory_min_samples == 3
+    assert s.memory_confidence_cap == 89
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "memory:\n"
+        "  priors_enabled: false\n"
+        "  min_samples: 5\n"
+        "  confidence_cap: 80\n"
+    )
+    s = Settings.load(path, env={})
+    assert s.memory_priors_enabled is False
+    assert s.memory_min_samples == 5
+    assert s.memory_confidence_cap == 80
+
+
+def test_memory_validation(tmp_path) -> None:
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text("memory:\n  min_samples: 0\n")
+    with pytest.raises(ValueError, match="memory_min_samples"):
+        Settings.load(path, env={})
+
+    path.write_text("memory:\n  confidence_cap: 101\n")
+    with pytest.raises(ValueError, match="memory_confidence_cap"):
+        Settings.load(path, env={})
+
+
+def test_risk_provider_defaults_to_heuristic() -> None:
+    s = Settings.from_env({})
+    assert s.risk_provider == "heuristic"
+    assert s.risk_model == "gpt-5.5"
+
+
+def test_risk_provider_from_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("risk:\n  provider: llm\n  model: gpt-4o-2026-04-23\n")
+    s = Settings.load(path, env={})
+    assert s.risk_provider == "llm"
+    assert s.risk_model == "gpt-4o-2026-04-23"
+
+
+def test_risk_provider_env_overrides_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("risk:\n  provider: heuristic\n")
+    s = Settings.load(
+        path,
+        env={"FOUNDRY_RISK_PROVIDER": "llm", "FOUNDRY_RISK_MODEL": "gpt-5.5-mini"},
+    )
+    assert s.risk_provider == "llm"
+    assert s.risk_model == "gpt-5.5-mini"
+
+
+def test_invalid_risk_provider_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="risk_provider"):
+        Settings.from_env({"FOUNDRY_RISK_PROVIDER": "bogus"})
+
+
+def test_policy_provider_defaults_to_local() -> None:
+    s = Settings.from_env({})
+    assert s.policy_provider == "local"
+    assert s.policy_opa_url is None
+
+
+def test_policy_provider_opa_from_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("policy:\n  provider: opa\n  opa_url: http://opa:8181\n")
+    s = Settings.load(path, env={})
+    assert s.policy_provider == "opa"
+    assert s.policy_opa_url == "http://opa:8181"
+
+
+def test_policy_provider_env_overrides_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("policy:\n  provider: local\n")
+    s = Settings.load(
+        path,
+        env={
+            "FOUNDRY_POLICY_PROVIDER": "opa",
+            "FOUNDRY_POLICY_OPA_URL": "http://opa.internal:8181",
+        },
+    )
+    assert s.policy_provider == "opa"
+    assert s.policy_opa_url == "http://opa.internal:8181"
+
+
+def test_invalid_policy_provider_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="policy_provider"):
+        Settings.from_env({"FOUNDRY_POLICY_PROVIDER": "bogus"})
+
+
+def test_opa_provider_without_url_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="policy_opa_url is required"):
+        Settings.from_env({"FOUNDRY_POLICY_PROVIDER": "opa"})

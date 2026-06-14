@@ -14,6 +14,7 @@ never invents workflow states in someone's Jira project.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable
 
 from foundry.schemas.ticket import RawTicket
@@ -58,7 +59,7 @@ class JiraConnector:
             target = _normalise(
                 (transition.get("to") or {}).get("name") or transition.get("name") or ""
             )
-            if target and (target == wanted or target in wanted or wanted in target):
+            if target and _matches(wanted, target):
                 self._transport(
                     "POST",
                     f"/rest/api/2/issue/{issue_id}/transitions",
@@ -74,3 +75,21 @@ class JiraConnector:
 
 def _normalise(name: str) -> str:
     return name.lower().replace("foundry:", "").strip()
+
+
+def _matches(wanted: str, target: str) -> bool:
+    """Whole-phrase match between a Foundry state and a Jira transition target.
+
+    Plain substring matching was bidirectional and unsafe: target ``"unblocked"``
+    contains ``"blocked"``, so asking to move to ``Blocked`` could fire a
+    transition to *Unblocked*. Require either an exact match or that one phrase
+    appears in the other on word boundaries (so ``"in progress"`` still matches
+    ``"in progress (dev)"`` but ``"blocked"`` never matches ``"unblocked"``).
+    """
+    if wanted == target:
+        return True
+    return _phrase_in(wanted, target) or _phrase_in(target, wanted)
+
+
+def _phrase_in(needle: str, haystack: str) -> bool:
+    return re.search(rf"\b{re.escape(needle)}\b", haystack) is not None

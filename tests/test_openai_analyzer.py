@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from foundry.engines import FakeStructuredLLM, LLMError, OpenAITicketAnalyzer
+from foundry.engines import (
+    FakeStructuredLLM,
+    HeuristicAnalyzer,
+    LLMError,
+    OpenAITicketAnalyzer,
+)
 from foundry.orchestrator import FoundryOrchestrator
 from foundry.schemas.common import ImplementationReadiness, WorkType
 from foundry.schemas.ticket import RawTicket
@@ -82,11 +87,52 @@ def test_invalid_then_valid_retries_and_succeeds() -> None:
     assert "invalid" in llm.calls[1]["user"].lower()
 
 
-def test_persistently_invalid_raises() -> None:
+def test_persistently_invalid_degrades_to_heuristic_loudly() -> None:
+    # Mirrors the risk classifiers' degrade-to-floor design: when the LLM
+    # cannot produce usable output, intake still gets the deterministic
+    # analysis, with the degradation recorded in the artifact (assumptions).
     bad = _valid_response(work_type="not_a_type")
     llm = FakeStructuredLLM([bad, bad])
-    with pytest.raises(LLMError):
-        OpenAITicketAnalyzer(llm, max_attempts=2).analyse(_ticket())
+    ticket = _ticket(description="Acceptance criteria:\n- The heart saves the item")
+    analysis = OpenAITicketAnalyzer(llm, max_attempts=2).analyse(ticket)
+
+    expected = HeuristicAnalyzer().analyse(ticket)
+    assert analysis.implementation_readiness is expected.implementation_readiness
+    assert analysis.acceptance_criteria == expected.acceptance_criteria
+    assert any("LLM analysis unavailable" in a for a in analysis.assumptions)
+
+
+def test_sdk_failure_degrades_to_heuristic_and_keeps_hard_rules() -> None:
+    # An LLM raising (rate limit, timeout, outage) degrades the same way -
+    # and the conservative heuristic still parks an AC-less ticket.
+    class _Raising:
+        def generate(self, **kwargs):
+            raise LLMError("simulated OpenAI outage")
+
+    analysis = OpenAITicketAnalyzer(_Raising()).analyse(_ticket())
+    assert analysis.is_ready_to_build is False
+    assert any("LLM analysis unavailable" in a for a in analysis.assumptions)
+
+
+def test_llm_outage_does_not_fail_intake(session_factory_for_openai) -> None:
+    # Issue #12: an OpenAI outage previously aborted intake_and_plan with zero
+    # audit trace. Now the run is created from the heuristic fallback.
+    class _Raising:
+        def generate(self, **kwargs):
+            raise LLMError("simulated OpenAI outage")
+
+    orch = FoundryOrchestrator(
+        session_factory_for_openai,
+        analyzer=OpenAITicketAnalyzer(_Raising()),
+    )
+    run_id = orch.intake_and_plan(
+        _ticket(
+            description="Acceptance criteria:\n- The heart saves the item",
+            known_repositories=["customer-web"],
+        ),
+        trigger_type="label",
+    )
+    assert orch.get_run(run_id).status.value == "waiting_approval"
 
 
 def test_drops_in_as_orchestrator_analyzer(session_factory_for_openai) -> None:
