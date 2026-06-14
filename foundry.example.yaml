@@ -64,6 +64,14 @@ policy:
     - "**/migrations/**"
     - "**/.env*"
     - "**/secrets/**"
+  # Per-repo protected subtrees for monorepos / multi-repo orgs (issue #35,
+  # path-scoped policy). These globs are added to `forbidden_globs` above *only*
+  # for runs routed to the named repo - strictly additive, so a repo can make
+  # the sticky block stricter but never weaken the global floor. The repo name
+  # is the one Foundry routed the run to (the context bundle's best repository).
+  # repo_forbidden_globs:
+  #   payments-service: ["**/ledger/**", "**/reconciliation/**"]
+  #   platform-monorepo: ["services/billing/**", "services/identity/**"]
   # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)
   # risk pass never flagged the area, the run escalates to human review.
   # Override per area; unlisted areas keep the built-in defaults.

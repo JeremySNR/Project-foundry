@@ -187,6 +187,12 @@ class Settings:
     sensitive_path_globs: tuple[tuple[str, tuple[str, ...]], ...] = (
         DEFAULT_SENSITIVE_PATH_GLOBS
     )
+    # repo name -> extra forbidden path globs applied only to runs routed to
+    # that repo, on top of the global ``forbidden_globs`` (issue #35, path-scoped
+    # policy for monorepos). Strictly additive: a repo's globs can only *add*
+    # protected subtrees, never drop a global one, so the sticky forbidden-path
+    # block stays a one-way ratchet towards stricter.
+    repo_forbidden_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     # --- remediation / feedback loop (behaviour: yaml) ---
     # When CI fails or a reviewer requests changes, Foundry can re-dispatch the
@@ -397,6 +403,11 @@ class Settings:
     def sensitive_globs_map(self) -> dict[str, tuple[str, ...]]:
         return {area: globs for area, globs in self.sensitive_path_globs}
 
+    @property
+    def repo_forbidden_map(self) -> dict[str, tuple[str, ...]]:
+        """repo name -> extra forbidden globs scoped to that repo."""
+        return {repo: globs for repo, globs in self.repo_forbidden_globs}
+
 
 def _from_yaml(path: Path) -> dict[str, Any]:
     try:
@@ -460,6 +471,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["sensitive_path_globs"] = tuple(
             (str(area), tuple(globs))
             for area, globs in (policy["sensitive_path_globs"] or {}).items()
+        )
+    if "repo_forbidden_globs" in policy:
+        out["repo_forbidden_globs"] = tuple(
+            (str(repo), tuple(globs))
+            for repo, globs in (policy["repo_forbidden_globs"] or {}).items()
         )
 
     remediation = data.get("remediation", {}) or {}

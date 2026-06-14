@@ -59,7 +59,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | --- | --- |
 | `schemas/` | Pydantic contracts for every artifact a run produces (`extra="forbid"` — changes here are API changes; update consumers in the same PR) |
 | `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam + `llm_risk.py` escalate-only LLM risk classifiers + `llm_planner.py` file-level LLM planner (degrades to the template planner) |
-| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, sensitive areas, retry caps, budget, role-checked approvals; **every autonomous action also requires ≥1 recorded human approval** via the role-agnostic `approval_present` input — the human-in-the-loop promise as a gate rule, not just an orchestration check, issue #18; `auto_merge`/`production_deploy` denied unconditionally). The budget cap binds on **every** spending action (first `start_agent` + each `retry_agent`), comparing *projected* spend — recorded cost plus the next dispatch's `estimated_cost_per_dispatch` proxy for providers that don't report `cost_usd`. **Forbidden-path blocking is *not* here** — it lives in `orchestrator._forbidden_violations()` (diff-aware, sticky `BLOCKED`) and has no Rego mirror, so invariant #2 doesn't apply to it |
+| `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, sensitive areas, retry caps, budget, role-checked approvals; **every autonomous action also requires ≥1 recorded human approval** via the role-agnostic `approval_present` input — the human-in-the-loop promise as a gate rule, not just an orchestration check, issue #18; `auto_merge`/`production_deploy` denied unconditionally). The budget cap binds on **every** spending action (first `start_agent` + each `retry_agent`), comparing *projected* spend — recorded cost plus the next dispatch's `estimated_cost_per_dispatch` proxy for providers that don't report `cost_usd`. **Forbidden-path blocking is *not* here** — it lives in `orchestrator._forbidden_violations()` (diff-aware, sticky `BLOCKED`) and has no Rego mirror, so invariant #2 doesn't apply to it. Forbidden globs are global (`policy.forbidden_globs`) **plus** optional per-repo extras (`policy.repo_forbidden_globs`, keyed on the run's routed repo, issue #35) merged by `_forbidden_globs_for(repo)` — strictly additive, so per-repo scoping only ever makes the block stricter, never weakens the global floor (invariant #1). The same merged list seeds the agent's `do_not_modify` constraints at dispatch |
 | `policy/foundry.rego` | OPA backend, selectable via `policy.provider: opa` (`OpaPolicyEngine`); the Python `LocalPolicyEngine` is the default. **Must change in lock-step** (machine-verified over shared vectors — see invariant #2). The confidence threshold is read from input, not hardcoded, so both backends honour the configured value |
 | `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows. `approve()` pre-validates the approver's roles against the run's required approvals (derived from risk) and refuses *before* recording, so a void approval can't land on the trail and be blocked only at dispatch |
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |
@@ -149,8 +149,10 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   the epic's full chain now exports as one cross-run evidence pack
   (`build_epic_evidence_pack`, `GET /runs/{id}/epic/evidence`), and the dashboard
   surfaces epics as a rolled-up board (`GET /epics`), but the *producer* —
-  decomposing an epic ticket into independently-gated child plans — plus
-  path-scoped policy are still open.
+  decomposing an epic ticket into independently-gated child plans — is still
+  open. Path-scoped policy has a first slice: per-repo forbidden-path globs
+  (`policy.repo_forbidden_globs`) make the sticky forbidden-path block
+  monorepo-aware (additive, no Rego); per-path *approval* rules remain open.
 - No Slack/Teams surface; approvals are tracker comments or the REST endpoint.
 
 A C#/.NET port of the core lives in unmerged PR #1 (`dotnet/`); the Python

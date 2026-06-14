@@ -63,6 +63,9 @@ policy:
   sensitive_path_globs:
     auth: ["**/iam/**"]
     payments: ["**/billing/**"]
+  repo_forbidden_globs:
+    payments-service: ["**/ledger/**", "**/reconciliation/**"]
+    platform-monorepo: ["services/billing/**"]
 triggers:
   label: "ai:go"
   status: "Ready for Foundry"
@@ -98,7 +101,16 @@ def test_load_from_yaml(tmp_path) -> None:
         "auth": ("**/iam/**",),
         "payments": ("**/billing/**",),
     }
+    assert s.repo_forbidden_map == {
+        "payments-service": ("**/ledger/**", "**/reconciliation/**"),
+        "platform-monorepo": ("services/billing/**",),
+    }
     assert s.temporal_address == "temporal.internal:7233"
+
+
+def test_repo_forbidden_globs_default_empty() -> None:
+    """No config => no per-repo forbidden globs (global list unchanged)."""
+    assert Settings.from_env({}).repo_forbidden_map == {}
 
 
 def test_legacy_authorised_approvers_yaml_still_loads(tmp_path) -> None:

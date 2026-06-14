@@ -1419,6 +1419,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         policy_engine=build_policy_engine(settings),
         max_files_changed=settings.max_files_changed,
         forbidden_globs=settings.forbidden_globs,
+        repo_forbidden_globs=settings.repo_forbidden_map,
         sensitive_path_globs=settings.sensitive_globs_map,
         max_agent_retries=settings.max_agent_retries,
         retry_on=settings.retry_on,
