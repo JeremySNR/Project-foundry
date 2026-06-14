@@ -661,6 +661,22 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **agent_scorecards(session, since=since)}
 
+    @app.get("/metrics/fleet")
+    def metrics_fleet(request: Request) -> dict[str, Any]:
+        """Live fleet snapshot: every run's *current* state across the org -
+        runs in flight, the human-approval queue depth, agents running, PRs
+        open, and spend committed by runs not yet finished. The "what are the
+        agents doing right now" view the historical ``/metrics/delivery``
+        endpoints (finished runs only) can't give; there is no time window
+        because it is a snapshot of now. Token-gated and fail-closed like the
+        other metrics endpoints.
+        """
+        from foundry.memory.metrics import fleet_status
+
+        _require_api_token(app, request)
+        with app.state.session_factory() as session:
+            return fleet_status(session)
+
     @app.post("/runs/{run_id}/approval")
     def approval(
         run_id: str,

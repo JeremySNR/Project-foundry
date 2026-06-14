@@ -117,7 +117,7 @@ A PR that opens and then fails CI used to be where automation stalled. Now: a fa
 
 ### The dashboard
 
-`GET /dashboard` serves a zero-build, read-only page over the audit data: every run with status badges (filterable down to an **approval queue** - just what is waiting on a human right now), a delivery-metrics strip, a **delivery-trend table** (PRs shipped vs blocked, by week), and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`).
+`GET /dashboard` serves a zero-build, read-only page over the audit data: a **live fleet strip** at the top (runs in flight, the approval-queue depth, agents running, PRs open, and spend committed by runs still in flight - the "what is every agent doing right now" view, backed by `GET /metrics/fleet`), every run with status badges (filterable down to an **approval queue** - just what is waiting on a human right now), a delivery-metrics strip, a **delivery-trend table** (PRs shipped vs blocked, by week), and per run the full decision timeline - artifacts, policy decisions with reasons, audit events, agent jobs and spend. It answers "why did the agent do that?" in one click. Token-gated by `FOUNDRY_API_TOKEN` and disabled when none is configured, same fail-closed posture as the API (the JSON equivalent is `GET /runs/{id}/timeline`). `GET /metrics/fleet` is a snapshot of the runs' *current* state (no time window), distinct from the historical delivery metrics below, which aggregate finished runs over a window.
 
 ### Delivery memory
 

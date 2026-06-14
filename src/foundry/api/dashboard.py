@@ -1,10 +1,12 @@
 """The Foundry dashboard: one static page, zero build step, zero new deps.
 
-Read-only visibility over the audit data that already exists: the delivery
-metrics strip, a delivery-trend-over-time table, the agent scorecards, the run
-list (with an approval-queue filter) and, per run, the full decision timeline
-(artifacts, audit events, policy decisions, agent jobs). All data comes from
-``GET /runs``, ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
+Read-only visibility over the audit data that already exists: a live fleet
+strip (runs in flight / approval queue / spend in flight, from the current run
+states), the delivery metrics strip, a delivery-trend-over-time table, the
+agent scorecards, the run list (with an approval-queue filter) and, per run,
+the full decision timeline (artifacts, audit events, policy decisions, agent
+jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
+``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/agents`` and ``GET /runs/{id}/timeline``; the calls carry the
 bearer token the user pastes once (kept in localStorage, never sent anywhere
 but this API).
@@ -89,14 +91,16 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #metrics, #agents, #trends {
+  #fleet, #metrics, #agents, #trends {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
-  #metrics .stat { margin-right: 18px; white-space: nowrap; }
-  #metrics .stat b { font-size: 15px; }
-  #metrics .stat.good b { color: var(--green); }
-  #metrics .stat.bad b { color: var(--red); }
+  #fleet { background: #11151c; }
+  #fleet .label { color: var(--muted); margin-right: 18px; font-weight: 600; }
+  #metrics .stat, #fleet .stat { margin-right: 18px; white-space: nowrap; }
+  #metrics .stat b, #fleet .stat b { font-size: 15px; }
+  #metrics .stat.good b, #fleet .stat.good b { color: var(--green); }
+  #metrics .stat.bad b, #fleet .stat.bad b { color: var(--red); }
   #metrics table, #agents table {
     border-collapse: collapse; margin: 8px 0 2px; font-size: 12px;
   }
@@ -133,6 +137,7 @@ DASHBOARD_HTML = """<!doctype html>
   <input id="token" type="password" placeholder="API token (stored locally)">
   <button id="save">Connect</button>
 </header>
+<div id="fleet"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -318,6 +323,31 @@ function dur(seconds) {
   return (seconds / 86400).toFixed(1) + "d";
 }
 
+async function loadFleet() {
+  const el = $("#fleet");
+  if (!localStorage.getItem("foundry_token")) {
+    el.style.display = "none";  // no token: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/fleet", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const f = await resp.json();
+    const spend = f.active_cost_usd == null ? "-" : "$" + f.active_cost_usd;
+    el.innerHTML = `
+      <span class="label">Fleet now</span>
+      <span class="stat"><b>${f.runs_active}</b> in flight</span>
+      <span class="stat"><b>${f.agents_running}</b> agents running</span>
+      <span class="stat ${f.awaiting_human ? "bad" : ""}"><b>${f.awaiting_human}</b> awaiting a human</span>
+      <span class="stat"><b>${f.prs_open}</b> PRs open</span>
+      <span class="stat"><b>${spend}</b> spend in flight</span>
+      <span class="stat"><b>${f.total_runs}</b> total runs</span>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadMetrics() {
   const el = $("#metrics");
   if (!localStorage.getItem("foundry_token")) {
@@ -431,6 +461,7 @@ async function loadTrends() {
 
 function refresh() {
   loadRuns();
+  loadFleet();
   loadMetrics();
   loadTrends();
   loadAgents();
