@@ -1,11 +1,13 @@
 # Foundry Ticket-to-PR policy.
 #
 # This Rego bundle mirrors foundry/policy/engine.py:LocalPolicyEngine. Keep the
-# two in lock-step. The Python evaluator (LocalPolicyEngine) is the engine the
-# app actually runs today; this bundle is the language-agnostic reference for an
-# OPA-based deployment and is exercised by `opa test` in CI. There is not yet a
-# config path that wires an OPA server at runtime (OpaPolicyEngine is unwired —
-# tracked in #21).
+# two in lock-step. The Python evaluator (LocalPolicyEngine) is the default the
+# app runs; this bundle is the language-agnostic backend used when
+# `policy.provider: opa` is configured (OpaPolicyEngine), and is exercised by
+# `opa test` in CI. Lock-step is machine-verified: scripts/policy_parity.py runs
+# the shared vectors in tests/data/policy_vectors.json through `opa eval` in the
+# OPA CI job, while tests/test_policy_parity.py runs the same vectors through
+# LocalPolicyEngine - both assert the same expected decisions.
 #
 # Decision document: data.foundry.ticket_to_pr.decision
 #   { "allow": bool, "reasons": [string], "allowed_agent_mode": string,
@@ -15,7 +17,10 @@ package foundry.ticket_to_pr
 
 import rego.v1
 
-repo_confidence_threshold := 70
+# The confidence threshold is supplied by the caller so the Rego bundle and the
+# Python LocalPolicyEngine evaluate against the *same* configured value (default
+# 70) instead of a hardcoded constant that could silently drift from YAML.
+repo_confidence_threshold := object.get(input, "repo_confidence_threshold", 70)
 
 # Actions that launch or progress autonomous work and must pass the gate.
 autonomous_actions := {

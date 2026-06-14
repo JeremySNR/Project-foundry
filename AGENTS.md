@@ -60,7 +60,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | `schemas/` | Pydantic contracts for every artifact a run produces (`extra="forbid"` — changes here are API changes; update consumers in the same PR) |
 | `engines/` | analyzer / enrichment / risk / planner (see table above) + `llm.py` structured-LLM seam + `llm_risk.py` escalate-only LLM risk classifiers |
 | `policy/engine.py` | Default-deny policy gate, ~10 hard rules (readiness, repo confidence, sensitive areas, retry caps, budget, role-checked approvals; `auto_merge`/`production_deploy` denied unconditionally). **Forbidden-path blocking is *not* here** — it lives in `orchestrator._forbidden_violations()` (diff-aware, sticky `BLOCKED`) and has no Rego mirror, so invariant #2 doesn't apply to it |
-| `policy/foundry.rego` | OPA mirror of the Python engine — **must change in lock-step**, tests on both sides |
+| `policy/foundry.rego` | OPA backend, selectable via `policy.provider: opa` (`OpaPolicyEngine`); the Python `LocalPolicyEngine` is the default. **Must change in lock-step** (machine-verified over shared vectors — see invariant #2). The confidence threshold is read from input, not hardcoded, so both backends honour the configured value |
 | `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows |
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |
 | `workflows/` | Temporal version (durable waits for approval/PR). Exists, signal-driven, **not yet battle-tested against a real server** |
@@ -84,7 +84,11 @@ payload mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create
 1. **Never weaken a gate.** PRs that loosen a policy rule, approval requirement,
    or audit write don't merge. Change rules explicitly, with tests, or not at all.
 2. **Python policy engine and `foundry.rego` change together**, with tests in
-   `tests/test_policy_engine.py` and `foundry_test.rego`.
+   `tests/test_policy_engine.py` and `foundry_test.rego`. Lock-step is
+   machine-verified: shared vectors in `tests/data/policy_vectors.json` run
+   through `LocalPolicyEngine` (`tests/test_policy_parity.py`) **and** through
+   `opa eval` (`scripts/policy_parity.py`, in the OPA CI job) against the same
+   expected decisions — add a vector when you add a rule, on both sides.
 3. **No network in core tests.** `pytest` must pass offline with zero API keys.
    New external calls need a transport seam + a fake.
 4. **The policy gate is default-deny**; an unrecognised action is refused.
