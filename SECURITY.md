@@ -31,8 +31,20 @@ Anything that lets work bypass the governance loop, including:
 Foundry fails closed by design, but you still need to deploy it sensibly:
 
 - Set strong values for `FOUNDRY_LINEAR_WEBHOOK_SECRET`,
-  `FOUNDRY_GITHUB_WEBHOOK_SECRET` and `FOUNDRY_API_TOKEN`. Without an API
-  token the REST approval endpoint is disabled (this is intentional).
+  `FOUNDRY_GITHUB_WEBHOOK_SECRET` and `FOUNDRY_API_TOKEN`. Without any API
+  credential the REST approval endpoint is disabled (this is intentional).
+- **OIDC API auth (optional).** Instead of (or alongside) the static
+  `FOUNDRY_API_TOKEN`, you can front the token-gated API with your IdP by
+  setting `auth.oidc` (`issuer` / `audience` / `jwks_uri`). A bearer JWT is then
+  accepted only if its signature verifies against the IdP's JWKS and its
+  `iss`/`aud`/`exp` (with bounded clock-skew leeway) check out. The signing
+  algorithm allow-list defaults to **RS256 only** — keep it asymmetric so a
+  token can never be accepted by presenting the public JWKS key as an HMAC
+  secret (`alg:none` / HS-confusion are refused). All three OIDC settings are
+  required together; a partial config fails closed at startup. This is
+  authentication only: approver **roles** are still taken from committed config,
+  never from a token claim, so an OIDC-authenticated caller cannot self-assert
+  an approver role.
 - Terminate TLS in front of the API; webhook signatures authenticate payloads,
   not transport.
 - Keep the approver → roles mapping in reviewed, committed YAML.

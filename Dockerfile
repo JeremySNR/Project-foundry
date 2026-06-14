@@ -7,7 +7,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN python -m pip install --upgrade pip && \
-    pip wheel --wheel-dir /wheels ".[server,http,postgres]"
+    pip wheel --wheel-dir /wheels ".[server,http,postgres,oidc]"
 
 
 FROM python:3.12-slim
@@ -16,11 +16,12 @@ FROM python:3.12-slim
 RUN useradd --create-home --shell /usr/sbin/nologin foundry
 
 # Install with the same extras the wheels were built for - the runtime needs
-# uvicorn (server), httpx (http) and psycopg2 (postgres) on PATH, not just the
-# base package, or the uvicorn CMD below fails with "executable not found".
+# uvicorn (server), httpx (http), psycopg2 (postgres) and pyjwt (oidc) on PATH,
+# not just the base package, or the uvicorn CMD below fails with "executable
+# not found" / OIDC auth fails loud at startup.
 COPY --from=build /wheels /wheels
 RUN pip install --no-cache-dir --no-index --find-links=/wheels \
-        "project-foundry[server,http,postgres]" && \
+        "project-foundry[server,http,postgres,oidc]" && \
     rm -rf /wheels
 
 # Ship the Alembic config + migration scripts so the entrypoint can own the

@@ -206,6 +206,28 @@ rate_limit:
   webhook_per_minute: 120  # provider deliveries can be bursty
   api_per_minute: 60       # approvals, run reads, metrics
 
+auth:
+  # OIDC bearer auth for the token-gated API + dashboard (issue #34). OPTIONAL
+  # and additive: when configured, a valid OIDC JWT from your IdP is accepted on
+  # the Authorization: Bearer header IN ADDITION TO the static FOUNDRY_API_TOKEN
+  # (both can be enabled at once; either alone is enough to gate the API). Leave
+  # this whole block out to keep the static-token-only behaviour unchanged.
+  #
+  # issuer/audience/jwks_uri are public IdP metadata (not secrets), so they live
+  # here in YAML; all three are required together or startup fails (fail-closed,
+  # so a half-configured deployment can't silently verify nothing). Env overrides:
+  # FOUNDRY_OIDC_ISSUER / _AUDIENCE / _JWKS_URI / _ALGORITHMS / _LEEWAY_SECONDS.
+  #
+  # Needs the optional 'oidc' extra (pip install 'project-foundry[oidc]'); it is
+  # bundled in the Docker image. Setting OIDC without the extra fails loud at
+  # startup rather than on the first request.
+  # oidc:
+  #   issuer: "https://login.example.com/"          # the iss claim to require
+  #   audience: "foundry-api"                        # the aud claim to require
+  #   jwks_uri: "https://login.example.com/.well-known/jwks.json"
+  #   algorithms: ["RS256"]   # signing-algorithm allow-list (no alg:none / HS confusion)
+  #   leeway_seconds: 60      # clock-skew tolerance for exp/nbf
+
 notifications:
   # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status
   # updates into. Needs FOUNDRY_SLACK_BOT_TOKEN set too; either missing => no
