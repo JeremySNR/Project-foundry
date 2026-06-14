@@ -123,13 +123,15 @@ def test_algorithm_not_in_allow_list_rejected():
 
 
 def test_hs256_confusion_token_rejected():
-    # Classic attack: sign HS256 using the published public key as the HMAC
-    # secret. The RS256 allow-list refuses the HS256 header outright.
-    priv, jwks = _keypair()
-    public_pem = jwks["keys"][0]  # not even needed; any secret would do
+    # Classic confusion attack: present a token with an HS256 header (an
+    # attacker would sign it with the verifier's public key material as the HMAC
+    # secret). The RS256 allow-list refuses the HS256 header outright, before any
+    # secret is even considered - so a plain secret here is enough to exercise it
+    # (and newer pyjwt refuses to *encode* with a JWK-shaped secret anyway).
+    _, jwks = _keypair()
     forged = jwt.encode(
         {"sub": "mallory", "iss": ISSUER, "aud": AUDIENCE, "exp": int(time.time()) + 60},
-        json.dumps(public_pem),
+        "public-key-bytes-as-hmac-secret",
         algorithm="HS256",
         headers={"kid": KID},
     )
