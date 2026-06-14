@@ -75,7 +75,10 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 
 Other locations: `tests/fixtures/` (webhook payloads — spec-derived from the
 providers' webhook docs, replaceable by redacted live captures — pinning every
-payload mapping), `migrations/` (Alembic, Postgres prod; SQLite dev uses `create_all`),
+payload mapping), `migrations/` (Alembic — the **single** schema owner on Postgres, run by the
+Docker entrypoint on startup; SQLite dev/test is bootstrapped in-process by
+`db.base.init_schema`, which create_alls only on SQLite so it never strands a
+later `alembic upgrade head`),
 `examples/claude-code-runner.yml` (reference agent workflow), `scripts/demo.py`
 (offline narrated end-to-end demo — the fastest way to see the whole loop).
 

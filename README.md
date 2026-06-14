@@ -195,7 +195,7 @@ The same code runs on a laptop (SQLite, heuristics, no keys) and in production (
 
 ## Running it
 
-The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quickstart.md)** - zero to governed PR in ~30 minutes with `docker compose up` (API + Postgres, optional Temporal profile, dashboard included).
+The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quickstart.md)** - zero to governed PR in ~30 minutes with `docker compose up` (API + Postgres, optional Temporal profile, dashboard included). A bare `docker compose up` boots on a fresh clone with no copy step (it mounts the committed `foundry.example.yaml`); the API container applies Alembic migrations on startup, so Postgres gets its schema — and its `alembic_version` stamp — without a manual step.
 
 Tagged releases (`vX.Y.Z`) publish a container image to GHCR (`ghcr.io/jeremysnr/project-foundry`) automatically, gated on the full test suite.
 
@@ -241,7 +241,7 @@ Optional extras, install what you need:
 - `.[llm]` GPT-5.5 analyzer
 - `.[http]` live Linear and GitHub transports
 - `.[workflow]` Temporal durable execution
-- `.[postgres]` Postgres driver + Alembic migrations (`alembic upgrade head`)
+- `.[postgres]` Postgres driver + Alembic migrations. On Postgres, Alembic is the **single** schema owner: run `alembic upgrade head` (the Docker image does this automatically on startup; `make migrate` does it by hand). SQLite dev/test databases have no migration step and are bootstrapped in-process.
 - `.[otel]` OpenTelemetry tracing (without it, the spans are free no-ops)
 
 There is also a live end-to-end smoke test (`scripts/smoke_e2e.py`) that drives a real Linear issue through approval, agent dispatch and PR observation. It is gated on `FOUNDRY_E2E=1` plus real credentials and never runs in CI.
@@ -312,7 +312,7 @@ src/foundry/
   api/             the FastAPI app, webhook security, payload mapping, dashboard
 tests/             one module per package, plus the gated Temporal/Postgres/E2E tests
 tests/fixtures/    spec-derived webhook payloads pinning every payload mapping
-migrations/        Alembic migrations (Postgres prod; SQLite dev uses create_all)
+migrations/        Alembic migrations — the sole schema owner on Postgres; SQLite dev uses init_schema/create_all
 examples/          reference Claude Code runner workflow
 scripts/           demo.py (offline narrated demo) + the live E2E smoke test
 docs/              quickstart

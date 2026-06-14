@@ -39,7 +39,7 @@ from foundry.connectors.transport import (
     gitlab_transport,
     linear_transport,
 )
-from foundry.db.base import create_all, make_engine, make_session_factory
+from foundry.db.base import init_schema, make_engine, make_session_factory
 from foundry.db.models import (
     FoundryAgentJob,
     FoundryArtifact,
@@ -135,7 +135,7 @@ def create_app(
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
-        create_all(engine)
+        init_schema(engine)
         session_factory = make_session_factory(engine)
 
     app = FastAPI(title="Project Foundry", version="1.1.0")
@@ -957,7 +957,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
 
 def app_from_settings(settings: Settings) -> FastAPI:
     engine = make_engine(settings.database_url)
-    create_all(engine)
+    init_schema(engine)
     session_factory = make_session_factory(engine)
     github_connector = (
         GitHubConnector(transport=github_transport(settings.github_api_token))

@@ -67,3 +67,20 @@ def create_all(engine) -> None:
     from . import models  # noqa: F401
 
     Base.metadata.create_all(engine)
+
+
+def init_schema(engine) -> None:
+    """Create the schema for the dev/test SQLite backend; Alembic owns the rest.
+
+    SQLite development and test databases have no migration step, so ``create_all``
+    is the schema owner there. On other backends (Postgres in production) Alembic
+    migrations are the *single* owner: running ``create_all`` would create the
+    tables without stamping ``alembic_version``, stranding a later
+    ``alembic upgrade head`` (it would start at base and fail on the existing
+    tables). So we skip it on non-SQLite and rely on ``alembic upgrade head``
+    instead — the Docker entrypoint runs it on startup, and ``make migrate``
+    runs it by hand. This is the one-owner-per-backend resolution of the
+    ``create_all`` vs Alembic conflict.
+    """
+    if engine.dialect.name == "sqlite":
+        create_all(engine)
