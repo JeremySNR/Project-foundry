@@ -115,3 +115,121 @@ async def test_workflow_reject_path(env) -> None:
             )
             result = await handle.result()
             assert result["status"] == "rejected"
+
+
+def _pr_event(status: str = "open") -> dict:
+    return {
+        "repo": "customer-web",
+        "pr_number": 1,
+        "url": "https://github.com/o/customer-web/pull/1",
+        "branch": "foundry/lin-123-add-customer-favourites",
+        "status": status,
+        "files_changed": ["src/x.ts"],
+    }
+
+
+async def test_workflow_approval_timeout_blocks_cleanly(env) -> None:
+    # No decision is ever sent: the time-skipping env fast-forwards past the
+    # approval window. The workflow must end the run cleanly (blocked), not fail
+    # and strand it at waiting_approval (issue #15, problem 1).
+    activities = _activities()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[TicketToPrWorkflow],
+            activities=activities.all(),
+            activity_executor=executor,
+        ):
+            handle = await env.client.start_workflow(
+                TicketToPrWorkflow.run,
+                {"ticket": READY_TICKET, "trigger_type": "label"},
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            result = await handle.result()
+            assert result["status"] == "blocked"
+
+
+async def test_workflow_pr_timeout_fails_cleanly(env) -> None:
+    # Approved and dispatched, but the agent never opens a PR: the PR window
+    # elapses and the run ends as execution_failed, not stranded at agent_running.
+    activities = _activities()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[TicketToPrWorkflow],
+            activities=activities.all(),
+            activity_executor=executor,
+        ):
+            handle = await env.client.start_workflow(
+                TicketToPrWorkflow.run,
+                {"ticket": READY_TICKET, "trigger_type": "label"},
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.signal(
+                TicketToPrWorkflow.submit_decision,
+                args=["approve", "lead@example.com", []],
+            )
+            result = await handle.result()
+            assert result["status"] == "execution_failed"
+
+
+async def test_workflow_ignores_unknown_decision_then_accepts_valid(env) -> None:
+    # An unrecognised verb must not silently stop the run (issue #15, problem 2):
+    # it is dropped, and a subsequent valid reject is honoured.
+    activities = _activities()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[TicketToPrWorkflow],
+            activities=activities.all(),
+            activity_executor=executor,
+        ):
+            handle = await env.client.start_workflow(
+                TicketToPrWorkflow.run,
+                {"ticket": READY_TICKET, "trigger_type": "label"},
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.signal(
+                TicketToPrWorkflow.submit_decision,
+                args=["frobnicate", "attacker@example.com", []],
+            )
+            await handle.signal(
+                TicketToPrWorkflow.submit_decision,
+                args=["reject", "lead@example.com", []],
+            )
+            result = await handle.result()
+            assert result["status"] == "rejected"
+
+
+async def test_workflow_processes_multiple_pr_events_until_terminal(env) -> None:
+    # The workflow loops on every PR event, not just the first (issue #15,
+    # problem 4): an opened PR followed by a merge drives the run to complete.
+    activities = _activities()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[TicketToPrWorkflow],
+            activities=activities.all(),
+            activity_executor=executor,
+        ):
+            handle = await env.client.start_workflow(
+                TicketToPrWorkflow.run,
+                {"ticket": READY_TICKET, "trigger_type": "label"},
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.signal(
+                TicketToPrWorkflow.submit_decision,
+                args=["approve", "lead@example.com", []],
+            )
+            await handle.signal(TicketToPrWorkflow.pr_observed, _pr_event("open"))
+            await handle.signal(TicketToPrWorkflow.pr_observed, _pr_event("merged"))
+            result = await handle.result()
+            assert result["status"] == "complete"
