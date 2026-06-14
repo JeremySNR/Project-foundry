@@ -19,6 +19,14 @@ The fixtures below were written from the providers' webhook documentation;
 payloads captured from live traffic are strictly better and welcome as
 replacements.
 
+## Slack interactivity
+
+`slack_block_action_approve.json` is the JSON Slack puts in the `payload` field
+of an interactivity (`block_actions`) request when an approver clicks a Foundry
+button. `tests/test_slack_approvals.py` URL-encodes it into a `payload=...` body,
+signs it with Slack's v0 scheme, and posts it through `/webhooks/slack` to pin
+the action_id -> command / value -> issue id / `user.id` -> approver mapping.
+
 ## GitHub REST responses (catalog code facts)
 
 `github_tree_recursive.json` / `github_tree_truncated.json` mirror the Git
