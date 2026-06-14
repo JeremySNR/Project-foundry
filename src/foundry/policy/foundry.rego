@@ -1,8 +1,11 @@
-# Foundry Ticket-to-PR policy (production backend).
+# Foundry Ticket-to-PR policy.
 #
 # This Rego bundle mirrors foundry/policy/engine.py:LocalPolicyEngine. Keep the
-# two in lock-step; the Python evaluator is the default for local/test use and
-# this bundle is used when an OPA server is configured.
+# two in lock-step. The Python evaluator (LocalPolicyEngine) is the engine the
+# app actually runs today; this bundle is the language-agnostic reference for an
+# OPA-based deployment and is exercised by `opa test` in CI. There is not yet a
+# config path that wires an OPA server at runtime (OpaPolicyEngine is unwired —
+# tracked in #21).
 #
 # Decision document: data.foundry.ticket_to_pr.decision
 #   { "allow": bool, "reasons": [string], "allowed_agent_mode": string,
