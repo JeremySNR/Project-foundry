@@ -253,6 +253,44 @@ def test_agent_metrics_scores_the_dispatched_provider(client) -> None:
     assert {r["repo"] for r in card["by_repo"]} == {"customer-web"}
 
 
+def test_agent_recommendation_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/agents/recommendation").status_code == 401
+    assert (
+        client.get("/metrics/agents/recommendation?days=0", headers=AUTH).status_code
+        == 422
+    )
+
+
+def test_agent_recommendation_empty_database(client) -> None:
+    body = client.get("/metrics/agents/recommendation", headers=AUTH).json()
+    assert body["days"] == 90
+    assert body["recommended"] is None
+    assert body["ranked"] == []
+
+
+def test_agent_recommendation_below_floor_is_not_recommended(client) -> None:
+    _run_to_merged(client)
+    body = client.get("/metrics/agents/recommendation?days=30", headers=AUTH).json()
+    # One merged run is below the default 3-sample floor: the fake provider shows
+    # in the ranking but isn't eligible to be recommended yet.
+    assert body["days"] == 30
+    assert {c["provider"] for c in body["ranked"]} == {"fake"}
+    assert body["recommended"] is None
+
+
+def test_agent_recommendation_picks_the_proven_provider(client) -> None:
+    # Three merged runs clear the default floor.
+    for i in range(3):
+        _run_to_merged(
+            client, issue_id=f"issue-{i}", key=f"LIN-{900 + i}", number=900 + i
+        )
+    body = client.get("/metrics/agents/recommendation", headers=AUTH).json()
+    assert body["recommended"] == "fake"
+    assert body["ranked"][0]["provider"] == "fake"
+    assert body["ranked"][0]["eligible"] is True
+    assert "fake" in body["reason"]
+
+
 def test_fleet_requires_bearer_token(client) -> None:
     assert client.get("/metrics/fleet").status_code == 401
     assert (

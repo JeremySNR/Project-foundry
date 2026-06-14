@@ -738,6 +738,34 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **agent_scorecards(session, since=since)}
 
+    @app.get("/metrics/agents/recommendation")
+    def metrics_agents_recommendation(
+        request: Request,
+        work_type: str | None = None,
+        repo: str | None = None,
+        days: int = 90,
+    ) -> dict[str, Any]:
+        """Which agent has the best track record for this work, with receipts.
+
+        The decision-support read behind the future ``agent.provider: auto``:
+        the scorecards turned into a single, explainable provider recommendation
+        for a ``work_type`` (and optionally ``repo``). Reporting only - nothing
+        dispatches. Token-gated like the other ``/metrics`` endpoints.
+        """
+        from foundry.memory.scorecards import recommend_provider
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **recommend_provider(
+                    session, work_type=work_type, repo=repo, since=since
+                ),
+            }
+
     @app.get("/metrics/fleet")
     def metrics_fleet(request: Request) -> dict[str, Any]:
         """Live fleet snapshot: every run's *current* state across the org -

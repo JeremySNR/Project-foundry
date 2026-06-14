@@ -13,8 +13,12 @@ merge rate (``smoothed_confidence``) so small samples stay honest (3 of 3 reads
 ``provider IS NOT NULL`` - count, since a run parked or rejected at intake says
 nothing about any agent.
 
-This module is read-only reporting. Acting on the numbers (policy-gated
-``agent.provider: auto`` dispatch) is deliberately a separate, gated change.
+This module is read-only reporting. ``recommend_provider`` turns the same
+numbers into a *decision* - which agent should ship a given piece of work -
+but it still only reports: it is the selection logic the future policy-gated
+``agent.provider: auto`` dispatch will call, surfaced ahead of that change so
+the decision can be inspected before anything acts on it. Actually dispatching
+on the recommendation remains a deliberately separate, gated change.
 """
 
 from __future__ import annotations
@@ -169,3 +173,141 @@ def agent_scorecards(
         )
     ]
     return {"min_samples": min_samples, "providers": providers}
+
+
+def _beta_rate(merged: int, runs: int) -> float:
+    """Beta(1,1)-smoothed merge rate in [0, 1] (the un-scaled ``smoothed_confidence``)."""
+    return (merged + 1) / (runs + 2) if runs >= 0 else 0.0
+
+
+def recommend_provider(
+    session,
+    *,
+    work_type: str | None = None,
+    repo: str | None = None,
+    candidates: list[str] | None = None,
+    since: datetime | None = None,
+    min_samples: int = DEFAULT_MIN_SAMPLES,
+) -> dict:
+    """Recommend the agent provider with the best track record for this work.
+
+    The selection logic the future ``agent.provider: auto`` dispatch will call,
+    kept deliberately separate from - and shipped ahead of - that gated change
+    so the *decision* can be inspected (via the metrics API and the CLI) before
+    anything acts on it. Reporting only: nothing here dispatches.
+
+    Mirrors the routing-priors guard rails (``priors.py``) so the two
+    delivery-memory signals behave the same way and stay explainable:
+
+    - **Scope, narrowest-with-evidence first.** With both ``work_type`` and
+      ``repo`` given, outcomes for that exact pair are preferred; if the pair
+      has fewer than ``min_samples`` runs it falls back to ``work_type`` alone,
+      then to all dispatched history - a recommendation always rests on enough
+      data, just at a coarser grain when it must.
+    - **Per-provider floor.** A provider needs >= ``min_samples`` runs in the
+      chosen scope to be *eligible*; thin history still appears in the ranking
+      but never wins.
+    - **Win on history that mostly worked.** The Beta(1,1)-smoothed merge rate
+      must clear 0.5 - an agent that mostly failed is a reason to stay quiet,
+      not to route to it.
+    - **Candidate allow-list.** ``candidates`` restricts the field to providers
+      you can actually dispatch (e.g. the ones with credentials configured), so
+      the engine never recommends an agent you cannot use.
+
+    Returns a ranked, fully annotated report. ``recommended`` is the top
+    eligible provider's name, or ``None`` when nothing qualifies - always with a
+    human-readable ``reason`` suitable for an audit trail.
+    """
+    allow = set(candidates) if candidates is not None else None
+
+    pair_cells: dict[str, _Cell] = {}
+    wt_cells: dict[str, _Cell] = {}
+    all_cells: dict[str, _Cell] = {}
+
+    for provider, row_wt, row_repo, runs, merged, jobs, cost_sum, cost_count in (
+        scorecard_rows(session, since=since)
+    ):
+        if allow is not None and provider not in allow:
+            continue
+        all_cells.setdefault(provider, _Cell()).add(runs, merged, jobs, cost_sum, cost_count)
+        if work_type is not None and row_wt == work_type:
+            wt_cells.setdefault(provider, _Cell()).add(
+                runs, merged, jobs, cost_sum, cost_count
+            )
+            if repo is not None and row_repo == repo:
+                pair_cells.setdefault(provider, _Cell()).add(
+                    runs, merged, jobs, cost_sum, cost_count
+                )
+
+    # Narrowest scope first; fall through to the next when this one is too thin.
+    ladder: list[tuple[str, dict[str, _Cell]]] = []
+    if work_type is not None and repo is not None:
+        ladder.append((f"{work_type} in {repo}", pair_cells))
+    if work_type is not None:
+        ladder.append((work_type, wt_cells))
+    ladder.append(("all dispatched work", all_cells))
+
+    scope_label, cells = ladder[-1]
+    for label, scope_cells in ladder:
+        if sum(cell.runs for cell in scope_cells.values()) >= min_samples:
+            scope_label, cells = label, scope_cells
+            break
+
+    ranked: list[dict] = []
+    for provider, cell in cells.items():
+        stat = cell.stat(min_samples=min_samples)
+        eligible = stat["meets_min_samples"] and _beta_rate(cell.merged, cell.runs) >= 0.5
+        ranked.append(
+            {
+                "provider": provider,
+                "eligible": eligible,
+                "runs": stat["runs"],
+                "merged": stat["merged"],
+                "success_rate": stat["success_rate"],
+                "smoothed_success": stat["smoothed_success"],
+                "avg_cost_usd": stat["avg_cost_usd"],
+                "meets_min_samples": stat["meets_min_samples"],
+            }
+        )
+
+    # Eligible first; then the strongest history; ties broken towards more
+    # evidence, then the cheaper agent, then the name (deterministic).
+    def _rank_key(card: dict) -> tuple:
+        cost = card["avg_cost_usd"]
+        return (
+            not card["eligible"],
+            -(card["smoothed_success"] or 0),
+            -card["runs"],
+            cost if cost is not None else float("inf"),
+            card["provider"],
+        )
+
+    ranked.sort(key=_rank_key)
+
+    top = ranked[0] if ranked and ranked[0]["eligible"] else None
+    if top is not None:
+        recommended = top["provider"]
+        reason = (
+            f"{top['provider']}: {top['merged']} of {top['runs']} {scope_label} "
+            f"runs merged (confidence {top['smoothed_success']})"
+        )
+        if top["avg_cost_usd"] is not None:
+            reason += f", ~${top['avg_cost_usd']}/run"
+        reason += "."
+    else:
+        recommended = None
+        reason = (
+            f"No agent has >= {min_samples} {scope_label} runs with a "
+            "majority-merged history yet; not enough evidence to recommend one."
+        )
+
+    return {
+        "work_type": work_type,
+        "repo": repo,
+        "scope": scope_label,
+        "min_samples": min_samples,
+        "candidates": sorted(allow) if allow is not None else None,
+        "recommended": recommended,
+        "reason": reason,
+        "ranked": ranked,
+    }
