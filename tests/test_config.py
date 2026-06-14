@@ -116,6 +116,43 @@ def test_api_token_from_env() -> None:
     assert s.api_token == "tok"
 
 
+def test_rate_limit_defaults_on() -> None:
+    s = Settings.from_env({})
+    assert s.rate_limit_enabled is True
+    assert s.rate_limit_webhook_per_minute == 120
+    assert s.rate_limit_api_per_minute == 60
+
+
+def test_rate_limit_from_yaml_and_env(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "rate_limit:\n  enabled: true\n  webhook_per_minute: 300\n  api_per_minute: 30\n"
+    )
+    s = Settings.load(path, env={})
+    assert s.rate_limit_enabled is True
+    assert s.rate_limit_webhook_per_minute == 300
+    assert s.rate_limit_api_per_minute == 30
+    # Env overrides YAML (operational knob).
+    s2 = Settings.load(
+        path,
+        env={
+            "FOUNDRY_RATE_LIMIT_ENABLED": "false",
+            "FOUNDRY_RATE_LIMIT_API_PER_MINUTE": "10",
+        },
+    )
+    assert s2.rate_limit_enabled is False
+    assert s2.rate_limit_api_per_minute == 10
+
+
+def test_rate_limit_invalid_values_rejected() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        Settings.from_env({"FOUNDRY_RATE_LIMIT_API_PER_MINUTE": "0"})
+    with pytest.raises(ValueError):
+        Settings.from_env({"FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE": "0"})
+
+
 def test_slack_notifications_from_env_and_yaml(tmp_path) -> None:
     # Bot token is env-only; the channel may come from YAML or env (env wins).
     s = Settings.from_env(

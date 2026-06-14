@@ -106,6 +106,18 @@ tracker:
 #   merged). Best-effort: a Slack outage never breaks a run. Fail-closed: outbound
 #   Slack is wired only when BOTH the bot token and a channel are set.
 
+rate_limit:
+  # Coarse per-client request caps on the network surfaces (webhooks + API).
+  # Stops a flood of authorised-looking requests - a replayed webhook in a tight
+  # loop, a runaway integration, a bearer-token brute force - from exhausting the
+  # process. Two independent buckets so a webhook burst can't starve the API.
+  # Per-process, fixed 60s window (see src/foundry/api/ratelimit.py for the
+  # scope caveats: not shared across workers, keyed by the direct peer address).
+  # Env overrides: FOUNDRY_RATE_LIMIT_ENABLED / _WEBHOOK_PER_MINUTE / _API_PER_MINUTE.
+  enabled: true
+  webhook_per_minute: 120  # provider deliveries can be bursty
+  api_per_minute: 60       # approvals, run reads, metrics
+
 notifications:
   # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status
   # updates into. Needs FOUNDRY_SLACK_BOT_TOKEN set too; either missing => no

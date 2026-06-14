@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func
 
 from foundry.config import Settings
@@ -61,6 +61,7 @@ from foundry.schemas.ticket import RawTicket
 
 from .dashboard import DASHBOARD_HTML
 from .mapping import linear_payload_to_ticket
+from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
 from .security import (
     is_authorised_approver,
@@ -100,6 +101,20 @@ def _run_to_dict(run: FoundryRun) -> dict[str, Any]:
 
 def _extract_event_id(payload: dict[str, Any], delivery_header: str | None) -> str | None:
     return delivery_header or payload.get("deliveryId") or payload.get("id")
+
+
+def _rate_limit_bucket(path: str) -> str | None:
+    """Which rate-limit bucket (if any) a request path falls into.
+
+    ``webhook`` covers every inbound provider delivery; ``api`` covers the run
+    reads, metrics and the approval POST. ``/healthz`` (load-balancer polling),
+    ``/dashboard`` (static HTML) and the docs are deliberately unthrottled.
+    """
+    if path.startswith("/webhooks/"):
+        return "webhook"
+    if path == "/runs" or path.startswith("/runs/") or path.startswith("/metrics"):
+        return "api"
+    return None
 
 
 def _is_trigger(payload: dict[str, Any], *, label: str, status: str) -> bool:
@@ -145,6 +160,9 @@ def create_app(
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
+    rate_limit_enabled: bool = True,
+    rate_limit_webhook_per_minute: int = 120,
+    rate_limit_api_per_minute: int = 60,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -181,6 +199,42 @@ def create_app(
     app.state.trigger_status = trigger_status
     # In-memory fast-path dedup; the durable guarantee is one run per issue (DB).
     app.state.processed_events = set()
+
+    # Per-client request caps on the network surfaces. Two buckets so a flood on
+    # one surface cannot starve the other. Per-process (like the dedup set);
+    # see api/ratelimit.py for the scope caveats. Disabled => no limiters wired.
+    if rate_limit_enabled:
+        app.state.rate_limiters = {
+            "webhook": RateLimiter(limit=rate_limit_webhook_per_minute),
+            "api": RateLimiter(limit=rate_limit_api_per_minute),
+        }
+    else:
+        app.state.rate_limiters = {}
+
+    @app.middleware("http")
+    async def _rate_limit(request: Request, call_next):
+        bucket = _rate_limit_bucket(request.url.path)
+        limiter = app.state.rate_limiters.get(bucket) if bucket else None
+        if limiter is None:
+            return await call_next(request)
+        client = request.client.host if request.client else "unknown"
+        result = limiter.check(f"{bucket}:{client}")
+        if not result.allowed:
+            # 429 before the handler runs: no signature check, no DB hit, no
+            # workflow side effect for a throttled request.
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "rate limit exceeded; retry later"},
+                headers={
+                    "Retry-After": str(result.retry_after),
+                    "X-RateLimit-Limit": str(result.limit),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(result.limit)
+        response.headers["X-RateLimit-Remaining"] = str(result.remaining)
+        return response
 
     def _submit_decision(run_id: str, *, command: str, user: str) -> None:
         """Drive an approve/reject/stop decision with config-derived roles."""
@@ -1094,6 +1148,9 @@ def app_from_settings(settings: Settings) -> FastAPI:
         slack_signing_secret=settings.slack_signing_secret,
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
+        rate_limit_enabled=settings.rate_limit_enabled,
+        rate_limit_webhook_per_minute=settings.rate_limit_webhook_per_minute,
+        rate_limit_api_per_minute=settings.rate_limit_api_per_minute,
     )
 
 
