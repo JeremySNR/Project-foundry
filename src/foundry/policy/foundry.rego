@@ -1,8 +1,13 @@
-# Foundry Ticket-to-PR policy (production backend).
+# Foundry Ticket-to-PR policy.
 #
 # This Rego bundle mirrors foundry/policy/engine.py:LocalPolicyEngine. Keep the
-# two in lock-step; the Python evaluator is the default for local/test use and
-# this bundle is used when an OPA server is configured.
+# two in lock-step. The Python evaluator (LocalPolicyEngine) is the default the
+# app runs; this bundle is the language-agnostic backend used when
+# `policy.provider: opa` is configured (OpaPolicyEngine), and is exercised by
+# `opa test` in CI. Lock-step is machine-verified: scripts/policy_parity.py runs
+# the shared vectors in tests/data/policy_vectors.json through `opa eval` in the
+# OPA CI job, while tests/test_policy_parity.py runs the same vectors through
+# LocalPolicyEngine - both assert the same expected decisions.
 #
 # Decision document: data.foundry.ticket_to_pr.decision
 #   { "allow": bool, "reasons": [string], "allowed_agent_mode": string,
@@ -12,7 +17,10 @@ package foundry.ticket_to_pr
 
 import rego.v1
 
-repo_confidence_threshold := 70
+# The confidence threshold is supplied by the caller so the Rego bundle and the
+# Python LocalPolicyEngine evaluate against the *same* configured value (default
+# 70) instead of a hardcoded constant that could silently drift from YAML.
+repo_confidence_threshold := object.get(input, "repo_confidence_threshold", 70)
 
 # Actions that launch or progress autonomous work and must pass the gate.
 autonomous_actions := {
@@ -37,6 +45,13 @@ advisory_actions := {
 forbidden_actions := {
 	"auto_merge",
 	"production_deploy",
+}
+
+# Actions that launch a coding agent and so spend against the run budget. The
+# budget cap is enforced for these at every attempt, including first dispatch.
+spend_actions := {
+	"start_agent",
+	"retry_agent",
 }
 
 default is_autonomous := false
@@ -113,12 +128,14 @@ deny_reasons contains msg if {
 }
 
 deny_reasons contains msg if {
-	input.action == "retry_agent"
+	input.action in spend_actions
 	max_cost := object.get(input, ["budget", "max_cost_usd"], null)
 	max_cost != null
 	cost := object.get(input, ["budget", "cost_usd"], 0)
-	cost >= max_cost
-	msg := sprintf("run spend $%.2f has reached the budget cap of $%.2f", [cost, max_cost])
+	pending := object.get(input, ["budget", "pending_cost_usd"], 0)
+	projected := cost + pending
+	projected >= max_cost
+	msg := sprintf("projected run spend $%.2f would reach the budget cap of $%.2f", [projected, max_cost])
 }
 
 deny_reasons contains msg if {

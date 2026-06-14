@@ -26,14 +26,28 @@ risk:
   model: gpt-5.5
 
 policy:
+  # Policy backend: "local" (in-process Python engine, the default) or "opa"
+  # (delegate to an OPA server running src/foundry/policy/foundry.rego). Both
+  # enforce identical rules - lock-step is machine-verified over shared vectors
+  # (tests/test_policy_parity.py + scripts/policy_parity.py).
+  provider: local
+  # OPA decision endpoint base URL; required only when provider is "opa".
+  # The repo_confidence_threshold below is sent to OPA so the two backends
+  # evaluate against the same value.
+  # opa_url: http://opa:8181
   # A run is blocked unless one repo clears this confidence (0-100).
   repo_confidence_threshold: 70
   # PRs larger than this are routed to human review.
   max_files_changed: 12
-  # Paths an agent may never touch. Matches block the run.
+  # Paths an agent may never touch. Matches block the run (sticky; never retried).
+  # Use the `**/...` form for dirs that can appear at any depth — a bare
+  # `migrations/**` only matches a top-level dir, so a nested
+  # `services/api/migrations/0001.py` would slip the hard block.
   forbidden_globs:
     - "infra/**"
+    - "**/infra/**"
     - "migrations/**"
+    - "**/migrations/**"
     - "**/.env*"
     - "**/secrets/**"
   # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)
@@ -54,10 +68,18 @@ remediation:
   retry_on: ["ci_failed", "changes_requested"]
 
 budget:
-  # Deny further agent retries once a run's provider-reported spend reaches
-  # this many USD. Omit (or null) for no cap. Only providers that expose
-  # usage (e.g. Cursor Cloud) report spend.
+  # Deny agent dispatch once a run's spend reaches this many USD. Enforced at
+  # first dispatch and on every retry (the gate compares *projected* spend:
+  # recorded cost so far plus the next dispatch's estimate). Omit (or null) for
+  # no cap.
   max_cost_per_run: 25.0
+  # Fallback per-dispatch cost (USD) for providers that don't report spend.
+  # Only some providers expose usage (e.g. Cursor Cloud reports cost_usd); with
+  # claude_code / webhook / manual the cap can never bind on reported cost
+  # alone. Set this so each dispatched attempt counts as a proxy and the cap
+  # still trips. Provider-reported cost always wins where available.
+  # 0 (the default) = no estimate; the cap then needs reported cost to bind.
+  estimated_cost_per_dispatch: 0.0
 
 agent:
   # Which coding agent receives approved work:
@@ -88,6 +110,42 @@ tracker:
 #            self-managed GitLab set FOUNDRY_GITLAB_API_BASE (default
 #            https://gitlab.com/api/v4).
 
+# Chat approvals (Slack):
+#   Slack - set FOUNDRY_SLACK_SIGNING_SECRET to enable POST /webhooks/slack.
+#           Approvers click approve/reject/stop buttons; the request is verified
+#           against Slack's v0 request signature with replay-age protection, then
+#           driven through the SAME policy gate and role checks as every other
+#           surface. The actor is the Slack-signed user id, so when Slack is your
+#           approval surface, key the approvers below by Slack user id (e.g.
+#           "U07ABC123") rather than email - as GitHub Issues approvers are keyed
+#           by login. Fail-closed: no signing secret => endpoint disabled.
+#
+# Outbound Slack notifications (the message approvers click + status updates):
+#   Set FOUNDRY_SLACK_BOT_TOKEN (a bot token, xoxb-...) AND notifications.slack_channel
+#   (below; or FOUNDRY_SLACK_CHANNEL). Foundry then posts an interactive approval
+#   message (approve/reject/stop buttons that round-trip to /webhooks/slack) when a
+#   run parks for approval, plus short status updates (parked, blocked, PR open,
+#   merged). Best-effort: a Slack outage never breaks a run. Fail-closed: outbound
+#   Slack is wired only when BOTH the bot token and a channel are set.
+
+rate_limit:
+  # Coarse per-client request caps on the network surfaces (webhooks + API).
+  # Stops a flood of authorised-looking requests - a replayed webhook in a tight
+  # loop, a runaway integration, a bearer-token brute force - from exhausting the
+  # process. Two independent buckets so a webhook burst can't starve the API.
+  # Per-process, fixed 60s window (see src/foundry/api/ratelimit.py for the
+  # scope caveats: not shared across workers, keyed by the direct peer address).
+  # Env overrides: FOUNDRY_RATE_LIMIT_ENABLED / _WEBHOOK_PER_MINUTE / _API_PER_MINUTE.
+  enabled: true
+  webhook_per_minute: 120  # provider deliveries can be bursty
+  api_per_minute: 60       # approvals, run reads, metrics
+
+notifications:
+  # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status
+  # updates into. Needs FOUNDRY_SLACK_BOT_TOKEN set too; either missing => no
+  # outbound Slack. Leave unset to disable.
+  slack_channel: "C01APPROVALS"
+
 triggers:
   # A run starts only on an explicit opt-in, never for every new issue.
   label: "foundry:candidate"
@@ -97,6 +155,8 @@ approval:
   # Who may run /foundry approve, and which approval roles each person's
   # sign-off grants. Roles are CONFIG, never request payload - an API caller
   # cannot claim "security" for themselves. Empty means nobody can approve.
+  # Key approvers by the identity the surface reports: email for Linear/Jira/REST,
+  # GitHub login for GitHub Issues, Slack user id for the Slack approval surface.
   approvers:
     - email: "lead@example.com"
       roles: ["engineering"]
@@ -135,7 +195,9 @@ context:
   # How many file-tree paths to store per repo (shallowest kept first; trees
   # beyond the cap are marked truncated). Minimum 100.
   tree_max_paths: 2000
-  # Optional manual keyword hints, merged with catalog scoring (catalog/code providers only).
+  # Repo -> keyword hints. With provider: static (the default) this map IS the
+  # routing catalog the enricher scores tickets against; with provider:
+  # catalog / code it's merged into the synced org catalog as manual hints.
   # repo_keywords:
   #   acme/billing-service: ["invoice", "stripe"]
 

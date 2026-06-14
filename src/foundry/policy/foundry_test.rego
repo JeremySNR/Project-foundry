@@ -168,6 +168,59 @@ test_retry_under_budget_allowed if {
 	decision.allow == true
 }
 
+# The budget cap binds on the first dispatch too (issue #29): with nothing
+# spent yet, the pending estimate alone can push a single attempt over the cap.
+test_start_agent_over_budget_denied if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "start_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"budget": {"cost_usd": 0.0, "pending_cost_usd": 5.0, "max_cost_usd": 5.0},
+		"approval": {},
+	}
+	decision.allow == false
+}
+
+test_start_agent_under_budget_allowed if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "start_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"budget": {"cost_usd": 0.0, "pending_cost_usd": 4.0, "max_cost_usd": 5.0},
+		"approval": {},
+	}
+	decision.allow == true
+}
+
+# Projected spend = recorded cost + the next dispatch's estimate; a retry whose
+# recorded spend is under the cap is still denied once the estimate is added.
+test_projected_spend_combines_recorded_and_pending if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "retry_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"budget": {"cost_usd": 4.0, "pending_cost_usd": 2.0, "max_cost_usd": 5.0},
+		"approval": {},
+	}
+	decision.allow == false
+}
+
+# The budget rule gates only the spending actions; open_pr is not blocked on spend.
+test_open_pr_not_blocked_on_spend if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "open_pr",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"budget": {"cost_usd": 99.0, "max_cost_usd": 5.0},
+		"approval": {},
+	}
+	decision.allow == true
+}
+
 # An action the policy does not recognise is denied by default.
 test_unknown_action_denied_by_default if {
 	decision := ticket_to_pr.decision with input as {

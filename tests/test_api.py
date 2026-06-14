@@ -722,6 +722,30 @@ def test_build_orchestrator_code_uses_code_enricher() -> None:
     assert isinstance(orch._enricher, CodeContextEnricher)
 
 
+def test_build_orchestrator_slack_notifier_fail_closed() -> None:
+    """Outbound Slack is wired only when BOTH the bot token and channel are set."""
+    from dataclasses import replace
+
+    from foundry.api.app import build_orchestrator
+    from foundry.config import Settings
+    from foundry.connectors.slack import SlackNotifier
+    from foundry.db import create_all, make_engine, make_session_factory
+
+    engine = make_engine()
+    create_all(engine)
+    sf = make_session_factory(engine)
+    base = Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"})
+
+    # Neither / only one => no notifier.
+    assert build_orchestrator(base, sf)._notifier is None
+    assert build_orchestrator(replace(base, slack_bot_token="xoxb-1"), sf)._notifier is None
+    assert build_orchestrator(replace(base, slack_channel="C1"), sf)._notifier is None
+
+    # Both => a SlackNotifier is wired.
+    both = replace(base, slack_bot_token="xoxb-1", slack_channel="C1")
+    assert isinstance(build_orchestrator(both, sf)._notifier, SlackNotifier)
+
+
 def test_build_orchestrator_static_carries_yaml_keywords() -> None:
     """Keywords from context.repo_keywords are wired into StaticContextEnricher."""
     from foundry.api.app import build_orchestrator
@@ -880,6 +904,11 @@ def test_timeline_exposes_full_decision_record(client) -> None:
 
     assert timeline["agent_jobs"], "the dispatched agent job must be visible"
     assert timeline["agent_jobs"][0]["provider"] == "fake"
+
+    # Spend vs cap is surfaced so an approver sees budget before approving.
+    assert {"consumed_usd", "cap_usd", "estimated_cost_per_dispatch"} == set(
+        timeline["budget"]
+    )
 
 
 # -- dashboard -----------------------------------------------------------------
