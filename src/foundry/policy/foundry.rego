@@ -74,6 +74,13 @@ is_unknown if {
 	not is_forbidden
 }
 
+# Whether any human approval has been recorded for the run (issue #18). This is
+# the role-agnostic "was this approved at all?" signal, separate from the
+# per-role approval map below. Autonomous actions require it.
+default approval_present := false
+
+approval_present if input.approval_present
+
 # --- required approvals derived from sensitive areas ---
 required_approvals contains "engineering" if input.risk.auth
 required_approvals contains "engineering" if input.risk.infrastructure
@@ -90,6 +97,14 @@ deny_reasons contains msg if {
 deny_reasons contains msg if {
 	is_unknown
 	msg := sprintf("action '%s' is not covered by this policy; denying by default", [input.action])
+}
+
+# Every autonomous action requires at least one recorded human approval - the
+# human-in-the-loop promise as a policy rule, not only an orchestration check
+# (issue #18). Mirrors LocalPolicyEngine; a gate strengthening (invariant #1).
+deny_reasons contains "autonomous action requires at least one recorded human approval" if {
+	is_autonomous
+	not approval_present
 }
 
 deny_reasons contains "production deployment is blocked in the MVP" if {

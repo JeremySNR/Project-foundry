@@ -71,6 +71,34 @@ def test_ready_ticket_reaches_waiting_approval(session_factory) -> None:
     assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
 
 
+def test_intake_records_achievable_agent_mode_and_pre_approval_denial(
+    session_factory,
+) -> None:
+    """The gate denies dispatch with no approval recorded yet (issue #18), but a
+    ready low-risk run must still (a) route to WAITING_APPROVAL and (b) advertise
+    the agent mode *achievable* once approved (draft_pr) rather than the transient
+    human-only of its unapproved state. The recorded intake decision is the
+    honest pre-approval result: denied for the missing approval."""
+    from foundry.schemas.common import AgentMode
+
+    orch = _orch(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    with session_factory() as s:
+        run = s.get(FoundryRun, run_id)
+        assert run.status is RunStatus.WAITING_APPROVAL
+        # Achievable-once-approved mode, not the unapproved human-only.
+        assert run.agent_mode is AgentMode.DRAFT_PR
+        decision = (
+            s.query(FoundryPolicyDecision)
+            .filter_by(run_id=run_id)
+            .one()
+        )
+        # The recorded gate decision is honest about the pre-approval state.
+        assert decision.allowed is False
+        assert "requires at least one recorded human approval" in decision.reason
+
+
 def test_intake_persists_all_artifacts(session_factory) -> None:
     orch = _orch(session_factory)
     run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")

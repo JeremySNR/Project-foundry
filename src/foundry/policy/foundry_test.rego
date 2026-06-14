@@ -17,6 +17,7 @@ test_low_risk_allows_draft_pr if {
 		"risk": {"overall_risk": "low"},
 		"repo": {"name": "customer-web", "confidence": 90},
 		"approval": {},
+		"approval_present": true,
 	}
 	decision.allow == true
 	decision.allowed_agent_mode == "draft_pr"
@@ -41,6 +42,7 @@ test_auth_allowed_with_engineering_approval if {
 		"risk": {"overall_risk": "medium", "auth": true},
 		"repo": {"confidence": 90},
 		"approval": {"engineering": true},
+		"approval_present": true,
 	}
 	decision.allow == true
 }
@@ -127,6 +129,7 @@ test_retry_within_cap_allowed if {
 		"repo": {"confidence": 90},
 		"retry": {"attempt": 2, "max_attempts": 2},
 		"approval": {},
+		"approval_present": true,
 	}
 	decision.allow == true
 }
@@ -164,6 +167,7 @@ test_retry_under_budget_allowed if {
 		"repo": {"confidence": 90},
 		"budget": {"cost_usd": 1.0, "max_cost_usd": 5.0},
 		"approval": {},
+		"approval_present": true,
 	}
 	decision.allow == true
 }
@@ -190,6 +194,7 @@ test_start_agent_under_budget_allowed if {
 		"repo": {"confidence": 90},
 		"budget": {"cost_usd": 0.0, "pending_cost_usd": 4.0, "max_cost_usd": 5.0},
 		"approval": {},
+		"approval_present": true,
 	}
 	decision.allow == true
 }
@@ -216,6 +221,47 @@ test_open_pr_not_blocked_on_spend if {
 		"risk": {"overall_risk": "low"},
 		"repo": {"confidence": 90},
 		"budget": {"cost_usd": 99.0, "max_cost_usd": 5.0},
+		"approval": {},
+		"approval_present": true,
+	}
+	decision.allow == true
+}
+
+# Every autonomous action requires at least one recorded human approval (issue
+# #18). A ready, low-risk, confident-repo run with no approval present is denied.
+test_start_agent_without_approval_denied if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "start_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"approval": {},
+	}
+	decision.allow == false
+	"autonomous action requires at least one recorded human approval" in decision.reasons
+}
+
+# The backstop covers retries too.
+test_retry_without_approval_denied if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "retry_agent",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
+		"retry": {"attempt": 1, "max_attempts": 2},
+		"approval": {},
+	}
+	decision.allow == false
+	"autonomous action requires at least one recorded human approval" in decision.reasons
+}
+
+# Advisory reads never launch work, so the approval rule does not gate them.
+test_advisory_allowed_without_approval if {
+	decision := ticket_to_pr.decision with input as {
+		"action": "analyse_ticket",
+		"ticket": {"readiness": "ready"},
+		"risk": {"overall_risk": "low"},
+		"repo": {"confidence": 90},
 		"approval": {},
 	}
 	decision.allow == true

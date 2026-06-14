@@ -113,6 +113,13 @@ class PolicyInput(BaseModel):
     budget: PolicyBudget = Field(default_factory=PolicyBudget)
     # Map of approval role -> granted. Missing keys are treated as not granted.
     approval: dict[str, bool] = Field(default_factory=dict)
+    # Whether *any* human approval has been recorded for the run. ``approval``
+    # above covers *which* sensitive-area roles signed off; this is the separate,
+    # role-agnostic "was this approved at all?" signal. Autonomous actions require
+    # it (issue #18) so the human-in-the-loop promise is a policy rule, not just
+    # an orchestration detail - any path that reaches the gate without an approval
+    # is denied, including low/medium-risk work that derives no required roles.
+    approval_present: bool = False
 
 
 class PolicyDecision(BaseModel):
@@ -254,6 +261,17 @@ class LocalPolicyEngine:
             )
 
         # --- hard blocks (MVP) ---
+        # Every autonomous action requires at least one recorded human approval.
+        # This is the product's central promise expressed as a policy rule, not
+        # only an orchestrator state check (issue #18): the orchestrator already
+        # refuses to dispatch a run that is not APPROVED, but without this the
+        # gate itself would allow ready, low/medium-risk, confident-repo work
+        # with no approval present - leaving any future path to the gate
+        # ungoverned. A gate *strengthening*, permitted under invariant #1.
+        if not payload.approval_present:
+            reasons.append(
+                "autonomous action requires at least one recorded human approval"
+            )
         if payload.risk.production_deploy:
             reasons.append("production deployment is blocked in the MVP")
         if payload.risk.database_migration:

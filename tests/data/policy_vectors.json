@@ -16,6 +16,10 @@
     "- `config.repo_confidence_threshold` (default 70) is injected into the OPA",
     "  input and passed to LocalPolicyEngine's constructor, proving the threshold",
     "  is threaded through rather than hardcoded.",
+    "- `approval_present` is the role-agnostic 'was this approved at all?' signal",
+    "  (issue #18). Autonomous-action vectors set it explicitly so each isolates",
+    "  the rule under test; the missing-approval rule itself is covered by its own",
+    "  vectors below. Advisory/forbidden/unknown actions ignore it.",
     "- `valid_action: false` marks an action outside the PolicyAction enum: Python",
     "  rejects it at the schema boundary (its form of default-deny) so only `allow`",
     "  is checked there; Rego's in-rule default-deny is checked in full."
@@ -28,7 +32,8 @@
         "ticket": {"work_type": "feature", "readiness": "ready"},
         "risk": {"overall_risk": "low"},
         "repo": {"name": "customer-web", "confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -44,7 +49,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 70},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -60,7 +66,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 69},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -77,7 +84,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 75},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -94,7 +102,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 80},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -110,7 +119,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "medium", "auth": true},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -126,7 +136,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "medium", "auth": true},
         "repo": {"confidence": 90},
-        "approval": {"engineering": true}
+        "approval": {"engineering": true},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -142,7 +153,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "medium", "customer_data": true},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -158,7 +170,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "high", "auth": true, "payments": true},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -177,7 +190,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "high", "auth": true, "payments": true},
         "repo": {"confidence": 90},
-        "approval": {"engineering": true}
+        "approval": {"engineering": true},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -193,7 +207,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "high", "auth": true, "payments": true},
         "repo": {"confidence": 90},
-        "approval": {"engineering": true, "security": true}
+        "approval": {"engineering": true, "security": true},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -209,7 +224,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "medium", "database_migration": true},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -225,7 +241,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "low", "production_deploy": true},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -241,7 +258,8 @@
         "ticket": {"readiness": "needs_clarification"},
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -257,7 +275,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "blocked"},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -273,12 +292,83 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "high"},
         "repo": {"confidence": 90},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
         "allowed_agent_mode": "human_only",
         "reasons": ["all minimum policy checks passed"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "start_agent_without_approval_denied",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["autonomous action requires at least one recorded human approval"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "start_agent_approval_present_false_denied",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+        "approval_present": false
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["autonomous action requires at least one recorded human approval"],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "missing_approval_compounds_with_other_denials",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "needs_clarification"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 40},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": [
+          "autonomous action requires at least one recorded human approval",
+          "repository confidence 40 is below the threshold of 70",
+          "ticket readiness is 'needs_clarification', not 'ready'"
+        ],
+        "required_approvals": []
+      }
+    },
+    {
+      "name": "retry_without_approval_denied",
+      "input": {
+        "action": "retry_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "retry": {"attempt": 1, "max_attempts": 2},
+        "approval": {}
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["autonomous action requires at least one recorded human approval"],
         "required_approvals": []
       }
     },
@@ -321,7 +411,8 @@
         "ticket": {"readiness": "ready"},
         "risk": {"overall_risk": "low"},
         "repo": {"name": "customer-web", "confidence": 100},
-        "approval": {"engineering": true, "security": true}
+        "approval": {"engineering": true, "security": true},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -354,7 +445,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "retry": {"attempt": 2, "max_attempts": 2},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -371,7 +463,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "retry": {"attempt": 3, "max_attempts": 2},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -388,7 +481,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "retry": {"attempt": 1, "max_attempts": 0},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -405,7 +499,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "retry": {"attempt": 0, "max_attempts": 0},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -422,7 +517,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "budget": {"cost_usd": 5.5, "max_cost_usd": 5.0},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -439,7 +535,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "budget": {"cost_usd": 5.0, "max_cost_usd": 5.0},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": false,
@@ -456,7 +553,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "budget": {"cost_usd": 4.99, "max_cost_usd": 5.0},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
@@ -473,7 +571,8 @@
         "risk": {"overall_risk": "low"},
         "repo": {"confidence": 90},
         "budget": {"cost_usd": 999.0},
-        "approval": {}
+        "approval": {},
+        "approval_present": true
       },
       "expected": {
         "allow": true,
