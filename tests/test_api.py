@@ -12,6 +12,7 @@ from foundry.api import create_app
 from foundry.api.security import compute_signature
 from foundry.db import create_all, make_engine, make_session_factory
 from foundry.orchestrator import FoundryOrchestrator
+from foundry.schemas.ticket import RawTicket
 
 SECRET = "test-secret"
 API_TOKEN = "test-api-token"
@@ -667,6 +668,70 @@ def test_timeline_disabled_without_configured_token() -> None:
 
 def test_timeline_unknown_run_404(client) -> None:
     assert client.get("/runs/nope/timeline", headers=AUTH).status_code == 404
+
+
+# -- epic view (parent/child runs, issue #35) ----------------------------------
+
+
+def _make_epic(client) -> tuple[str, str]:
+    """Create a parent run + one child linked to it; return (parent, child)."""
+    orch = client.app.state.orchestrator
+    parent = orch.intake_and_plan(
+        RawTicket(
+            issue_id="epic-1",
+            issue_key="LIN-900",
+            title="Migrate logging",
+            description=READY_DESC,
+            known_repositories=["customer-web"],
+        ),
+        trigger_type="label",
+    )
+    child = orch.intake_and_plan(
+        RawTicket(
+            issue_id="epic-1-child",
+            issue_key="LIN-901",
+            title="Migrate logging in web",
+            description=READY_DESC,
+            known_repositories=["customer-web"],
+        ),
+        trigger_type="label",
+        parent_run_id=parent,
+    )
+    return parent, child
+
+
+def test_epic_requires_token(client) -> None:
+    parent, _ = _make_epic(client)
+    assert client.get(f"/runs/{parent}/epic").status_code == 401
+
+
+def test_epic_lists_children_and_rollup(client) -> None:
+    parent, child = _make_epic(client)
+    body = client.get(f"/runs/{parent}/epic", headers=AUTH).json()
+    assert body["run"]["id"] == parent
+    assert [c["id"] for c in body["children"]] == [child]
+    assert body["rollup"]["total"] == 1
+    assert body["rollup"]["status"] == "in_progress"
+
+
+def test_epic_resolves_root_from_child(client) -> None:
+    parent, child = _make_epic(client)
+    # Asking for a child's epic returns the whole epic, rooted at the parent.
+    body = client.get(f"/runs/{child}/epic", headers=AUTH).json()
+    assert body["run"]["id"] == parent
+    assert [c["id"] for c in body["children"]] == [child]
+
+
+def test_epic_unknown_run_404(client) -> None:
+    assert client.get("/runs/nope/epic", headers=AUTH).status_code == 404
+
+
+def test_run_dict_exposes_parent_run_id(client) -> None:
+    parent, child = _make_epic(client)
+    child_dict = client.get(f"/runs/{child}").json()
+    assert child_dict["parent_run_id"] == parent
+    parent_dict = client.get(f"/runs/{parent}").json()
+    assert parent_dict["parent_run_id"] is None
 
 
 # -- Enricher wiring via build_orchestrator ------------------------------------
