@@ -9,15 +9,21 @@ end-to-end.
 from __future__ import annotations
 
 from foundry.api.security import (
+    SLACK_MAX_AGE_SECONDS,
     ApprovalCommand,
     compute_signature,
+    compute_slack_signature,
     is_authorised_approver,
     parse_command,
     verify_signature,
+    verify_slack_signature,
 )
 
 BODY = b'{"hello":"world"}'
 SECRET = "test-secret"
+
+SLACK_BODY = b"payload=%7B%22type%22%3A%22block_actions%22%7D"
+SLACK_TS = "1718370123"
 
 
 # -- verify_signature ----------------------------------------------------------
@@ -55,6 +61,62 @@ def test_verify_signature_fails_closed_without_a_configured_secret() -> None:
 def test_verify_signature_is_body_sensitive() -> None:
     sig = compute_signature(SECRET, BODY)
     assert verify_signature(SECRET, BODY + b"tampered", sig) is False
+
+
+# -- verify_slack_signature ----------------------------------------------------
+
+
+def _slack_sig(secret=SECRET, ts=SLACK_TS, body=SLACK_BODY):
+    return compute_slack_signature(secret, ts, body)
+
+
+def test_verify_slack_signature_accepts_a_correct_signature() -> None:
+    sig = _slack_sig()
+    # ``now`` pinned to the signed timestamp so the request is fresh.
+    assert verify_slack_signature(
+        SECRET, SLACK_BODY, SLACK_TS, sig, now=float(SLACK_TS)
+    )
+
+
+def test_verify_slack_signature_rejects_a_wrong_signature() -> None:
+    assert not verify_slack_signature(
+        SECRET, SLACK_BODY, SLACK_TS, "v0=deadbeef", now=float(SLACK_TS)
+    )
+    other = compute_slack_signature("other", SLACK_TS, SLACK_BODY)
+    assert not verify_slack_signature(
+        SECRET, SLACK_BODY, SLACK_TS, other, now=float(SLACK_TS)
+    )
+
+
+def test_verify_slack_signature_is_body_sensitive() -> None:
+    sig = _slack_sig()
+    assert not verify_slack_signature(
+        SECRET, SLACK_BODY + b"x", SLACK_TS, sig, now=float(SLACK_TS)
+    )
+
+
+def test_verify_slack_signature_fails_closed_without_secret_or_headers() -> None:
+    sig = _slack_sig()
+    assert not verify_slack_signature("", SLACK_BODY, SLACK_TS, sig, now=float(SLACK_TS))
+    assert not verify_slack_signature(SECRET, SLACK_BODY, None, sig, now=float(SLACK_TS))
+    assert not verify_slack_signature(
+        SECRET, SLACK_BODY, SLACK_TS, None, now=float(SLACK_TS)
+    )
+
+
+def test_verify_slack_signature_rejects_non_numeric_timestamp() -> None:
+    sig = compute_slack_signature(SECRET, "not-a-number", SLACK_BODY)
+    assert not verify_slack_signature(SECRET, SLACK_BODY, "not-a-number", sig)
+
+
+def test_verify_slack_signature_rejects_a_stale_request() -> None:
+    # A correctly-signed but old request must be refused (replay protection),
+    # both for the past and a clock-skewed future.
+    sig = _slack_sig()
+    stale = float(SLACK_TS) + SLACK_MAX_AGE_SECONDS + 1
+    assert not verify_slack_signature(SECRET, SLACK_BODY, SLACK_TS, sig, now=stale)
+    future = float(SLACK_TS) - SLACK_MAX_AGE_SECONDS - 1
+    assert not verify_slack_signature(SECRET, SLACK_BODY, SLACK_TS, sig, now=future)
 
 
 # -- parse_command -------------------------------------------------------------

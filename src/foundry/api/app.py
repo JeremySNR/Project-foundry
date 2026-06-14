@@ -6,6 +6,11 @@ Surfaces:
   ``FoundryOrchestrator.intake_and_plan``, plus the *primary* approval surface:
   ``/foundry approve|reject|stop`` comments arrive here already authenticated
   by the webhook signature, with the actor taken from the Linear payload.
+- ``POST /webhooks/slack`` - the chat approval surface: a Slack interactivity
+  request (approve/reject/stop button) verified against Slack's v0 request
+  signature with replay-age protection, then driven through the same policy-gated
+  decision path. Fail-closed (no ``FOUNDRY_SLACK_SIGNING_SECRET`` => disabled);
+  the actor is the Slack-signed ``user.id`` and roles come from config.
 - ``POST /runs/{run_id}/approval`` - the API approval surface. Requires a
   bearer token (``FOUNDRY_API_TOKEN``); disabled entirely when no token is
   configured, because an unauthenticated approval endpoint would let anyone
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
@@ -55,7 +61,13 @@ from foundry.schemas.ticket import RawTicket
 
 from .dashboard import DASHBOARD_HTML
 from .mapping import linear_payload_to_ticket
-from .security import is_authorised_approver, parse_command, verify_signature
+from .slack import parse_slack_interaction
+from .security import (
+    is_authorised_approver,
+    parse_command,
+    verify_signature,
+    verify_slack_signature,
+)
 
 # Trigger conditions: a run starts only on an explicit opt-in, never for every
 # new issue (that would create noise).
@@ -129,6 +141,7 @@ def create_app(
     jira_webhook_secret: str | None = None,
     gitlab_webhook_secret: str | None = None,
     gitlab_connector: GitLabConnector | None = None,
+    slack_signing_secret: str | None = None,
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
@@ -157,9 +170,10 @@ def create_app(
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
     app.state.github_connector = github_connector or GitHubConnector()
-    # Jira/GitLab endpoints are fail-closed: no secret => endpoint disabled.
+    # Jira/GitLab/Slack endpoints are fail-closed: no secret => endpoint disabled.
     app.state.jira_webhook_secret = jira_webhook_secret
     app.state.gitlab_webhook_secret = gitlab_webhook_secret
+    app.state.slack_signing_secret = slack_signing_secret
     # Without a transport the connector is diff-blind (file gates skipped),
     # mirroring GitHubConnector with no transport.
     app.state.gitlab_connector = gitlab_connector or GitLabConnector()
@@ -358,6 +372,60 @@ def create_app(
             raise HTTPException(status_code=401, detail="invalid webhook token")
         payload = await request.json()
         return _handle_jira_event(app, payload)
+
+    @app.post("/webhooks/slack", status_code=200)
+    async def slack_webhook(
+        request: Request,
+        signature: str | None = Header(default=None, alias="X-Slack-Signature"),
+        timestamp: str | None = Header(
+            default=None, alias="X-Slack-Request-Timestamp"
+        ),
+    ) -> dict[str, Any]:
+        """Slack interactivity (approve/reject/stop buttons).
+
+        The approval surface for chat: a Slack button click is verified against
+        Slack's v0 request signature (HMAC over ``v0:{timestamp}:{body}``) with
+        replay-age protection, then driven through the same policy-gated decision
+        path as every other surface. Fail-closed: no signing secret => disabled.
+
+        The acting identity is the Slack ``user.id`` Slack signs into the payload,
+        so it cannot be forged without the signing secret. Configure approvers by
+        Slack user id (as GitHub Issues approvers are keyed by login). Roles come
+        from config, never the payload.
+        """
+        if not app.state.slack_signing_secret:
+            raise HTTPException(
+                status_code=403,
+                detail="slack webhook disabled: configure FOUNDRY_SLACK_SIGNING_SECRET",
+            )
+        raw = await request.body()
+        if not verify_slack_signature(
+            app.state.slack_signing_secret, raw, timestamp, signature
+        ):
+            raise HTTPException(status_code=401, detail="invalid slack signature")
+
+        # Slack delivers interactivity as a urlencoded body with a single JSON
+        # ``payload`` field. Signature is over the raw body above; parse it here
+        # directly (no multipart dependency) now that it is authenticated.
+        fields = urllib.parse.parse_qs(raw.decode("utf-8"))
+        raw_payload = (fields.get("payload") or [None])[0]
+        if not raw_payload:
+            return {"status": "ignored", "reason": "no interaction payload"}
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError):
+            return {"status": "ignored", "reason": "unparseable interaction payload"}
+
+        interaction = parse_slack_interaction(payload)
+        if interaction is None:
+            return {"status": "ignored", "reason": "no actionable foundry decision"}
+        return _apply_decision(
+            app,
+            app.state.orchestrator,
+            interaction.issue_id,
+            interaction.command,
+            interaction.user,
+        )
 
     @app.get("/runs")
     def list_runs(skip: int = 0, limit: int = 100) -> dict[str, Any]:
@@ -984,6 +1052,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         jira_webhook_secret=settings.jira_webhook_secret,
         gitlab_webhook_secret=settings.gitlab_webhook_secret,
         gitlab_connector=gitlab_connector,
+        slack_signing_secret=settings.slack_signing_secret,
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
     )

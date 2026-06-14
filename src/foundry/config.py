@@ -80,6 +80,11 @@ class Settings:
     # API root; override for self-managed GitLab (e.g. https://gitlab.example.com/api/v4).
     gitlab_api_base: str = "https://gitlab.com/api/v4"
 
+    # --- Slack approvals (secret: env); None => /webhooks/slack disabled ---
+    # Slack signs interactivity requests with this signing secret (v0 scheme);
+    # approvers are then keyed by Slack user id rather than email.
+    slack_signing_secret: str | None = None
+
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
@@ -385,6 +390,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_GITLAB_WEBHOOK_SECRET": "gitlab_webhook_secret",
         "FOUNDRY_GITLAB_API_TOKEN": "gitlab_api_token",
         "FOUNDRY_GITLAB_API_BASE": "gitlab_api_base",
+        "FOUNDRY_SLACK_SIGNING_SECRET": "slack_signing_secret",
         "FOUNDRY_API_TOKEN": "api_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
         "FOUNDRY_TRACKER_PROVIDER": "tracker_provider",
