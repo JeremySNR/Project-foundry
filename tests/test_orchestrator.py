@@ -1578,3 +1578,82 @@ def test_audit_events_unique_run_sequence_index_present(session_factory) -> None
         if i["unique"] and set(i["column_names"]) == {"run_id", "sequence"}
     ]
     assert unique_seq, f"missing unique (run_id, sequence) index; have {indexes}"
+
+
+# -- per-repo forbidden globs (issue #35: path-scoped policy for monorepos) ------
+
+
+def test_per_repo_forbidden_glob_blocks_run(session_factory) -> None:
+    """A repo-scoped forbidden glob hard-blocks a PR in that repo, even when the
+    path is in neither the global forbidden list nor any sensitive area."""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"repo_forbidden_globs": {"customer-web": ("**/ledger/**",)}},
+    )
+    pr = _pr(files_changed=["src/ledger/posting.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+    # Sticky: the block stands and further events are refused (invariant #7).
+    with pytest.raises(OrchestratorError):
+        orch.record_pr(run_id, _pr())
+
+
+def test_per_repo_forbidden_glob_is_scoped_to_its_repo(session_factory) -> None:
+    """The same path is fine for a run routed to a *different* repo - per-repo
+    globs are scoped to the repo they name, not applied globally."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        repo_forbidden_globs={"customer-web": ("**/ledger/**",)},
+    )
+    # Route this run to a different repo than the one with the extra rule.
+    ticket = _ready_ticket(
+        issue_id="i-billing",
+        issue_key="LIN-200",
+        known_repositories=["billing-svc"],
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+
+    pr = PullRequestState(
+        repo="billing-svc",
+        pr_number=9,
+        url="https://github.com/example/billing-svc/pull/9",
+        branch="foundry/lin-200",
+        status=PRStatus.OPEN,
+        files_changed=["src/ledger/posting.ts"],
+    )
+    # No customer-web rule applies here, and the path is otherwise benign.
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
+
+
+def test_global_forbidden_globs_still_apply_with_per_repo_config(session_factory) -> None:
+    """Per-repo globs are additive: the global forbidden list still blocks every
+    repo, even one that has its own extra rules configured."""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"repo_forbidden_globs": {"customer-web": ("**/ledger/**",)}},
+    )
+    # A global forbidden path (migrations/**) the per-repo config never mentions.
+    pr = _pr(files_changed=["migrations/0003_add_index.sql"])
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+
+
+def test_per_repo_forbidden_globs_reach_agent_do_not_modify(session_factory) -> None:
+    """The dispatched agent is told about repo-specific protected paths too, so a
+    well-behaved agent avoids them rather than only being blocked after the fact."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        repo_forbidden_globs={"customer-web": ("**/ledger/**",)},
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+
+    do_not_modify = provider._inputs[job.job_id].constraints.do_not_modify
+    assert "**/ledger/**" in do_not_modify  # per-repo rule present
+    assert "migrations/**" in do_not_modify  # global floor still present

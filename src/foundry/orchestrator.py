@@ -149,6 +149,7 @@ class FoundryOrchestrator:
         notifier: RunNotifier | None = None,
         max_files_changed: int = 12,
         forbidden_globs: tuple[str, ...] | list[str] | None = None,
+        repo_forbidden_globs: Mapping[str, tuple[str, ...]] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         max_agent_retries: int = 2,
         retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
@@ -171,6 +172,12 @@ class FoundryOrchestrator:
         self._forbidden_globs = list(
             forbidden_globs if forbidden_globs is not None else DEFAULT_FORBIDDEN_GLOBS
         )
+        # Per-repo forbidden globs (issue #35, path-scoped policy for monorepos):
+        # additional protected subtrees that apply only to runs routed to a given
+        # repo, layered *on top of* the global list above - never replacing it.
+        self._repo_forbidden_globs = {
+            repo: list(globs) for repo, globs in (repo_forbidden_globs or {}).items()
+        }
         if sensitive_path_globs is None:
             from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
 
@@ -1582,7 +1589,9 @@ class FoundryOrchestrator:
                 else run.status
             )
 
-        violations = self._forbidden_violations(pr_state.files_changed)
+        violations = self._forbidden_violations(
+            pr_state.files_changed, self._run_repo(session, run_id)
+        )
         if violations:
             session.add(
                 build_audit_event(
@@ -1678,7 +1687,7 @@ class FoundryOrchestrator:
             delivery_plan=plan,
             agent_instructions=(plan.agent_instructions or "") + extra_instructions,
             constraints=JobConstraints(
-                do_not_modify=list(self._forbidden_globs),
+                do_not_modify=list(self._forbidden_globs_for(best_repo.repo)),
                 required_tests=list(context.test_commands),
                 max_files_changed=self._max_files_changed,
             ),
@@ -1717,10 +1726,40 @@ class FoundryOrchestrator:
             approval_present=approval_present,
         )
 
-    def _forbidden_violations(self, files: list[str]) -> list[str]:
+    def _forbidden_globs_for(self, repo: str | None) -> list[str]:
+        """Global forbidden globs plus any extra ones scoped to ``repo``.
+
+        Per-repo globs (issue #35) are strictly additive: they only ever *add*
+        protected paths for a given repo on top of the global floor, so the
+        sticky forbidden-path block can never be weakened by repo scoping - only
+        made stricter (AGENTS.md invariant #1).
+        """
+        extra = self._repo_forbidden_globs.get(repo) if repo else None
+        return self._forbidden_globs + extra if extra else self._forbidden_globs
+
+    def _run_repo(self, session, run_id: str) -> str | None:
+        """The repo this run was routed to, read from its context bundle.
+
+        The canonical "which repo is this run for" used to scope per-repo
+        forbidden globs - the same source the agent was dispatched against, so
+        the dispatch-time ``do_not_modify`` constraints and the PR-time block
+        agree on which repo's protected paths apply.
+        """
+        try:
+            context: ContextBundle = self._load(
+                session, run_id, ArtifactType.CONTEXT_BUNDLE
+            )
+        except OrchestratorError:
+            return None
+        return context.best_repository.repo if context.best_repository else None
+
+    def _forbidden_violations(
+        self, files: list[str], repo: str | None = None
+    ) -> list[str]:
+        globs = self._forbidden_globs_for(repo)
         violations: list[str] = []
         for path in files:
-            for pattern in self._forbidden_globs:
+            for pattern in globs:
                 if glob_match(path, pattern):
                     violations.append(path)
                     break
