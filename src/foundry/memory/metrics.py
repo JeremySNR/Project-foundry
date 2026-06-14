@@ -12,8 +12,15 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-from foundry.db.models import FoundryRunOutcome
+from sqlalchemy import func
+
+from foundry.db.models import FoundryAgentJob, FoundryRun, FoundryRunOutcome
 from foundry.memory.priors import routing_prior_rows, smoothed_confidence
+from foundry.schemas.common import (
+    ACTIVE_RUN_STATUSES,
+    TERMINAL_RUN_STATUSES,
+    RunStatus,
+)
 
 # Buckets supported by ``delivery_trends``. Kept small and explicit so the
 # endpoint can validate the query param without trusting caller input.
@@ -251,4 +258,64 @@ def delivery_trends(session, *, since: datetime, bucket: str = "week") -> dict:
         "since": since.isoformat(),
         "bucket": bucket,
         "periods": series,
+    }
+
+
+def fleet_status(session) -> dict:
+    """Live operational snapshot — every run's *current* state across the org.
+
+    This is the "what are the agents doing right now" view the historical
+    delivery metrics can't give: :func:`delivery_metrics` and
+    :func:`delivery_trends` aggregate ``FoundryRunOutcome`` (finished runs only)
+    over a time window, whereas this reads ``FoundryRun`` live and takes a
+    snapshot of *now* — no ``since`` window. It feeds the dashboard's fleet
+    strip: runs in flight, the human-approval queue depth, agents currently
+    running, PRs open, and spend committed by runs that have not yet finished.
+
+    ``active_cost_usd`` sums provider-reported cost across agent jobs belonging
+    to runs still in an active state; it stays ``None`` when no in-flight job
+    reported cost (never a conjured ``$0`` from missing data, matching
+    :func:`delivery_metrics`).
+    """
+    by_status: dict[str, int] = {}
+    for status, count in (
+        session.query(FoundryRun.status, func.count(FoundryRun.id))
+        .group_by(FoundryRun.status)
+        .all()
+    ):
+        key = status.value if isinstance(status, RunStatus) else str(status)
+        by_status[key] = count
+
+    def _count(*statuses: RunStatus) -> int:
+        return sum(by_status.get(s.value, 0) for s in statuses)
+
+    # The human queue: runs parked on a person. ``waiting_approval`` and
+    # ``review_required`` are active; ``needs_clarification`` is terminal but
+    # re-triggerable and still needs a human to act — mirror the dashboard's
+    # approval-queue filter so the strip count matches the filtered list.
+    awaiting_human = _count(
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.REVIEW_REQUIRED,
+        RunStatus.NEEDS_CLARIFICATION,
+    )
+
+    active_cost = (
+        session.query(func.sum(FoundryAgentJob.cost_usd))
+        .join(FoundryRun, FoundryAgentJob.run_id == FoundryRun.id)
+        .filter(
+            FoundryRun.status.in_(ACTIVE_RUN_STATUSES),
+            FoundryAgentJob.cost_usd.isnot(None),
+        )
+        .scalar()
+    )
+
+    return {
+        "total_runs": sum(by_status.values()),
+        "runs_active": _count(*ACTIVE_RUN_STATUSES),
+        "runs_terminal": _count(*TERMINAL_RUN_STATUSES),
+        "awaiting_human": awaiting_human,
+        "agents_running": _count(RunStatus.AGENT_RUNNING),
+        "prs_open": _count(RunStatus.PR_OPEN),
+        "active_cost_usd": round(active_cost, 2) if active_cost is not None else None,
+        "by_status": by_status,
     }

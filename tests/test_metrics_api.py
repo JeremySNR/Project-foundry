@@ -253,6 +253,59 @@ def test_agent_metrics_scores_the_dispatched_provider(client) -> None:
     assert {r["repo"] for r in card["by_repo"]} == {"customer-web"}
 
 
+def test_fleet_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/fleet").status_code == 401
+    assert (
+        client.get(
+            "/metrics/fleet", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_fleet_empty_database(client) -> None:
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["total_runs"] == 0
+    assert body["runs_active"] == 0
+    assert body["runs_terminal"] == 0
+    assert body["awaiting_human"] == 0
+    assert body["agents_running"] == 0
+    assert body["prs_open"] == 0
+    # No in-flight job reported cost: None, never a conjured $0.
+    assert body["active_cost_usd"] is None
+    assert body["by_status"] == {}
+
+
+def test_fleet_counts_live_and_terminal_states(client) -> None:
+    # One run runs all the way to a merged PR (terminal: complete)...
+    _run_to_merged(client)
+
+    # ...one is parked waiting for a human approval (active + in the queue)...
+    _post_webhook(client, _ready_payload("issue-w", "LIN-400"), delivery="d-w")
+
+    # ...and one is approved and dispatched, so an agent is running on it
+    # (active, but no longer awaiting a human).
+    _post_webhook(client, _ready_payload("issue-a", "LIN-500"), delivery="d-a")
+    run_a = _latest_run_id(client)
+    client.post(
+        f"/runs/{run_a}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["total_runs"] == 3
+    assert body["runs_active"] == 2  # waiting_approval + agent_running
+    assert body["runs_terminal"] == 1  # complete
+    assert body["awaiting_human"] == 1  # only the waiting_approval run
+    assert body["agents_running"] == 1
+    assert body["by_status"]["complete"] == 1
+    assert body["by_status"]["waiting_approval"] == 1
+    assert body["by_status"]["agent_running"] == 1
+    # The fake provider reports no cost, so spend-in-flight stays None.
+    assert body["active_cost_usd"] is None
+
+
 def test_final_summary_appears_in_timeline(client) -> None:
     _run_to_merged(client)
     run_id = _latest_run_id(client)
