@@ -38,9 +38,11 @@ from sqlalchemy import func
 from foundry.compliance import (
     DEFAULT_CONTROL_MAPPINGS,
     ControlMapping,
+    build_epic_evidence_pack,
     build_evidence_archive,
     build_evidence_pack,
     render_archive_html,
+    render_epic_evidence_html,
     render_evidence_html,
 )
 from foundry.config import Settings
@@ -584,6 +586,46 @@ def create_app(
             "rollup": compute_epic_rollup(c.status for c in children),
             "children": [_run_to_dict(c) for c in children],
         }
+
+    @app.get("/runs/{run_id}/epic/evidence")
+    def run_epic_evidence(
+        run_id: str, request: Request, format: str = "json"
+    ) -> Any:
+        """Cross-run compliance evidence export for an epic (issue #35): the
+        parent run plus every child run bundled into one document, so the whole
+        epic's chain across all its repos is a single auditable artifact.
+
+        Resolves the epic root first, so calling this on a child returns the
+        whole epic. Carries the epic rollup, each run's full pack (the same
+        ``GET /runs/{id}/evidence`` produces), and an aggregate rollup
+        (integrity, status breakdown, per-control coverage). A run with no
+        children exports cleanly as a degenerate one-run epic. ``?format=html``
+        renders a standalone page; the default is JSON. Token-gated and
+        fail-closed like ``/runs/{id}/evidence``.
+        """
+        _require_api_token(app, request)
+        if format not in ("json", "html"):
+            raise HTTPException(
+                status_code=422, detail="format must be 'json' or 'html'"
+            )
+        orch: FoundryOrchestrator = app.state.orchestrator
+        root_id = orch.epic_root_id(run_id)
+        if root_id is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        with app.state.session_factory() as session:
+            root = session.get(FoundryRun, root_id)
+            children = (
+                session.query(FoundryRun)
+                .filter(FoundryRun.parent_run_id == root_id)
+                .order_by(FoundryRun.created_at, FoundryRun.id)
+                .all()
+            )
+            pack = build_epic_evidence_pack(
+                session, root, children, control_mappings=app.state.control_mappings
+            )
+        if format == "html":
+            return HTMLResponse(render_epic_evidence_html(pack))
+        return pack
 
     @app.get("/runs/{run_id}/timeline")
     def run_timeline(run_id: str, request: Request) -> dict[str, Any]:

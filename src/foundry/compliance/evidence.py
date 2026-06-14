@@ -56,6 +56,7 @@ def _iso(value: datetime | None) -> str | None:
 def _run_section(run: FoundryRun) -> dict[str, Any]:
     return {
         "id": run.id,
+        "parent_run_id": run.parent_run_id,
         "linear_issue_id": run.linear_issue_id,
         "linear_issue_key": run.linear_issue_key,
         "status": run.status.value,
@@ -312,6 +313,23 @@ def build_evidence_archive(
         for run in runs
     ]
 
+    return {
+        "generated_at": _iso(stamp),
+        "range": {"from": _iso(since), "to": _iso(until)},
+        "run_count": len(packs),
+        "summary": _summarise_packs(packs),
+        "runs": packs,
+    }
+
+
+def _summarise_packs(packs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll a list of per-run evidence packs up into one summary.
+
+    Shared by the date-range archive and the per-epic export: aggregate
+    integrity (every run's chain verified), a status breakdown, and per-control
+    coverage (how many of the packs satisfy each configured control). An empty
+    list summarises as vacuously verified with no coverage rows.
+    """
     status_breakdown: dict[str, int] = {}
     failed_integrity: list[str] = []
     for pack in packs:
@@ -320,8 +338,8 @@ def build_evidence_archive(
         if not pack["integrity"]["verified"]:
             failed_integrity.append(pack["run"]["id"])
 
-    # Per-control coverage across the range, keyed by (framework, control_id) and
-    # emitted in first-seen order so the rollup is stable for a fixed config.
+    # Per-control coverage, keyed by (framework, control_id) and emitted in
+    # first-seen order so the rollup is stable for a fixed config.
     coverage: dict[tuple[str, str], dict[str, Any]] = {}
     order: list[tuple[str, str]] = []
     for pack in packs:
@@ -342,22 +360,82 @@ def build_evidence_archive(
             if c["satisfied"]:
                 row["satisfied_runs"] += 1
     control_coverage = [
-        {**coverage[key], "fully_satisfied": coverage[key]["satisfied_runs"] == coverage[key]["total_runs"]}
+        {
+            **coverage[key],
+            "fully_satisfied": coverage[key]["satisfied_runs"]
+            == coverage[key]["total_runs"],
+        }
         for key in order
     ]
 
     return {
+        "verified": not failed_integrity,
+        "runs_verified": len(packs) - len(failed_integrity),
+        "runs_failed_integrity": failed_integrity,
+        "status_breakdown": status_breakdown,
+        "control_coverage": control_coverage,
+    }
+
+
+def build_epic_evidence_pack(
+    session: Session,
+    root: FoundryRun,
+    children: list[FoundryRun],
+    *,
+    control_mappings: tuple[ControlMapping, ...] = (),
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Cross-run evidence export: an epic's full chain as one document (#35).
+
+    ``root`` is the epic's parent run and ``children`` its decomposed child runs
+    (one per repo / scope). The export bundles the root's evidence pack plus
+    each child's pack - the same ``build_evidence_pack`` produces - so the whole
+    epic's chain (every ticket, plan, approval, policy decision and audit trail
+    across all its repos) is one auditable artifact.
+
+    Alongside the per-run packs it carries:
+
+    - ``epic.rollup`` - the :func:`epics.compute_epic_rollup` status over the
+      children (so this export and ``GET /runs/{id}/epic`` agree);
+    - ``epic.root_run_id`` / ``epic.child_run_ids`` - the explicit cross-run
+      linkage (each child's own pack also carries its ``parent_run_id``);
+    - ``summary`` - aggregate integrity, status breakdown and per-control
+      coverage across the root *and* every child (the same rollup the date-range
+      archive produces).
+
+    Caller resolves the epic root (a child resolves to its parent) before
+    calling, mirroring ``GET /runs/{id}/epic``. A run with no children exports
+    as a degenerate one-run epic: the rollup is ``empty`` and only the root pack
+    is present.
+    """
+    # Imported here, not at module top, to keep this packaging module free of a
+    # hard dependency on the lifecycle/rollup module for the single-run path.
+    from foundry.epics import compute_epic_rollup
+
+    stamp = generated_at or datetime.now(timezone.utc)
+    root_pack = build_evidence_pack(
+        session, root, control_mappings=control_mappings, generated_at=stamp
+    )
+    child_packs = [
+        build_evidence_pack(
+            session, child, control_mappings=control_mappings, generated_at=stamp
+        )
+        for child in children
+    ]
+    rollup = compute_epic_rollup(child.status for child in children)
+
+    return {
         "generated_at": _iso(stamp),
-        "range": {"from": _iso(since), "to": _iso(until)},
-        "run_count": len(packs),
-        "summary": {
-            "verified": not failed_integrity,
-            "runs_verified": len(packs) - len(failed_integrity),
-            "runs_failed_integrity": failed_integrity,
-            "status_breakdown": status_breakdown,
-            "control_coverage": control_coverage,
+        "epic": {
+            "root_run_id": root.id,
+            "linear_issue_key": root.linear_issue_key,
+            "rollup": rollup,
+            "child_run_ids": [child.id for child in children],
         },
-        "runs": packs,
+        "run_count": 1 + len(child_packs),
+        "summary": _summarise_packs([root_pack, *child_packs]),
+        "root": root_pack,
+        "children": child_packs,
     }
 
 
@@ -487,6 +565,81 @@ def render_evidence_html(pack: dict[str, Any]) -> str:
 </body></html>"""
 
 
+# Shared page CSS for the multi-run (archive / epic) rollup pages.
+_ROLLUP_CSS = """
+ body { font: 14px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 960px; padding: 2rem; color: #1a1a1a; }
+ h1 { margin: 0 0 .25rem; }
+ .sub { color: #666; margin: 0 0 1.5rem; }
+ .banner { padding: .75rem 1rem; border-radius: 6px; font-weight: 600; margin: 0 0 1.5rem; }
+ .banner.ok { background: #e6f5ea; color: #1b6b34; border: 1px solid #b6e0c2; }
+ .banner.fail { background: #fbe7e7; color: #a11; border: 1px solid #f0b5b5; }
+ section { margin: 0 0 1.5rem; }
+ h2 { font-size: 1.05rem; border-bottom: 1px solid #eee; padding-bottom: .25rem; }
+ table { border-collapse: collapse; width: 100%; }
+ th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eee; vertical-align: top; }
+ th { color: #666; font-weight: 600; }
+ td.satisfied { color: #1b6b34; }
+ td.missing { color: #a11; }
+ code { background: #f0f0f2; padding: 0 .25rem; border-radius: 3px; }
+"""
+
+
+def _coverage_table(control_coverage: list[dict[str, Any]]) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{_esc(c['framework'])}</td>"
+        f"<td><code>{_esc(c['control_id'])}</code></td>"
+        f"<td>{_esc(c['title'])}</td>"
+        f"<td class=\"{'satisfied' if c['fully_satisfied'] else 'missing'}\">"
+        f"{_esc(c['satisfied_runs'])} / {_esc(c['total_runs'])}</td>"
+        "</tr>"
+        for c in control_coverage
+    ) or "<tr><td colspan=\"4\"><em>no controls configured</em></td></tr>"
+    return (
+        "<table><thead><tr><th>Framework</th><th>Control</th><th>Title</th>"
+        "<th>Runs satisfying</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    )
+
+
+def _status_table(status_breakdown: dict[str, int]) -> str:
+    rows = "".join(
+        f"<tr><td><code>{_esc(status)}</code></td><td>{_esc(count)}</td></tr>"
+        for status, count in sorted(status_breakdown.items())
+    ) or "<tr><td colspan=\"2\"><em>none</em></td></tr>"
+    return (
+        "<table><thead><tr><th>Status</th><th>Runs</th></tr></thead><tbody>"
+        + rows
+        + "</tbody></table>"
+    )
+
+
+def _runs_table(packs: list[dict[str, Any]]) -> str:
+    rows = []
+    for pack in packs:
+        run = pack["run"]
+        controls = pack["control_mappings"]
+        sat = sum(1 for c in controls if c["satisfied"])
+        ok = pack["integrity"]["verified"]
+        role = "root" if run["parent_run_id"] is None else "child"
+        rows.append(
+            "<tr>"
+            f"<td><code>{_esc(run['id'])}</code></td>"
+            f"<td>{_esc(role)}</td>"
+            f"<td>{_esc(run['linear_issue_key'])}</td>"
+            f"<td>{_esc(run['status'])}</td>"
+            f"<td class=\"{'satisfied' if ok else 'missing'}\">"
+            f"{'verified' if ok else 'FAILED'}</td>"
+            f"<td>{_esc(sat)} / {_esc(len(controls))}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Run</th><th>Role</th><th>Issue</th><th>Status</th>"
+        "<th>Integrity</th><th>Controls</th></tr></thead><tbody>"
+        + ("".join(rows) or "<tr><td colspan=\"6\"><em>no runs</em></td></tr>")
+        + "</tbody></table>"
+    )
+
+
 def render_archive_html(archive: dict[str, Any]) -> str:
     """Render an org-wide evidence archive as a standalone, zero-build page."""
     summary = archive["summary"]
@@ -504,82 +657,52 @@ def render_archive_html(archive: dict[str, Any]) -> str:
         )
 
     rng = archive["range"]
-    coverage_rows = "".join(
-        "<tr>"
-        f"<td>{_esc(c['framework'])}</td>"
-        f"<td><code>{_esc(c['control_id'])}</code></td>"
-        f"<td>{_esc(c['title'])}</td>"
-        f"<td class=\"{'satisfied' if c['fully_satisfied'] else 'missing'}\">"
-        f"{_esc(c['satisfied_runs'])} / {_esc(c['total_runs'])}</td>"
-        "</tr>"
-        for c in summary["control_coverage"]
-    ) or "<tr><td colspan=\"4\"><em>no controls configured</em></td></tr>"
-    coverage_table = (
-        "<table><thead><tr><th>Framework</th><th>Control</th><th>Title</th>"
-        "<th>Runs satisfying</th></tr></thead><tbody>"
-        + coverage_rows
-        + "</tbody></table>"
-    )
-
-    status_rows = "".join(
-        f"<tr><td><code>{_esc(status)}</code></td><td>{_esc(count)}</td></tr>"
-        for status, count in sorted(summary["status_breakdown"].items())
-    ) or "<tr><td colspan=\"2\"><em>none</em></td></tr>"
-    status_table = (
-        "<table><thead><tr><th>Status</th><th>Runs</th></tr></thead><tbody>"
-        + status_rows
-        + "</tbody></table>"
-    )
-
-    run_rows = []
-    for pack in archive["runs"]:
-        run = pack["run"]
-        controls = pack["control_mappings"]
-        sat = sum(1 for c in controls if c["satisfied"])
-        ok = pack["integrity"]["verified"]
-        run_rows.append(
-            "<tr>"
-            f"<td><code>{_esc(run['id'])}</code></td>"
-            f"<td>{_esc(run['linear_issue_key'])}</td>"
-            f"<td>{_esc(run['status'])}</td>"
-            f"<td class=\"{'satisfied' if ok else 'missing'}\">"
-            f"{'verified' if ok else 'FAILED'}</td>"
-            f"<td>{_esc(sat)} / {_esc(len(controls))}</td>"
-            "</tr>"
-        )
-    runs_table = (
-        "<table><thead><tr><th>Run</th><th>Issue</th><th>Status</th>"
-        "<th>Integrity</th><th>Controls</th></tr></thead><tbody>"
-        + ("".join(run_rows) or "<tr><td colspan=\"5\"><em>no runs</em></td></tr>")
-        + "</tbody></table>"
-    )
-
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Foundry evidence archive</title>
-<style>
- body {{ font: 14px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 960px; padding: 2rem; color: #1a1a1a; }}
- h1 {{ margin: 0 0 .25rem; }}
- .sub {{ color: #666; margin: 0 0 1.5rem; }}
- .banner {{ padding: .75rem 1rem; border-radius: 6px; font-weight: 600; margin: 0 0 1.5rem; }}
- .banner.ok {{ background: #e6f5ea; color: #1b6b34; border: 1px solid #b6e0c2; }}
- .banner.fail {{ background: #fbe7e7; color: #a11; border: 1px solid #f0b5b5; }}
- section {{ margin: 0 0 1.5rem; }}
- h2 {{ font-size: 1.05rem; border-bottom: 1px solid #eee; padding-bottom: .25rem; }}
- table {{ border-collapse: collapse; width: 100%; }}
- th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eee; vertical-align: top; }}
- th {{ color: #666; font-weight: 600; }}
- td.satisfied {{ color: #1b6b34; }}
- td.missing {{ color: #a11; }}
- code {{ background: #f0f0f2; padding: 0 .25rem; border-radius: 3px; }}
-</style></head><body>
+<style>{_ROLLUP_CSS}</style></head><body>
 <h1>Compliance evidence archive</h1>
 <p class="sub">Range <strong>{_esc(rng['from'] or 'beginning')}</strong> &rarr;
  <strong>{_esc(rng['to'] or 'now')}</strong>
  &middot; {_esc(run_count)} run(s)
  &middot; generated {_esc(archive['generated_at'])}</p>
 <div class="banner {banner_cls}">{banner_text}</div>
-<section><h2>Control coverage</h2>{coverage_table}</section>
-<section><h2>Run statuses</h2>{status_table}</section>
-<section><h2>Runs</h2>{runs_table}</section>
+<section><h2>Control coverage</h2>{_coverage_table(summary['control_coverage'])}</section>
+<section><h2>Run statuses</h2>{_status_table(summary['status_breakdown'])}</section>
+<section><h2>Runs</h2>{_runs_table(archive['runs'])}</section>
+</body></html>"""
+
+
+def render_epic_evidence_html(pack: dict[str, Any]) -> str:
+    """Render an epic evidence export as a standalone, zero-build page (#35)."""
+    epic = pack["epic"]
+    summary = pack["summary"]
+    verified = summary["verified"]
+    banner_cls = "ok" if verified else "fail"
+    run_count = pack["run_count"]
+    failed = summary["runs_failed_integrity"]
+    if verified:
+        banner_text = f"INTEGRITY VERIFIED &middot; {run_count} run(s)"
+    else:
+        banner_text = (
+            f"INTEGRITY CHECK FAILED &middot; {len(failed)} of {run_count} run(s)"
+        )
+
+    rollup = epic["rollup"]
+    all_packs = [pack["root"], *pack["children"]]
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Foundry epic evidence &mdash; {_esc(epic['linear_issue_key'])}</title>
+<style>{_ROLLUP_CSS}</style></head><body>
+<h1>Epic evidence pack</h1>
+<p class="sub">Epic root <code>{_esc(epic['root_run_id'])}</code>
+ &middot; {_esc(epic['linear_issue_key'])}
+ &middot; rollup <strong>{_esc(rollup['status'])}</strong>
+ &middot; {_esc(len(epic['child_run_ids']))} child run(s)
+ &middot; generated {_esc(pack['generated_at'])}</p>
+<div class="banner {banner_cls}">{banner_text}</div>
+<section><h2>Epic rollup</h2>{_json_block(rollup)}</section>
+<section><h2>Control coverage</h2>{_coverage_table(summary['control_coverage'])}</section>
+<section><h2>Run statuses</h2>{_status_table(summary['status_breakdown'])}</section>
+<section><h2>Runs</h2>{_runs_table(all_packs)}</section>
 </body></html>"""

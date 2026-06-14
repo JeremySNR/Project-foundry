@@ -15,9 +15,11 @@ from .controls import (
     ControlMapping,
 )
 from .evidence import (
+    build_epic_evidence_pack,
     build_evidence_archive,
     build_evidence_pack,
     render_archive_html,
+    render_epic_evidence_html,
     render_evidence_html,
     verify_integrity,
 )
@@ -26,9 +28,11 @@ __all__ = [
     "ControlMapping",
     "DEFAULT_CONTROL_MAPPINGS",
     "KNOWN_EVIDENCE_SECTIONS",
+    "build_epic_evidence_pack",
     "build_evidence_archive",
     "build_evidence_pack",
     "render_archive_html",
+    "render_epic_evidence_html",
     "render_evidence_html",
     "verify_integrity",
 ]
