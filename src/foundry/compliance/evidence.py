@@ -280,6 +280,87 @@ def build_evidence_pack(
     return pack
 
 
+def build_evidence_archive(
+    session: Session,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    control_mappings: tuple[ControlMapping, ...] = (),
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Org-wide evidence export: every run in a date range as one archive.
+
+    Each run's full pack (the same one ``build_evidence_pack`` produces) is
+    included, plus a rollup ``summary`` over the whole range: aggregate
+    integrity, a status breakdown, and per-control coverage (how many runs in
+    the range satisfy each configured control). ``since``/``until`` bound
+    ``FoundryRun.created_at`` - ``since`` inclusive, ``until`` exclusive - and
+    either may be ``None`` for an open bound.
+    """
+    stamp = generated_at or datetime.now(timezone.utc)
+    query = session.query(FoundryRun)
+    if since is not None:
+        query = query.filter(FoundryRun.created_at >= since)
+    if until is not None:
+        query = query.filter(FoundryRun.created_at < until)
+    runs = query.order_by(FoundryRun.created_at, FoundryRun.id).all()
+
+    packs = [
+        build_evidence_pack(
+            session, run, control_mappings=control_mappings, generated_at=stamp
+        )
+        for run in runs
+    ]
+
+    status_breakdown: dict[str, int] = {}
+    failed_integrity: list[str] = []
+    for pack in packs:
+        status = pack["run"]["status"]
+        status_breakdown[status] = status_breakdown.get(status, 0) + 1
+        if not pack["integrity"]["verified"]:
+            failed_integrity.append(pack["run"]["id"])
+
+    # Per-control coverage across the range, keyed by (framework, control_id) and
+    # emitted in first-seen order so the rollup is stable for a fixed config.
+    coverage: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    for pack in packs:
+        for c in pack["control_mappings"]:
+            key = (c["framework"], c["control_id"])
+            row = coverage.get(key)
+            if row is None:
+                row = {
+                    "framework": c["framework"],
+                    "control_id": c["control_id"],
+                    "title": c["title"],
+                    "satisfied_runs": 0,
+                    "total_runs": 0,
+                }
+                coverage[key] = row
+                order.append(key)
+            row["total_runs"] += 1
+            if c["satisfied"]:
+                row["satisfied_runs"] += 1
+    control_coverage = [
+        {**coverage[key], "fully_satisfied": coverage[key]["satisfied_runs"] == coverage[key]["total_runs"]}
+        for key in order
+    ]
+
+    return {
+        "generated_at": _iso(stamp),
+        "range": {"from": _iso(since), "to": _iso(until)},
+        "run_count": len(packs),
+        "summary": {
+            "verified": not failed_integrity,
+            "runs_verified": len(packs) - len(failed_integrity),
+            "runs_failed_integrity": failed_integrity,
+            "status_breakdown": status_breakdown,
+            "control_coverage": control_coverage,
+        },
+        "runs": packs,
+    }
+
+
 # --------------------------------------------------------------------------- HTML
 
 
@@ -403,4 +484,102 @@ def render_evidence_html(pack: dict[str, Any]) -> str:
  &middot; generated {_esc(pack['generated_at'])}</p>
 <div class="banner {banner_cls}">{banner_text}</div>
 {''.join(sections)}
+</body></html>"""
+
+
+def render_archive_html(archive: dict[str, Any]) -> str:
+    """Render an org-wide evidence archive as a standalone, zero-build page."""
+    summary = archive["summary"]
+    verified = summary["verified"]
+    banner_cls = "ok" if verified else "fail"
+    run_count = archive["run_count"]
+    failed = summary["runs_failed_integrity"]
+    if not run_count:
+        banner_text = "NO RUNS IN RANGE"
+    elif verified:
+        banner_text = f"INTEGRITY VERIFIED &middot; {run_count} run(s)"
+    else:
+        banner_text = (
+            f"INTEGRITY CHECK FAILED &middot; {len(failed)} of {run_count} run(s)"
+        )
+
+    rng = archive["range"]
+    coverage_rows = "".join(
+        "<tr>"
+        f"<td>{_esc(c['framework'])}</td>"
+        f"<td><code>{_esc(c['control_id'])}</code></td>"
+        f"<td>{_esc(c['title'])}</td>"
+        f"<td class=\"{'satisfied' if c['fully_satisfied'] else 'missing'}\">"
+        f"{_esc(c['satisfied_runs'])} / {_esc(c['total_runs'])}</td>"
+        "</tr>"
+        for c in summary["control_coverage"]
+    ) or "<tr><td colspan=\"4\"><em>no controls configured</em></td></tr>"
+    coverage_table = (
+        "<table><thead><tr><th>Framework</th><th>Control</th><th>Title</th>"
+        "<th>Runs satisfying</th></tr></thead><tbody>"
+        + coverage_rows
+        + "</tbody></table>"
+    )
+
+    status_rows = "".join(
+        f"<tr><td><code>{_esc(status)}</code></td><td>{_esc(count)}</td></tr>"
+        for status, count in sorted(summary["status_breakdown"].items())
+    ) or "<tr><td colspan=\"2\"><em>none</em></td></tr>"
+    status_table = (
+        "<table><thead><tr><th>Status</th><th>Runs</th></tr></thead><tbody>"
+        + status_rows
+        + "</tbody></table>"
+    )
+
+    run_rows = []
+    for pack in archive["runs"]:
+        run = pack["run"]
+        controls = pack["control_mappings"]
+        sat = sum(1 for c in controls if c["satisfied"])
+        ok = pack["integrity"]["verified"]
+        run_rows.append(
+            "<tr>"
+            f"<td><code>{_esc(run['id'])}</code></td>"
+            f"<td>{_esc(run['linear_issue_key'])}</td>"
+            f"<td>{_esc(run['status'])}</td>"
+            f"<td class=\"{'satisfied' if ok else 'missing'}\">"
+            f"{'verified' if ok else 'FAILED'}</td>"
+            f"<td>{_esc(sat)} / {_esc(len(controls))}</td>"
+            "</tr>"
+        )
+    runs_table = (
+        "<table><thead><tr><th>Run</th><th>Issue</th><th>Status</th>"
+        "<th>Integrity</th><th>Controls</th></tr></thead><tbody>"
+        + ("".join(run_rows) or "<tr><td colspan=\"5\"><em>no runs</em></td></tr>")
+        + "</tbody></table>"
+    )
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Foundry evidence archive</title>
+<style>
+ body {{ font: 14px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 960px; padding: 2rem; color: #1a1a1a; }}
+ h1 {{ margin: 0 0 .25rem; }}
+ .sub {{ color: #666; margin: 0 0 1.5rem; }}
+ .banner {{ padding: .75rem 1rem; border-radius: 6px; font-weight: 600; margin: 0 0 1.5rem; }}
+ .banner.ok {{ background: #e6f5ea; color: #1b6b34; border: 1px solid #b6e0c2; }}
+ .banner.fail {{ background: #fbe7e7; color: #a11; border: 1px solid #f0b5b5; }}
+ section {{ margin: 0 0 1.5rem; }}
+ h2 {{ font-size: 1.05rem; border-bottom: 1px solid #eee; padding-bottom: .25rem; }}
+ table {{ border-collapse: collapse; width: 100%; }}
+ th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eee; vertical-align: top; }}
+ th {{ color: #666; font-weight: 600; }}
+ td.satisfied {{ color: #1b6b34; }}
+ td.missing {{ color: #a11; }}
+ code {{ background: #f0f0f2; padding: 0 .25rem; border-radius: 3px; }}
+</style></head><body>
+<h1>Compliance evidence archive</h1>
+<p class="sub">Range <strong>{_esc(rng['from'] or 'beginning')}</strong> &rarr;
+ <strong>{_esc(rng['to'] or 'now')}</strong>
+ &middot; {_esc(run_count)} run(s)
+ &middot; generated {_esc(archive['generated_at'])}</p>
+<div class="banner {banner_cls}">{banner_text}</div>
+<section><h2>Control coverage</h2>{coverage_table}</section>
+<section><h2>Run statuses</h2>{status_table}</section>
+<section><h2>Runs</h2>{runs_table}</section>
 </body></html>"""

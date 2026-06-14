@@ -11,11 +11,15 @@ import json
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from foundry.audit import build_artifact, build_audit_event
 from foundry.compliance import (
     DEFAULT_CONTROL_MAPPINGS,
     ControlMapping,
+    build_evidence_archive,
     build_evidence_pack,
+    render_archive_html,
     render_evidence_html,
     verify_integrity,
 )
@@ -265,6 +269,203 @@ def test_verify_integrity_empty_run_is_trivially_verified() -> None:
             "contiguous": True,
         },
     }
+
+
+# -- org-wide date-range archive -----------------------------------------------
+
+
+def _seed_run_at(
+    session_factory,
+    run_id: str,
+    *,
+    created_at: datetime,
+    status: RunStatus = RunStatus.COMPLETE,
+    with_pr: bool = True,
+    tamper: bool = False,
+) -> None:
+    """Persist a minimal run (ticket + plan + risk + approval [+ pr]) at a
+    given ``created_at`` so date-range filtering and rollups can be exercised.
+    """
+    with session_factory() as session:
+        session.add(
+            FoundryRun(
+                id=run_id,
+                linear_issue_id=f"issue-{run_id}",
+                linear_issue_key=f"ENG-{run_id}",
+                status=status,
+                trigger_type="label",
+                created_at=created_at,
+            )
+        )
+        ticket = build_artifact(
+            run_id=run_id,
+            artifact_type=ArtifactType.TICKET_SNAPSHOT,
+            content={"title": f"Ticket {run_id}"},
+        )
+        if tamper:
+            ticket.content_json = json.dumps({"title": "TAMPERED"})
+        session.add(ticket)
+        session.add(
+            build_artifact(
+                run_id=run_id,
+                artifact_type=ArtifactType.DELIVERY_PLAN,
+                content={"steps": ["do the thing"]},
+            )
+        )
+        session.add(
+            build_artifact(
+                run_id=run_id,
+                artifact_type=ArtifactType.RISK_ASSESSMENT,
+                content={"overall": "low", "required_approvals": []},
+            )
+        )
+        session.add(
+            build_artifact(
+                run_id=run_id,
+                artifact_type=ArtifactType.APPROVAL_RECORD,
+                content={"user": "lead@example.com", "granted_roles": ["engineering"]},
+            )
+        )
+        if with_pr:
+            session.add(
+                build_artifact(
+                    run_id=run_id,
+                    artifact_type=ArtifactType.PR_STATE,
+                    content={"url": f"https://example/pr/{run_id}", "state": "merged"},
+                )
+            )
+        session.add(
+            build_audit_event(
+                run_id=run_id,
+                event_type=AuditEventType.RUN_STARTED,
+                actor_type="system",
+            )
+        )
+        session.commit()
+
+
+def _archive(session_factory, **kwargs) -> dict:
+    with session_factory() as session:
+        return build_evidence_archive(session, **kwargs)
+
+
+def test_archive_filters_to_the_date_range(session_factory) -> None:
+    now = datetime(2026, 6, 14, 12, 0, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "old", created_at=now - timedelta(days=40))
+    _seed_run_at(session_factory, "in1", created_at=now - timedelta(days=5))
+    _seed_run_at(session_factory, "in2", created_at=now - timedelta(days=1))
+
+    archive = _archive(
+        session_factory,
+        since=now - timedelta(days=10),
+        until=now,
+        control_mappings=DEFAULT_CONTROL_MAPPINGS,
+    )
+    assert archive["run_count"] == 2
+    ids = [p["run"]["id"] for p in archive["runs"]]
+    assert ids == ["in1", "in2"]  # ordered by created_at
+    assert archive["range"]["from"] == (now - timedelta(days=10)).isoformat()
+    assert archive["range"]["to"] == now.isoformat()
+
+
+def test_archive_until_is_exclusive_and_since_inclusive(session_factory) -> None:
+    boundary = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "at-since", created_at=boundary)
+    _seed_run_at(session_factory, "at-until", created_at=boundary + timedelta(days=1))
+
+    archive = _archive(
+        session_factory, since=boundary, until=boundary + timedelta(days=1)
+    )
+    assert [p["run"]["id"] for p in archive["runs"]] == ["at-since"]
+
+
+def test_archive_open_bounds_include_everything(session_factory) -> None:
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "a", created_at=now - timedelta(days=400))
+    _seed_run_at(session_factory, "b", created_at=now)
+    archive = _archive(session_factory)
+    assert archive["run_count"] == 2
+    assert archive["range"] == {"from": None, "to": None}
+
+
+def test_archive_rollup_summary(session_factory) -> None:
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    # Two complete runs with a PR (satisfy SOC 2 CC8.1 needs pr + policy...),
+    # one blocked run without a PR.
+    _seed_run_at(session_factory, "c1", created_at=now, status=RunStatus.COMPLETE)
+    _seed_run_at(session_factory, "c2", created_at=now, status=RunStatus.COMPLETE)
+    _seed_run_at(
+        session_factory,
+        "b1",
+        created_at=now,
+        status=RunStatus.BLOCKED,
+        with_pr=False,
+    )
+
+    archive = _archive(session_factory, control_mappings=DEFAULT_CONTROL_MAPPINGS)
+    summary = archive["summary"]
+    assert summary["status_breakdown"] == {"complete": 2, "blocked": 1}
+    assert summary["verified"] is True
+    assert summary["runs_verified"] == 3
+    assert summary["runs_failed_integrity"] == []
+
+    by_control = {c["control_id"]: c for c in summary["control_coverage"]}
+    # EU AI Act Art. 14 (risk + approvals + policy_decisions) - no run seeded a
+    # policy decision, so zero runs satisfy it.
+    assert by_control["Article 14"]["total_runs"] == 3
+    assert by_control["Article 14"]["satisfied_runs"] == 0
+    assert by_control["Article 14"]["fully_satisfied"] is False
+
+
+def test_archive_aggregate_integrity_flags_a_tampered_run(session_factory) -> None:
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "good", created_at=now)
+    _seed_run_at(session_factory, "bad", created_at=now, tamper=True)
+
+    archive = _archive(session_factory)
+    summary = archive["summary"]
+    assert summary["verified"] is False
+    assert summary["runs_failed_integrity"] == ["bad"]
+    assert summary["runs_verified"] == 1
+
+
+def test_archive_empty_range_is_well_formed(session_factory) -> None:
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    archive = _archive(
+        session_factory,
+        since=now - timedelta(days=1),
+        until=now,
+        control_mappings=DEFAULT_CONTROL_MAPPINGS,
+    )
+    assert archive["run_count"] == 0
+    assert archive["runs"] == []
+    assert archive["summary"]["verified"] is True  # vacuously
+    assert archive["summary"]["control_coverage"] == []
+
+
+def test_render_archive_html_is_standalone(session_factory) -> None:
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "r1", created_at=now)
+    archive = _archive(
+        session_factory,
+        since=now - timedelta(days=1),
+        until=now + timedelta(days=1),
+        control_mappings=DEFAULT_CONTROL_MAPPINGS,
+    )
+    html = render_archive_html(archive)
+    assert html.startswith("<!doctype html>")
+    assert "Compliance evidence archive" in html
+    assert "INTEGRITY VERIFIED" in html
+    assert "ENG-r1" in html
+    assert "CC8.1" in html
+
+
+def test_render_archive_html_marks_failed_integrity(session_factory) -> None:
+    now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+    _seed_run_at(session_factory, "bad", created_at=now, tamper=True)
+    archive = _archive(session_factory)
+    html = render_archive_html(archive)
+    assert "INTEGRITY CHECK FAILED" in html
 
 
 # -- config seam ---------------------------------------------------------------

@@ -972,6 +972,78 @@ def test_evidence_html_render(client) -> None:
     assert "Compliance evidence pack" in resp.text
 
 
+# -- org-wide evidence archive -------------------------------------------------
+
+
+def test_evidence_archive_requires_token(client) -> None:
+    assert client.get("/evidence").status_code == 401
+    assert (
+        client.get("/evidence", headers={"Authorization": "Bearer wrong"}).status_code
+        == 401
+    )
+
+
+def test_evidence_archive_disabled_without_configured_token() -> None:
+    c = _make_client(api_token=None)
+    assert c.get("/evidence", headers=AUTH).status_code == 403
+
+
+def test_evidence_archive_bad_format_422(client) -> None:
+    assert client.get("/evidence?format=pdf", headers=AUTH).status_code == 422
+
+
+def test_evidence_archive_bad_date_422(client) -> None:
+    assert client.get("/evidence?from=not-a-date", headers=AUTH).status_code == 422
+
+
+def test_evidence_archive_inverted_range_422(client) -> None:
+    resp = client.get(
+        "/evidence?from=2026-06-10&to=2026-06-01", headers=AUTH
+    )
+    assert resp.status_code == 422
+
+
+def test_evidence_archive_packages_runs_in_range(client) -> None:
+    run_id = _approve_and_dispatch(client)
+    # A wide window certainly contains the just-created run.
+    archive = client.get("/evidence?days=3650", headers=AUTH).json()
+
+    assert archive["run_count"] >= 1
+    ids = [p["run"]["id"] for p in archive["runs"]]
+    assert run_id in ids
+
+    # Each entry is a full pack with integrity + controls.
+    pack = next(p for p in archive["runs"] if p["run"]["id"] == run_id)
+    assert pack["integrity"]["verified"] is True
+    assert pack["plan"] is not None
+
+    summary = archive["summary"]
+    assert summary["verified"] is True
+    assert summary["runs_verified"] == archive["run_count"]
+    control_ids = {c["control_id"] for c in summary["control_coverage"]}
+    assert {"CC8.1", "Article 14"} <= control_ids
+
+
+def test_evidence_archive_empty_window_is_well_formed(client) -> None:
+    _approve_and_dispatch(client)
+    # A window that ends before the run was created excludes everything.
+    archive = client.get(
+        "/evidence?from=2000-01-01&to=2000-12-31", headers=AUTH
+    ).json()
+    assert archive["run_count"] == 0
+    assert archive["runs"] == []
+    assert archive["summary"]["verified"] is True
+
+
+def test_evidence_archive_html_render(client) -> None:
+    _approve_and_dispatch(client)
+    resp = client.get("/evidence?days=3650&format=html", headers=AUTH)
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert resp.text.startswith("<!doctype html>")
+    assert "Compliance evidence archive" in resp.text
+
+
 # -- dashboard -----------------------------------------------------------------
 
 
