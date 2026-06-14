@@ -63,7 +63,7 @@ the test baseline; they are intentionally conservative, not unfinished LLM calls
 | `policy/foundry.rego` | OPA backend, selectable via `policy.provider: opa` (`OpaPolicyEngine`); the Python `LocalPolicyEngine` is the default. **Must change in lock-step** (machine-verified over shared vectors — see invariant #2). The confidence threshold is read from input, not hardcoded, so both backends honour the configured value |
 | `orchestrator.py` | The state machine; writes every decision/artifact/approval as content-hashed audit rows |
 | `drivers.py` | RunDriver seam: inline in-process (the real one) vs Temporal |
-| `workflows/` | Temporal version (durable waits for approval/PR). Exists, signal-driven, **not yet battle-tested against a real server** |
+| `workflows/` | Temporal version (durable waits for approval/PR). Signal-driven; the sequencing decisions are pure functions in `decisions.py` (offline-tested) and the workflow is a thin shell. Wait timeouts terminate cleanly (approval window → `BLOCKED`, PR window → `EXECUTION_FAILED`, both audited via `expire_pending_approval` / `expire_pending_pr`); unknown decision verbs are dropped in the signal handler (never a silent stop); `intake_and_plan` is idempotent under activity retries; PR observation loops on every push until the run leaves a PR-observable state. **Still not battle-tested against a real server** (the E2E `test_temporal_workflow.py` runs only where the time-skipping test-server binary is fetchable — CI, not offline sandboxes) |
 | `agents/` | Provider abstraction: `manual`, fake, `cursor_cloud`, `cursor_via_linear`, `claude_code` (GitHub Actions `workflow_dispatch`), `webhook` (HMAC-signed). All go through one `create_job` path with a secret-leak scan, and expose `cancel_job` — a human `stop`/`reject` best-effort cancels the in-flight job (Cursor cancel API; no-op for `manual`/`webhook`/`claude_code`) so a stopped run stops spending, recorded as an `AGENT_CANCELLED` audit event |
 | `connectors/` | Trackers: Linear, GitHub Issues, Jira. SCMs: GitHub, GitLab. Both fetch the changed-file list via an injected transport (`github_transport` / `gitlab_transport`, GitLab paging `/diffs`) so file-based gates see the full diff; **no token ⇒ diff-blind, gates skipped**. Chat notifications: `RunNotifier` seam (`connectors/notify.py`) with a `SlackNotifier` (`connectors/slack.py`, `slack_transport` → `chat.postMessage`) that posts the interactive approval message (buttons whose `action_id`/`value` the inbound `api/slack.py` parser consumes — the wire contract `SLACK_ACTION_PREFIX`/`SLACK_DECISIONS` lives in `connectors/slack.py`, re-exported by `api/slack.py`) and status updates (parked/blocked/PR open/merged). Best-effort like the tracker write-back; **fail-closed: wired only when both `FOUNDRY_SLACK_BOT_TOKEN` and a channel are set**. `transport.py` is the HTTP seam (fakes in tests) |
 | `catalog/` | `foundry-catalog sync` — GitHub org metadata sweep feeding the catalog enricher (stateful, budget-aware, resumable). `--code-facts` (implied by `context.provider: code`) adds per-repo code facts: file tree via the Git Trees API, CODEOWNERS, root manifests; derivation logic is pure functions in `catalog/code_facts.py` |
@@ -130,6 +130,10 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   precise); `risk.provider: llm` adds judgment + cited evidence, escalate-only.
 - Single-tenant DB; approvers are static config (no SSO/SCIM); no rate limiting.
 - Temporal driver unproven against a live server; inline driver is production path.
+  The known workflow holes (wait-timeout handling, decision-verb validation,
+  intake idempotency, single-shot PR observation) are fixed and CI-tested under
+  the time-skipping environment, but durability against a real Temporal server
+  is still the open work in #37.
 - One run targets one repo; no cross-repo or epic decomposition.
 - No Slack/Teams surface; approvals are tracker comments or the REST endpoint.
 

@@ -878,6 +878,92 @@ def test_mark_agent_failed_on_running_run_still_fails_it(session_factory) -> Non
     assert _outcome_value(session_factory, run_id) == "failed"
 
 
+# -- durable-wait expiry (Temporal driver): clean terminal, never a strand ------
+
+
+def _audit_meta(session_factory, run_id, event_type):
+    import json
+
+    from foundry.db.models import FoundryAuditEvent
+
+    with session_factory() as s:
+        events = [
+            e
+            for e in s.query(FoundryAuditEvent).filter_by(run_id=run_id)
+            if e.event_type is event_type
+        ]
+        return [json.loads(e.metadata_json) if e.metadata_json else {} for e in events]
+
+
+def test_expire_pending_approval_blocks_with_audited_reason(session_factory) -> None:
+    from foundry.db.models import AuditEventType
+
+    orch = _orch(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    status = orch.expire_pending_approval(run_id)
+    assert status is RunStatus.BLOCKED
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _outcome_value(session_factory, run_id) == "blocked"
+    metas = _audit_meta(session_factory, run_id, AuditEventType.RUN_BLOCKED)
+    assert any(m.get("category") == "approval_window_expired" for m in metas)
+
+
+def test_expire_pending_pr_fails_dispatched_run(session_factory) -> None:
+    from foundry.db.models import AuditEventType
+
+    orch, run_id = _dispatched_run(session_factory)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+    status = orch.expire_pending_pr(run_id)
+    assert status is RunStatus.EXECUTION_FAILED
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    assert _outcome_value(session_factory, run_id) == "failed"
+    metas = _audit_meta(session_factory, run_id, AuditEventType.AGENT_FAILED)
+    assert any(m.get("category") == "pr_window_expired" for m in metas)
+
+
+def test_expire_is_idempotent_when_run_already_moved_on(session_factory) -> None:
+    # The awaited signal won the race (the run was approved), or the activity is
+    # being retried: expiry must be a no-op, never overwriting the live run.
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+    status = orch.expire_pending_approval(run_id)
+    assert status is RunStatus.APPROVED
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_expire_pending_pr_on_open_pr_is_noop(session_factory) -> None:
+    # A run that has already opened a PR is not AGENT_RUNNING; a late PR-window
+    # expiry must leave the delivered PR untouched.
+    orch, run_id = _dispatched_run(session_factory)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    status = orch.expire_pending_pr(run_id)
+    assert status is RunStatus.PR_OPEN
+    assert _status(session_factory, run_id) is RunStatus.PR_OPEN
+
+
+def test_expire_pending_pr_cancels_in_flight_job(session_factory) -> None:
+    # A dispatched-but-undelivered run may still be spending; PR-window expiry
+    # cancels the job like a human stop would.
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    orch.dispatch_agent(run_id)  # job left in flight (not run to completion)
+
+    orch.expire_pending_pr(run_id)
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    with session_factory() as s:
+        job = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+        assert job.status is AgentJobStatus.CANCELLED
+
+
 # -- stop cancels the agent: "stop" means stop spending, not just stop listening -
 
 

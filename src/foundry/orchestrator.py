@@ -75,6 +75,7 @@ from foundry.schemas.analysis import TicketAnalysis
 from foundry.memory.outcomes import record_outcome
 from foundry.schemas.common import (
     ACTIVE_RUN_STATUSES,
+    PR_OBSERVABLE_STATUSES,
     AgentMode,
     ApprovalRole,
     CIStatus,
@@ -103,10 +104,9 @@ _ARTIFACT_MODELS: dict[ArtifactType, type] = {
 
 _log = logging.getLogger(__name__)
 
-# Run states in which PR webhook events are meaningful for the run.
-_PR_OBSERVABLE_STATUSES = frozenset(
-    {RunStatus.AGENT_RUNNING, RunStatus.PR_OPEN, RunStatus.REVIEW_REQUIRED}
-)
+# Run states in which PR webhook events are meaningful for the run. Defined once
+# in schemas/common.py so the orchestrator and the durable workflow share it.
+_PR_OBSERVABLE_STATUSES = PR_OBSERVABLE_STATUSES
 
 # Status transitions worth pinging a chat surface about: parked, blocked, PR
 # open, merged (and the failure terminals, which an approver wants to hear about
@@ -526,6 +526,77 @@ class FoundryOrchestrator:
             self._record_outcome_if_terminal(session, run)
             session.commit()
         self._notify_state(issue_id, status)
+
+    def expire_pending_approval(self, run_id: str) -> RunStatus:
+        """Terminate a run whose approval window elapsed without a decision.
+
+        Called by the durable Temporal driver when ``wait_condition`` for the
+        approval signal times out: instead of letting the workflow fail and
+        strand the run at ``WAITING_APPROVAL`` with no audit row, transition it
+        cleanly to ``BLOCKED`` with a ``run.blocked`` event tagged
+        ``approval_window_expired``. Idempotent — a run that has since been
+        approved/rejected (the signal raced the timeout, or the activity is
+        being retried) is left untouched and its current status returned.
+        """
+        return self._expire_wait(
+            run_id,
+            expected=RunStatus.WAITING_APPROVAL,
+            status=RunStatus.BLOCKED,
+            event_type=AuditEventType.RUN_BLOCKED,
+            category="approval_window_expired",
+        )
+
+    def expire_pending_pr(self, run_id: str) -> RunStatus:
+        """Terminate a dispatched run whose PR never arrived in the wait window.
+
+        The durable counterpart to a silently-stranded ``AGENT_RUNNING`` run:
+        the agent was dispatched but produced no PR within the workflow's PR
+        window, so the run failed to deliver. Transition to ``EXECUTION_FAILED``
+        with an ``agent.failed`` event (consistent with a provider that raises)
+        and cancel any in-flight job so it stops spending. Idempotent — a run
+        that has since opened a PR (or already terminated) is left untouched.
+        """
+        return self._expire_wait(
+            run_id,
+            expected=RunStatus.AGENT_RUNNING,
+            status=RunStatus.EXECUTION_FAILED,
+            event_type=AuditEventType.AGENT_FAILED,
+            category="pr_window_expired",
+        )
+
+    def _expire_wait(
+        self,
+        run_id: str,
+        *,
+        expected: RunStatus,
+        status: RunStatus,
+        event_type: AuditEventType,
+        category: str,
+    ) -> RunStatus:
+        with self._sf() as session:
+            run = self._require_run(session, run_id, lock=True)
+            if run.status is not expected:
+                # The awaited signal won the race, or this expiry is a retry:
+                # nothing to do, never overwrite a run that already moved on.
+                return run.status
+            run.status = status
+            run.current_step = status.value
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=event_type,
+                    actor_type="foundry",
+                    metadata={"category": category},
+                )
+            )
+            # A dispatched-but-undelivered run may still have a job spending;
+            # cancel it best-effort exactly as a human stop would.
+            self._cancel_active_job(session, run_id, user="foundry")
+            issue_id = run.linear_issue_id
+            self._record_outcome_if_terminal(session, run)
+            session.commit()
+        self._notify_state(issue_id, status)
+        return status
 
     def _cancel_active_job(self, session, run_id: str, *, user: str) -> None:
         """Cancel the run's in-flight provider job when a human ends the run.
