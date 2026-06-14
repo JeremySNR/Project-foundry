@@ -135,6 +135,32 @@ def test_forbidden_file_blocks_run(session_factory) -> None:
     assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
 
 
+def test_nested_forbidden_migrations_path_blocks_run(session_factory) -> None:
+    """A migrations dir nested under a service path still hard-blocks.
+
+    Regression for root-anchored forbidden globs: ``migrations/**`` only matched
+    a top-level dir, so a nested ``services/api/migrations/...`` got the softer
+    sensitive-area escalation (REVIEW_REQUIRED) instead of the sticky BLOCK the
+    forbidden list promises.
+    """
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+
+    pr = PullRequestState(
+        repo="customer-web",
+        pr_number=2,
+        url="https://github.com/example/customer-web/pull/2",
+        branch="foundry/lin-123",
+        status=PRStatus.OPEN,
+        files_changed=["services/api/migrations/0001_init.py"],
+    )
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+
+
 def test_forbidden_file_on_second_page_blocks_run(session_factory) -> None:
     """A forbidden file at position 101+ in a large PR still hard-blocks.
 
@@ -222,11 +248,142 @@ def test_auth_change_is_human_only_and_blocks_dispatch(session_factory) -> None:
     assert _status(session_factory, run_id) is RunStatus.BLOCKED
 
 
+def test_permanently_blocked_ticket_parks_blocked_not_waiting_approval(
+    session_factory,
+) -> None:
+    """A DB-migration ticket is denied by policy no matter who approves, so it
+    parks at BLOCKED at intake instead of inviting a futile approval that
+    dispatch would only convert to BLOCKED.
+    """
+    import json
+
+    from foundry.db.models import AuditEventType, FoundryAuditEvent
+
+    orch = _orch(session_factory)
+    ticket = _ready_ticket(
+        title="Migrate the users table",
+        description=(
+            "Acceptance Criteria:\n"
+            "- alter table users add column nickname\n"
+            "- backfill existing rows\n"
+        ),
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    # A permanently-blocked run cannot be approved.
+    with pytest.raises(OrchestratorError):
+        orch.approve(run_id, user="lead@example.com")
+
+    # The block is recorded as a policy denial (not "unroutable"), with the
+    # decision attached so the trail shows why approval was never offered.
+    with session_factory() as s:
+        events = (
+            s.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id, event_type=AuditEventType.RUN_BLOCKED)
+            .all()
+        )
+    assert len(events) == 1
+    meta = json.loads(events[0].metadata_json or "{}")
+    assert meta["category"] == "policy_denied"
+    assert events[0].output_hash is not None
+
+
 def test_dispatch_requires_approval_first(session_factory) -> None:
     orch = _orch(session_factory, provider=InMemoryFakeProvider())
     run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
     with pytest.raises(OrchestratorError):
         orch.dispatch_agent(run_id)
+
+
+def _infra_ticket(**overrides) -> RawTicket:
+    """Infrastructure work: requires ENGINEERING approval but is medium-risk, so
+    (unlike auth) it is dispatchable as a draft PR once approved with the role."""
+    base = dict(
+        issue_id="i-infra",
+        issue_key="LIN-INF",
+        title="Update the terraform deployment config",
+        description=(
+            "Acceptance Criteria:\n"
+            "- terraform plan runs clean\n"
+            "- the deployment config applies\n"
+        ),
+        known_repositories=["customer-web"],
+    )
+    base.update(overrides)
+    return RawTicket(**base)
+
+
+def _has_artifact(session_factory, run_id, artifact_type) -> bool:
+    with session_factory() as s:
+        return (
+            s.query(FoundryArtifact)
+            .filter_by(run_id=run_id, artifact_type=artifact_type)
+            .count()
+            > 0
+        )
+
+
+def test_approve_without_required_role_is_refused_and_records_nothing(
+    session_factory,
+) -> None:
+    """Issue #18: an approver lacking a role this run requires is refused *before*
+    anything is written - no void APPROVAL_GRANTED, no flip to APPROVED. Previously
+    the approval was recorded and only blocked at dispatch (approve->blocked
+    whiplash with a misleading audit trail)."""
+    from foundry.db.models import AuditEventType
+
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_infra_ticket(), trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    # Infra work requires ENGINEERING; approving with no roles must be refused.
+    with pytest.raises(OrchestratorError, match="approval refused"):
+        orch.approve(run_id, user="lead@example.com")
+
+    # The run is untouched: still awaiting approval, no approver recorded.
+    with session_factory() as s:
+        run = s.get(FoundryRun, run_id)
+        assert run.status is RunStatus.WAITING_APPROVAL
+        assert run.approved_by is None
+    # No phantom approval artifact or audit event on the trail.
+    assert not _has_artifact(session_factory, run_id, ArtifactType.APPROVAL_RECORD)
+    assert (
+        _events_of_type(session_factory, run_id, AuditEventType.APPROVAL_GRANTED) == []
+    )
+
+
+def test_approve_with_partial_roles_is_refused(session_factory) -> None:
+    """A run needing SECURITY (customer PII) is not unlocked by an ENGINEERING-only
+    sign-off; the refusal names the missing role."""
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    ticket = _ready_ticket(
+        title="Export customer data with GDPR fields",
+        description=(
+            "Acceptance Criteria:\n"
+            "- personal data is exportable\n"
+            "- gdpr fields included\n"
+        ),
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    with pytest.raises(OrchestratorError, match="security"):
+        orch.approve(
+            run_id, user="lead@example.com", granted_roles={ApprovalRole.ENGINEERING}
+        )
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+
+def test_approve_with_required_role_records_and_dispatches(session_factory) -> None:
+    """The same infra run, approved *with* the required ENGINEERING role, records
+    the approval and dispatches (medium risk -> draft PR, not human-only)."""
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_infra_ticket(), trigger_type="label")
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.ENGINEERING}
+    )
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+    assert _has_artifact(session_factory, run_id, ArtifactType.APPROVAL_RECORD)
+    orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
 
 
 def test_tracker_receives_comment_and_state_on_intake(session_factory) -> None:
@@ -402,6 +559,19 @@ def test_correlate_pr_no_match_returns_none(session_factory) -> None:
     assert orch.correlate_pr(pr) is None
 
 
+def test_find_run_id_for_branch_ignores_terminal_runs(session_factory) -> None:
+    """A branch whose run has gone terminal is not matched, so a late PR webhook
+    cannot revive it (correlate_pr's documented PR-observable-only contract).
+    """
+    branch = "foundry/lin-123-add-customer-favourites"
+    orch, run_id = _dispatched_run(session_factory)
+    # While the run is observable (AGENT_RUNNING), the branch correlates.
+    assert orch.find_run_id_for_branch(branch) == run_id
+    # Drive it terminal; the same branch must no longer match.
+    orch.stop(run_id, user="lead@example.com")
+    assert orch.find_run_id_for_branch(branch) is None
+
+
 # -- governed remediation loop ----------------------------------------------------
 
 
@@ -486,6 +656,38 @@ def test_changes_requested_review_triggers_remediation(session_factory) -> None:
     assert orch.record_pr(run_id, review) is RunStatus.AGENT_RUNNING
 
 
+def test_pr_opened_emitted_once_across_remediation(session_factory) -> None:
+    """PR_OPENED fires only on the first observation; later events (including
+    pushes during remediation, when the status is AGENT_RUNNING again) emit
+    PR_UPDATED. Regression for keying ``first_observation`` off the run status.
+    """
+    from foundry.db.models import AuditEventType, FoundryAuditEvent
+
+    orch, run_id, _provider = _dispatched_with_provider(session_factory)
+    orch.record_pr(run_id, _pr())  # first observation -> PR_OPENED
+    # CI fails -> re-dispatch; the run is AGENT_RUNNING again.
+    assert (
+        orch.record_pr(run_id, _pr(ci_status=CIStatus.FAILING))
+        is RunStatus.AGENT_RUNNING
+    )
+    # The agent pushes again mid-remediation: must be PR_UPDATED, not PR_OPENED.
+    orch.record_pr(run_id, _pr())
+
+    with session_factory() as s:
+        opened = (
+            s.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id, event_type=AuditEventType.PR_OPENED)
+            .count()
+        )
+        updated = (
+            s.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id, event_type=AuditEventType.PR_UPDATED)
+            .count()
+        )
+    assert opened == 1
+    assert updated >= 2
+
+
 def test_retry_on_config_disables_remediation(session_factory) -> None:
     orch, run_id, _provider = _dispatched_with_provider(
         session_factory, retry_on=()
@@ -526,6 +728,56 @@ def test_remediation_allowed_when_under_budget(session_factory) -> None:
         s.commit()
     failing = _pr(ci_status=CIStatus.FAILING)
     assert orch.record_pr(run_id, failing) is RunStatus.AGENT_RUNNING
+
+
+def test_budget_cap_blocks_first_dispatch_when_estimate_exceeds_cap(
+    session_factory,
+) -> None:
+    """A single dispatch whose estimated cost already exceeds the cap is
+    refused at ``start_agent`` (issue #29): no provider call, run BLOCKED."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        max_cost_per_run=5.0,
+        estimated_cost_per_dispatch=6.0,
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    with pytest.raises(OrchestratorError):
+        orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    # Phase 3 only records a job for an allowed dispatch, so nothing ran.
+    assert _job_count(session_factory, run_id) == 0
+
+
+def test_estimate_counts_unreported_cost_against_budget(session_factory) -> None:
+    """The fake provider reports no ``cost_usd``. With an estimate configured,
+    each dispatched attempt counts the estimate as a proxy so the cap still
+    binds on retry (issue #29) - the case claude_code / webhook / manual hit
+    in production where the provider never reports spend."""
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory, max_cost_per_run=5.0, estimated_cost_per_dispatch=3.0
+    )
+    orch.record_pr(run_id, _pr())
+    # One unreported job has run (estimate 3.0); a retry would project
+    # 3.0 + 3.0 = 6.0, past the 5.0 cap, so remediation is denied.
+    failing = _pr(ci_status=CIStatus.FAILING)
+    assert orch.record_pr(run_id, failing) is RunStatus.REVIEW_REQUIRED
+    assert _job_count(session_factory, run_id) == 1  # no re-dispatch
+
+
+def test_budget_snapshot_reports_consumed_and_cap(session_factory) -> None:
+    """``budget_snapshot`` surfaces spend vs cap for the timeline/dashboard,
+    using the estimate as a proxy for a provider that reports no cost."""
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory, max_cost_per_run=10.0, estimated_cost_per_dispatch=2.5
+    )
+    snap = orch.budget_snapshot(run_id)
+    assert snap["cap_usd"] == 10.0
+    assert snap["estimated_cost_per_dispatch"] == 2.5
+    # One unreported job -> the estimate stands in as consumed spend.
+    assert snap["consumed_usd"] == 2.5
 
 
 def test_no_remediation_for_forbidden_path_block(session_factory) -> None:
@@ -765,6 +1017,92 @@ def test_mark_agent_failed_on_running_run_still_fails_it(session_factory) -> Non
     orch.mark_agent_failed(run_id, reason="agent crashed")
     assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
     assert _outcome_value(session_factory, run_id) == "failed"
+
+
+# -- durable-wait expiry (Temporal driver): clean terminal, never a strand ------
+
+
+def _audit_meta(session_factory, run_id, event_type):
+    import json
+
+    from foundry.db.models import FoundryAuditEvent
+
+    with session_factory() as s:
+        events = [
+            e
+            for e in s.query(FoundryAuditEvent).filter_by(run_id=run_id)
+            if e.event_type is event_type
+        ]
+        return [json.loads(e.metadata_json) if e.metadata_json else {} for e in events]
+
+
+def test_expire_pending_approval_blocks_with_audited_reason(session_factory) -> None:
+    from foundry.db.models import AuditEventType
+
+    orch = _orch(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    status = orch.expire_pending_approval(run_id)
+    assert status is RunStatus.BLOCKED
+    assert _status(session_factory, run_id) is RunStatus.BLOCKED
+    assert _outcome_value(session_factory, run_id) == "blocked"
+    metas = _audit_meta(session_factory, run_id, AuditEventType.RUN_BLOCKED)
+    assert any(m.get("category") == "approval_window_expired" for m in metas)
+
+
+def test_expire_pending_pr_fails_dispatched_run(session_factory) -> None:
+    from foundry.db.models import AuditEventType
+
+    orch, run_id = _dispatched_run(session_factory)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+    status = orch.expire_pending_pr(run_id)
+    assert status is RunStatus.EXECUTION_FAILED
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    assert _outcome_value(session_factory, run_id) == "failed"
+    metas = _audit_meta(session_factory, run_id, AuditEventType.AGENT_FAILED)
+    assert any(m.get("category") == "pr_window_expired" for m in metas)
+
+
+def test_expire_is_idempotent_when_run_already_moved_on(session_factory) -> None:
+    # The awaited signal won the race (the run was approved), or the activity is
+    # being retried: expiry must be a no-op, never overwriting the live run.
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+    status = orch.expire_pending_approval(run_id)
+    assert status is RunStatus.APPROVED
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_expire_pending_pr_on_open_pr_is_noop(session_factory) -> None:
+    # A run that has already opened a PR is not AGENT_RUNNING; a late PR-window
+    # expiry must leave the delivered PR untouched.
+    orch, run_id = _dispatched_run(session_factory)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    status = orch.expire_pending_pr(run_id)
+    assert status is RunStatus.PR_OPEN
+    assert _status(session_factory, run_id) is RunStatus.PR_OPEN
+
+
+def test_expire_pending_pr_cancels_in_flight_job(session_factory) -> None:
+    # A dispatched-but-undelivered run may still be spending; PR-window expiry
+    # cancels the job like a human stop would.
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    orch.dispatch_agent(run_id)  # job left in flight (not run to completion)
+
+    orch.expire_pending_pr(run_id)
+    assert _status(session_factory, run_id) is RunStatus.EXECUTION_FAILED
+    with session_factory() as s:
+        job = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+        assert job.status is AgentJobStatus.CANCELLED
 
 
 # -- stop cancels the agent: "stop" means stop spending, not just stop listening -

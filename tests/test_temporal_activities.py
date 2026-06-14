@@ -97,3 +97,33 @@ def test_reject_activity(activities: FoundryActivities) -> None:
     run_id = activities.intake_and_plan(_ticket_params())["run_id"]
     result = activities.reject({"run_id": run_id, "user": "lead@example.com"})
     assert result["status"] == "rejected"
+
+
+def test_intake_activity_idempotent_under_retry(activities: FoundryActivities) -> None:
+    # A timed-out intake activity that already created the run is retried by
+    # Temporal: the second call must attach to the existing active run, not raise
+    # "already has an active run" and fail the workflow (issue #15, problem 3).
+    first = activities.intake_and_plan(_ticket_params())
+    second = activities.intake_and_plan(_ticket_params())
+    assert second["run_id"] == first["run_id"]
+    assert second["status"] == "waiting_approval"
+
+
+def test_expire_approval_activity(activities: FoundryActivities) -> None:
+    run_id = activities.intake_and_plan(_ticket_params())["run_id"]
+    result = activities.expire({"run_id": run_id, "phase": "approval"})
+    assert result["status"] == "blocked"
+
+
+def test_expire_pr_activity(activities: FoundryActivities) -> None:
+    run_id = activities.intake_and_plan(_ticket_params())["run_id"]
+    activities.approve({"run_id": run_id, "user": "lead@example.com", "roles": []})
+    activities.dispatch_agent(run_id)
+    result = activities.expire({"run_id": run_id, "phase": "pr"})
+    assert result["status"] == "execution_failed"
+
+
+def test_expire_activity_unknown_phase_raises(activities: FoundryActivities) -> None:
+    run_id = activities.intake_and_plan(_ticket_params())["run_id"]
+    with pytest.raises(ValueError):
+        activities.expire({"run_id": run_id, "phase": "nonsense"})

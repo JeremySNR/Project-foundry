@@ -17,8 +17,18 @@ from foundry.schemas.plan import DeliveryPlan, ImplementationStep, TestPlan
 from foundry.schemas.risk import RiskAssessment
 from foundry.schemas.ticket import RawTicket
 
-# Default forbidden globs for the coding agent (also enforced by policy).
-DEFAULT_FORBIDDEN_GLOBS = ["infra/**", "migrations/**", "**/.env*", "**/secrets/**"]
+# Default forbidden globs for the coding agent (also enforced by the orchestrator).
+# Kept in lock-step with ``foundry.config.DEFAULT_FORBIDDEN_GLOBS``. The `**/...`
+# variants make the block depth-agnostic: a nested `services/api/migrations/0001.py`
+# is forbidden, not merely flagged as a sensitive area.
+DEFAULT_FORBIDDEN_GLOBS = [
+    "infra/**",
+    "**/infra/**",
+    "migrations/**",
+    "**/migrations/**",
+    "**/.env*",
+    "**/secrets/**",
+]
 
 # The guardrail block and the PR-handoff closing are rendered by Foundry, never
 # by a model: every planner (template or LLM) shares this exact text so an LLM
