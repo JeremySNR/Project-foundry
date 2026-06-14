@@ -1,11 +1,13 @@
 """The Foundry dashboard: one static page, zero build step, zero new deps.
 
 Read-only visibility over the audit data that already exists: the delivery
-metrics strip, the run list and, per run, the full decision timeline
+metrics strip, a delivery-trend-over-time table, the agent scorecards, the run
+list (with an approval-queue filter) and, per run, the full decision timeline
 (artifacts, audit events, policy decisions, agent jobs). All data comes from
-``GET /runs``, ``GET /metrics/delivery`` and ``GET /runs/{id}/timeline``;
-the timeline call carries the bearer token the user pastes once (kept in
-localStorage, never sent anywhere but this API).
+``GET /runs``, ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
+``GET /metrics/agents`` and ``GET /runs/{id}/timeline``; the calls carry the
+bearer token the user pastes once (kept in localStorage, never sent anywhere
+but this API).
 
 Served only when an API token is configured - same fail-closed posture as the
 approval endpoint.
@@ -87,7 +89,7 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #metrics, #agents {
+  #metrics, #agents, #trends {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
@@ -98,12 +100,30 @@ DASHBOARD_HTML = """<!doctype html>
   #metrics table, #agents table {
     border-collapse: collapse; margin: 8px 0 2px; font-size: 12px;
   }
-  #metrics th, #metrics td, #agents th, #agents td {
+  #metrics th, #metrics td, #agents th, #agents td,
+  #trends th, #trends td {
     border: 1px solid var(--border); padding: 3px 10px; text-align: left;
     color: var(--muted);
   }
-  #metrics th, #agents th { color: var(--text); }
-  #agents summary { color: var(--text); cursor: pointer; }
+  #metrics th, #agents th, #trends th { color: var(--text); }
+  #agents summary, #trends summary { color: var(--text); cursor: pointer; }
+  #trends td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  #trends .bar {
+    display: inline-block; height: 8px; background: var(--green);
+    border-radius: 2px; vertical-align: middle; min-width: 1px;
+  }
+  #trends .bar.blocked { background: var(--red); }
+  .queue-filter {
+    display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border);
+    background: var(--panel); position: sticky; top: 0; z-index: 1;
+  }
+  .queue-filter button {
+    padding: 3px 10px; font-size: 12px;
+  }
+  .queue-filter button.active {
+    border-color: var(--accent); color: var(--accent);
+  }
+  .queue-filter .count { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -114,6 +134,7 @@ DASHBOARD_HTML = """<!doctype html>
   <button id="save">Connect</button>
 </header>
 <div id="metrics"></div>
+<div id="trends"></div>
 <div id="agents"></div>
 <main>
   <div id="runs"></div>
@@ -153,36 +174,58 @@ function when(iso) {
   return new Date(iso).toLocaleString();
 }
 
+// Statuses that mean "waiting on a human" - the approval queue.
+const AWAITING = new Set(["waiting_approval", "review_required", "needs_clarification"]);
+let allRuns = [];
+let queueOnly = false;
+
 async function loadRuns() {
   const el = $("#runs");
   try {
     const resp = await fetch("runs", { headers: authHeaders() });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const data = await resp.json();
-    if (!data.runs.length) {
-      el.innerHTML = '<div class="run"><span class="meta">No runs yet.</span></div>';
-      return;
-    }
-    el.innerHTML = data.runs
-      .slice()
-      .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""))
-      .map((r) => `
+    allRuns = data.runs || [];
+    renderRuns();
+  } catch (err) {
+    el.innerHTML = `<div class="error">Could not load runs: ${esc(err.message)}</div>`;
+  }
+}
+
+function renderRuns() {
+  const el = $("#runs");
+  const awaiting = allRuns.filter((r) => AWAITING.has(r.status));
+  const shown = (queueOnly ? awaiting : allRuns)
+    .slice()
+    .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  const filterBar = `
+    <div class="queue-filter">
+      <button data-q="all" class="${queueOnly ? "" : "active"}">All runs</button>
+      <button data-q="queue" class="${queueOnly ? "active" : ""}">Approval queue
+        <span class="count">(${awaiting.length})</span></button>
+    </div>`;
+  const list = shown.length
+    ? shown.map((r) => `
         <div class="run" data-id="${esc(r.id)}">
           <span class="key">${esc(r.linear_issue_key)}</span>${badge(r.status)}
           <div class="meta">${esc(r.id)} &middot; ${esc(r.risk_level || "unclassified")} risk
             &middot; ${when(r.created_at)}</div>
-        </div>`)
-      .join("");
-    el.querySelectorAll(".run[data-id]").forEach((node) => {
-      node.addEventListener("click", () => {
-        el.querySelectorAll(".run").forEach((n) => n.classList.remove("active"));
-        node.classList.add("active");
-        loadTimeline(node.dataset.id);
-      });
+        </div>`).join("")
+    : `<div class="run"><span class="meta">${queueOnly ? "Nothing awaiting approval." : "No runs yet."}</span></div>`;
+  el.innerHTML = filterBar + list;
+  el.querySelectorAll(".queue-filter button[data-q]").forEach((node) => {
+    node.addEventListener("click", () => {
+      queueOnly = node.dataset.q === "queue";
+      renderRuns();
     });
-  } catch (err) {
-    el.innerHTML = `<div class="error">Could not load runs: ${esc(err.message)}</div>`;
-  }
+  });
+  el.querySelectorAll(".run[data-id]").forEach((node) => {
+    node.addEventListener("click", () => {
+      el.querySelectorAll(".run").forEach((n) => n.classList.remove("active"));
+      node.classList.add("active");
+      loadTimeline(node.dataset.id);
+    });
+  });
 }
 
 async function loadTimeline(runId) {
@@ -340,18 +383,67 @@ async function loadAgents() {
   }
 }
 
-$("#save").addEventListener("click", () => {
-  localStorage.setItem("foundry_token", tokenInput.value.trim());
+function fmtPeriod(iso) {
+  if (!iso) return "";
+  return new Date(iso).toLocaleDateString(undefined, {
+    year: "numeric", month: "short", day: "numeric",
+  });
+}
+
+async function loadTrends() {
+  const el = $("#trends");
+  if (!localStorage.getItem("foundry_token")) {
+    el.style.display = "none";  // no token: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/delivery/trends?days=90&bucket=week", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const periods = m.periods || [];
+    if (!periods.length) { el.style.display = "none"; return; }
+    const maxFinished = Math.max(1, ...periods.map((p) => p.runs_finished));
+    const rows = periods.map((p) => {
+      const shipW = Math.round((p.prs_shipped / maxFinished) * 120);
+      const blockW = Math.round((p.blocked / maxFinished) * 120);
+      const cost = p.total_cost_usd == null ? "-" : "$" + p.total_cost_usd;
+      return `<tr>
+        <td>${esc(fmtPeriod(p.period_start))}</td>
+        <td class="num">${p.prs_shipped}</td>
+        <td class="num">${p.blocked}</td>
+        <td class="num">${p.runs_finished}</td>
+        <td class="num">${p.retries_consumed}</td>
+        <td class="num">${cost}</td>
+        <td><span class="bar" style="width:${shipW}px"></span><span class="bar blocked" style="width:${blockW}px"></span></td>
+      </tr>`;
+    }).join("");
+    el.innerHTML = `<details open><summary>delivery trend &mdash; PRs shipped vs blocked, by week (90d)</summary>
+      <table><tr><th>week of</th><th>shipped</th><th>blocked</th><th>finished</th>
+        <th>retries</th><th>spend</th><th></th></tr>${rows}</table>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
+function refresh() {
   loadRuns();
   loadMetrics();
+  loadTrends();
   loadAgents();
+}
+
+$("#save").addEventListener("click", () => {
+  localStorage.setItem("foundry_token", tokenInput.value.trim());
+  refresh();
   $("#detail").innerHTML = '<div class="empty">Select a run to see its full decision timeline.</div>';
 });
 
-loadRuns();
-loadMetrics();
-loadAgents();
-setInterval(() => { loadRuns(); loadMetrics(); loadAgents(); }, 15000);
+refresh();
+setInterval(refresh, 15000);
 </script>
 </body>
 </html>

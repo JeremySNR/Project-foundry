@@ -138,6 +138,36 @@ def test_metrics_empty_database(client) -> None:
     assert body["top_priors"] == []
 
 
+def test_trends_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/delivery/trends").status_code == 401
+
+
+def test_trends_rejects_bad_window_and_bucket(client) -> None:
+    assert client.get("/metrics/delivery/trends?days=0", headers=AUTH).status_code == 422
+    assert (
+        client.get("/metrics/delivery/trends?bucket=month", headers=AUTH).status_code
+        == 422
+    )
+
+
+def test_trends_empty_database(client) -> None:
+    body = client.get("/metrics/delivery/trends", headers=AUTH).json()
+    assert body["days"] == 90
+    assert body["bucket"] == "week"
+    assert body["periods"] == []
+
+
+def test_trends_reports_a_merge_in_a_period(client) -> None:
+    _run_to_merged(client)
+    body = client.get("/metrics/delivery/trends?bucket=day", headers=AUTH).json()
+    assert body["bucket"] == "day"
+    assert len(body["periods"]) == 1
+    period = body["periods"][0]
+    assert period["prs_shipped"] == 1
+    assert period["blocked"] == 0
+    assert period["runs_finished"] == 1
+
+
 def test_metrics_counts_a_merge_and_a_block(client) -> None:
     _run_to_merged(client)
 
