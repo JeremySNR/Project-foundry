@@ -199,3 +199,35 @@ def test_epics_cannot_nest(session_factory) -> None:
             trigger_type="label",
             parent_run_id=child,
         )
+
+
+def test_list_epics_returns_only_roots_with_children(session_factory) -> None:
+    orch = _orch(session_factory)
+    # A plain run with no children is not an epic.
+    orch.intake_and_plan(_ready_ticket("solo", "LIN-1"), trigger_type="label")
+    # Two real epics, each with children.
+    epic_a = orch.intake_and_plan(
+        _ready_ticket("epic-a", "LIN-100"), trigger_type="label"
+    )
+    orch.intake_and_plan(
+        _ready_ticket("a-1", "LIN-101"), trigger_type="label", parent_run_id=epic_a
+    )
+    orch.intake_and_plan(
+        _ready_ticket("a-2", "LIN-102"), trigger_type="label", parent_run_id=epic_a
+    )
+    epic_b = orch.intake_and_plan(
+        _ready_ticket("epic-b", "LIN-200"), trigger_type="label"
+    )
+    orch.intake_and_plan(
+        _ready_ticket("b-1", "LIN-201"), trigger_type="label", parent_run_id=epic_b
+    )
+
+    roots = orch.list_epics()
+    # Only the two parents are epics; the solo run and the children are omitted.
+    assert [r.id for r in roots] == [epic_a, epic_b]  # oldest first
+
+
+def test_list_epics_empty_when_no_children(session_factory) -> None:
+    orch = _orch(session_factory)
+    orch.intake_and_plan(_ready_ticket("solo", "LIN-1"), trigger_type="label")
+    assert orch.list_epics() == []

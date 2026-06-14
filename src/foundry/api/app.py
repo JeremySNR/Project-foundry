@@ -627,6 +627,32 @@ def create_app(
             return HTMLResponse(render_epic_evidence_html(pack))
         return pack
 
+    @app.get("/epics")
+    def list_epics(request: Request) -> dict[str, Any]:
+        """Every epic with its rolled-up status and child runs (issue #35).
+
+        An epic is a run other runs point at via ``parent_run_id``; ordinary
+        single-repo runs (no children) are omitted. Each item has the same
+        shape as ``GET /runs/{id}/epic`` (``run`` / ``rollup`` / ``children``)
+        so the dashboard renders one from the other. The rollup is computed
+        server-side via :func:`compute_epic_rollup`, so the dashboard never
+        re-implements the lifecycle logic. Token-gated and fail-closed like the
+        per-run epic view.
+        """
+        _require_api_token(app, request)
+        orch: FoundryOrchestrator = app.state.orchestrator
+        epics = []
+        for root in orch.list_epics():
+            children = orch.child_runs(root.id)
+            epics.append(
+                {
+                    "run": _run_to_dict(root),
+                    "rollup": compute_epic_rollup(c.status for c in children),
+                    "children": [_run_to_dict(c) for c in children],
+                }
+            )
+        return {"epics": epics, "total": len(epics)}
+
     @app.get("/runs/{run_id}/timeline")
     def run_timeline(run_id: str, request: Request) -> dict[str, Any]:
         """The full decision record for a run: every artifact, audit event and

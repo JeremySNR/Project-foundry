@@ -734,6 +734,68 @@ def test_run_dict_exposes_parent_run_id(client) -> None:
     assert parent_dict["parent_run_id"] is None
 
 
+# -- epic board (GET /epics, dashboard data, issue #35) ------------------------
+
+
+def test_epics_requires_token(client) -> None:
+    _make_epic(client)
+    assert client.get("/epics").status_code == 401
+
+
+def test_epics_disabled_without_configured_token() -> None:
+    client = _make_client(api_token=None)
+    assert client.get("/epics").status_code == 403
+
+
+def test_epics_lists_roots_with_rollup_and_children(client) -> None:
+    parent, child = _make_epic(client)
+    body = client.get("/epics", headers=AUTH).json()
+    assert body["total"] == 1
+    (epic,) = body["epics"]
+    assert epic["run"]["id"] == parent
+    assert [c["id"] for c in epic["children"]] == [child]
+    # The rollup is the same server-computed shape as GET /runs/{id}/epic.
+    assert epic["rollup"]["total"] == 1
+    assert epic["rollup"]["status"] == "in_progress"
+    assert epic["rollup"]["counts"]["active"] == 1
+
+
+def test_epics_omits_runs_without_children(client) -> None:
+    # A plain single-repo run is not an epic and must not appear.
+    orch = client.app.state.orchestrator
+    orch.intake_and_plan(
+        RawTicket(
+            issue_id="solo",
+            issue_key="LIN-1",
+            title="Standalone task",
+            description=READY_DESC,
+            known_repositories=["customer-web"],
+        ),
+        trigger_type="label",
+    )
+    body = client.get("/epics", headers=AUTH).json()
+    assert body == {"epics": [], "total": 0}
+
+
+def test_dashboard_maps_every_epic_status_to_a_badge() -> None:
+    """Drift guard: every EpicStatus the /epics rollup can emit must have an
+    explicit badge class in the dashboard, or a real status (e.g. partial) is
+    silently rendered with the muted fallback."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+    from foundry.epics import EpicStatus
+
+    start = DASHBOARD_HTML.index("const EPIC_BADGE = {")
+    badge_block = DASHBOARD_HTML[start : DASHBOARD_HTML.index("};", start)]
+    for status in EpicStatus:
+        assert f"{status.value}:" in badge_block, f"no epic badge for {status.value}"
+
+
+def test_dashboard_talks_to_epics_endpoint() -> None:
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("epics"' in DASHBOARD_HTML
+
+
 # -- Enricher wiring via build_orchestrator ------------------------------------
 
 
