@@ -551,6 +551,10 @@ def test_reviews_empty_database(client) -> None:
     assert body["oldest_unreviewed_seconds"] is None
     assert body["sla_breaches"] == 0
     assert body["sla_seconds"] is None
+    # Staleness ("stale since last push") summary defaults are inert.
+    assert body["oldest_inactive_seconds"] is None
+    assert body["stale_breaches"] == 0
+    assert body["stale_sla_seconds"] is None
 
 
 def test_reviews_lists_open_pr(client) -> None:
@@ -562,6 +566,42 @@ def test_reviews_lists_open_pr(client) -> None:
     assert entry["status"] == "pr_open"
     assert entry["unreviewed_seconds"] >= 0
     assert entry["sla_breached"] is False  # no SLA configured
+    # The "stale since last push" age is carried alongside the open age; with no
+    # later push it equals the open age, and with no staleness SLA it never breaches.
+    assert entry["inactive_seconds"] >= 0
+    assert entry["inactive_seconds"] <= entry["unreviewed_seconds"]
+    assert entry["stale_breached"] is False
+
+
+def test_reviews_staleness_sla_is_plumbed_through() -> None:
+    # The staleness SLA is wired from app config into the endpoint. A just-opened
+    # PR is fresh (idle ~0s), so it does not breach a 48h SLA - matching how the
+    # review-latency SLA treats a fresh PR. Breach logic is covered by the unit
+    # tests in test_review_queue.py with a controlled clock.
+    client = _client_with(review_stale_sla_seconds=172_800)  # 48h
+    _run_to_pr_open(client)
+    body = client.get("/metrics/reviews", headers=AUTH).json()
+    assert body["stale_sla_seconds"] == 172_800
+    assert body["count"] == 1
+    assert body["runs"][0]["stale_breached"] is False
+    assert body["stale_breaches"] == 0
+
+
+def test_fleet_includes_review_staleness_summary() -> None:
+    client = _client_with(review_stale_sla_seconds=172_800)  # 48h
+    # No PR open yet: the staleness summary is empty/inert.
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["review_stale_sla_seconds"] == 172_800
+    assert body["reviews_stale"] == 0
+    assert body["oldest_inactive_seconds"] is None
+
+    # Ship an open PR; the strip now reports a non-negative idle age, not breaching.
+    _run_to_pr_open(client)
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["prs_open"] == 1
+    assert body["oldest_inactive_seconds"] is not None
+    assert body["oldest_inactive_seconds"] >= 0
+    assert body["reviews_stale"] == 0
 
 
 def test_fleet_includes_review_queue_summary() -> None:

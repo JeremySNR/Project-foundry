@@ -242,6 +242,7 @@ def create_app(
     approval_sla_seconds: int | None = None,
     execution_sla_seconds: int | None = None,
     review_sla_seconds: int | None = None,
+    review_stale_sla_seconds: int | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -321,6 +322,11 @@ def create_app(
     # a run may sit at an open PR (PR_OPEN, awaiting review/CI) before it is
     # flagged. None = no SLA (no breach signal); read-only, blocks no run.
     app.state.review_sla_seconds = review_sla_seconds
+    # Review *staleness* SLA for the same surfaces (issue #37): how long an open PR
+    # may go with no observed push before it is flagged stale - the "stale since
+    # last push" signal, distinct from review_sla_seconds (total open time). None =
+    # no SLA (no breach signal); read-only, blocks no run.
+    app.state.review_stale_sla_seconds = review_stale_sla_seconds
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.deduplicator = WebhookDeduplicator(
         session_factory,
@@ -1166,6 +1172,7 @@ def create_app(
                 sla_seconds=app.state.approval_sla_seconds,
                 execution_sla_seconds=app.state.execution_sla_seconds,
                 review_sla_seconds=app.state.review_sla_seconds,
+                review_stale_sla_seconds=app.state.review_stale_sla_seconds,
             )
 
     @app.get("/metrics/approvals")
@@ -1209,14 +1216,22 @@ def create_app(
         ``GET /metrics/approvals`` and ``GET /metrics/executions``. Every run at an
         open PR (PR_OPEN, awaiting review/CI), oldest first, each with how long the
         PR has been open and (when a review SLA is configured) whether it has
-        breached - the "PRs sitting unreviewed for N hours" signal. Token-gated and
-        fail-closed like the other metrics endpoints; read-only, changes no gate.
+        breached - the "PRs sitting unreviewed for N hours" signal. Each entry also
+        carries ``inactive_seconds`` (time since the PR last changed) and, when a
+        staleness SLA is configured, ``stale_breached`` - the "stale since last
+        push" signal that tells an actively-pushed PR from an abandoned one.
+        Token-gated and fail-closed like the other metrics endpoints; read-only,
+        changes no gate.
         """
         from foundry.memory.metrics import review_queue
 
         _require_api_token(app, request)
         with app.state.session_factory() as session:
-            return review_queue(session, sla_seconds=app.state.review_sla_seconds)
+            return review_queue(
+                session,
+                sla_seconds=app.state.review_sla_seconds,
+                stale_sla_seconds=app.state.review_stale_sla_seconds,
+            )
 
     @app.post("/runs/{run_id}/approval")
     def approval(
@@ -1990,6 +2005,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         approval_sla_seconds=settings.approval_sla_seconds,
         execution_sla_seconds=settings.execution_sla_seconds,
         review_sla_seconds=settings.review_sla_seconds,
+        review_stale_sla_seconds=settings.review_stale_sla_seconds,
     )
 
 

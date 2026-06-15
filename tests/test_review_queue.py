@@ -232,6 +232,113 @@ def test_fleet_status_without_review_sla(session_factory) -> None:
     assert fleet["oldest_review_seconds"] == 3 * 3600
 
 
+def test_inactive_age_dates_from_last_push(session_factory) -> None:
+    """The "stale since last push" age is dated from the *latest* of
+    PR_OPENED / PR_UPDATED, so an actively-pushed PR reads as fresh even though it
+    opened long ago - distinct from ``unreviewed_seconds`` (total open time)."""
+    with session_factory() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.PR_OPEN,
+            updated_at=NOW - timedelta(minutes=1),
+        )
+        _add_event(session, rid, AuditEventType.PR_OPENED, NOW - timedelta(hours=5))
+        _add_event(session, rid, AuditEventType.PR_UPDATED, NOW - timedelta(minutes=20))
+        session.commit()
+        q = review_queue(session, now=NOW)
+    entry = q["runs"][0]
+    assert entry["unreviewed_seconds"] == 5 * 3600  # open for 5h
+    assert entry["inactive_seconds"] == 20 * 60  # but pushed 20m ago
+    assert entry["last_activity_since"] == (NOW - timedelta(minutes=20)).isoformat()
+    # The most-stale-PR summary reports the inactivity age, not the open age.
+    assert q["oldest_inactive_seconds"] == 20 * 60
+
+
+def test_inactive_collapses_to_open_age_without_a_push(session_factory) -> None:
+    """A PR with only PR_OPENED (never pushed) is idle since it opened, so
+    ``inactive_seconds == unreviewed_seconds`` - never *more* idle than open."""
+    with session_factory() as session:
+        rid = _add_run(session, status=RunStatus.PR_OPEN, updated_at=NOW)
+        _add_event(session, rid, AuditEventType.PR_OPENED, NOW - timedelta(hours=3))
+        session.commit()
+        q = review_queue(session, now=NOW)
+    entry = q["runs"][0]
+    assert entry["inactive_seconds"] == entry["unreviewed_seconds"] == 3 * 3600
+
+
+def test_stale_sla_flags_idle_prs_independently_of_review_sla(session_factory) -> None:
+    """The staleness SLA is its own knob: a PR open 5h but pushed 20m ago breaches
+    a 1h *review* SLA yet not a 1h *staleness* SLA; a PR open 5h with no push since
+    breaches both."""
+    with session_factory() as session:
+        active = _add_run(
+            session, status=RunStatus.PR_OPEN, updated_at=NOW - timedelta(minutes=1)
+        )
+        _add_event(session, active, AuditEventType.PR_OPENED, NOW - timedelta(hours=5))
+        _add_event(
+            session, active, AuditEventType.PR_UPDATED, NOW - timedelta(minutes=20)
+        )
+        abandoned = _add_run(
+            session, status=RunStatus.PR_OPEN, updated_at=NOW - timedelta(minutes=1)
+        )
+        _add_event(
+            session, abandoned, AuditEventType.PR_OPENED, NOW - timedelta(hours=5)
+        )
+        session.commit()
+        q = review_queue(session, now=NOW, sla_seconds=3600, stale_sla_seconds=3600)
+    by_id = {r["run_id"]: r for r in q["runs"]}
+    # Both are open 5h, so both breach the review SLA.
+    assert by_id[active]["sla_breached"] is True
+    assert by_id[abandoned]["sla_breached"] is True
+    # Only the untouched one is stale (idle 5h); the pushed one is idle 20m.
+    assert by_id[active]["stale_breached"] is False
+    assert by_id[abandoned]["stale_breached"] is True
+    assert q["sla_breaches"] == 2
+    assert q["stale_breaches"] == 1
+    assert q["stale_sla_seconds"] == 3600
+    assert q["oldest_inactive_seconds"] == 5 * 3600
+
+
+def test_no_stale_sla_means_no_stale_signal(session_factory) -> None:
+    with session_factory() as session:
+        _seed_three(session)  # PR_OPENED only, no pushes
+        session.commit()
+        q = review_queue(session, now=NOW, stale_sla_seconds=None)
+    assert q["stale_sla_seconds"] is None
+    assert q["stale_breaches"] == 0
+    assert all(r["stale_breached"] is False for r in q["runs"])
+    # The inactivity age is still reported even without a staleness SLA.
+    assert q["oldest_inactive_seconds"] == 3 * 3600
+
+
+def test_fleet_status_carries_stale_summary(session_factory) -> None:
+    with session_factory() as session:
+        rid = _add_run(
+            session, status=RunStatus.PR_OPEN, updated_at=NOW - timedelta(minutes=1)
+        )
+        _add_event(session, rid, AuditEventType.PR_OPENED, NOW - timedelta(hours=5))
+        # No push since it opened -> idle 5h.
+        session.commit()
+        fleet = fleet_status(session, review_stale_sla_seconds=3600, now=NOW)
+    assert fleet["review_stale_sla_seconds"] == 3600
+    assert fleet["oldest_inactive_seconds"] == 5 * 3600
+    assert fleet["reviews_stale"] == 1
+    # The headline review-latency summary is unaffected by the staleness knob.
+    assert fleet["reviews_breaching_sla"] == 0
+    assert fleet["review_sla_seconds"] is None
+
+
+def test_fleet_status_without_stale_sla(session_factory) -> None:
+    with session_factory() as session:
+        _seed_three(session)
+        session.commit()
+        fleet = fleet_status(session, now=NOW)
+    assert fleet["review_stale_sla_seconds"] is None
+    assert fleet["reviews_stale"] == 0
+    # Oldest inactivity age is still reported (PR_OPENED-only seeds -> idle == open).
+    assert fleet["oldest_inactive_seconds"] == 3 * 3600
+
+
 def test_fleet_review_sla_is_independent_of_the_other_slas(session_factory) -> None:
     """The three SLAs are distinct knobs: a 2h open PR breaches a 1h review SLA
     without touching the approval- or execution-queue summaries."""

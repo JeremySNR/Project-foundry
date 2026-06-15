@@ -4,7 +4,8 @@ Read-only visibility over the audit data that already exists: a live fleet
 strip (runs in flight / approval queue / execution queue / review queue / spend
 in flight, from the current run states), an approval-queue panel, an
 execution-queue panel (in-flight agent runs with run-time age + SLA, issue #37)
-and a review-queue panel (open PRs with review-latency age + SLA, issue #37),
+and a review-queue panel (open PRs with review-latency age + a "stale since last
+push" age, each with its own SLA, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), an epic board (multi-repo
@@ -454,6 +455,12 @@ async function loadFleet() {
     const reviewBreaching = f.reviews_breaching_sla
       ? `<span class="stat bad"><b>${f.reviews_breaching_sla}</b> over SLA</span>`
       : "";
+    // The "stale since last push" cut of the same open PRs: most-idle PR + how
+    // many have gone untouched past the staleness SLA (issue #37). Both omitted
+    // when no PR is open or the count is zero.
+    const reviewsStale = f.reviews_stale
+      ? `<span class="stat bad"><b>${f.reviews_stale}</b> stale</span>`
+      : "";
     el.innerHTML = `
       <span class="label">Fleet now</span>
       <span class="stat"><b>${f.runs_active}</b> in flight</span>
@@ -466,6 +473,7 @@ async function loadFleet() {
       <span class="stat"><b>${f.prs_open}</b> PRs open</span>
       ${oldestReview}
       ${reviewBreaching}
+      ${reviewsStale}
       <span class="stat"><b>${spend}</b> spend in flight</span>
       <span class="stat"><b>${f.total_runs}</b> total runs</span>`;
     el.style.display = "block";
@@ -551,15 +559,17 @@ async function loadReviews() {
     const runs = q.runs || [];
     if (!runs.length) { el.style.display = "none"; return; }  // no open PRs: hide
     const rows = runs.map((r) => `
-      <div class="run ${r.sla_breached ? "breach" : ""}" data-id="${esc(r.run_id)}" title="open timeline">
+      <div class="run ${r.sla_breached || r.stale_breached ? "breach" : ""}" data-id="${esc(r.run_id)}" title="open timeline">
         <span class="key">${esc(r.linear_issue_key)}</span>${badge(r.status)}
         <span class="age ${r.sla_breached ? "bad" : ""}">${dur(r.unreviewed_seconds)} unreviewed</span>
+        <span class="age ${r.stale_breached ? "bad" : ""}">${dur(r.inactive_seconds)} since last push</span>
         <div class="meta">${esc(r.run_id)} &middot; ${esc(r.risk_level || "unclassified")} risk
           &middot; ${esc(r.current_step || "-")}</div>
       </div>`).join("");
-    const sla = q.sla_seconds
-      ? ` &middot; ${q.sla_breaches} of ${q.count} over the ${dur(q.sla_seconds)} SLA`
-      : "";
+    const slaParts = [];
+    if (q.sla_seconds) slaParts.push(`${q.sla_breaches} of ${q.count} over the ${dur(q.sla_seconds)} review SLA`);
+    if (q.stale_sla_seconds) slaParts.push(`${q.stale_breaches} idle over the ${dur(q.stale_sla_seconds)} staleness SLA`);
+    const sla = slaParts.length ? ` &middot; ${slaParts.join(" &middot; ")}` : "";
     el.innerHTML = `<details open><summary>review queue &mdash; ${q.count} PR${q.count === 1 ? "" : "s"} open, oldest first${sla}</summary>${rows}</details>`;
     el.style.display = "block";
     el.querySelectorAll(".run[data-id]").forEach((node) => {
