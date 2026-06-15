@@ -194,6 +194,15 @@ class Settings:
     # behaviour, byte-for-byte).
     approval_sla_seconds: int | None = None
 
+    # Execution SLA: how long (seconds) a run may sit dispatched to an agent
+    # (AGENT_RUNNING, no PR opened yet) before it is flagged as breaching - the
+    # hung/runaway-agent signal, the machine-state complement to
+    # ``approval_sla_seconds``. Surfaced read-only on the fleet strip and the
+    # GET /metrics/executions queue; it changes no gate and blocks no run. None
+    # (default) = no SLA configured, no breach signal (the historical behaviour,
+    # byte-for-byte).
+    execution_sla_seconds: int | None = None
+
     # --- issue tracker (behaviour: yaml) ---
     # "linear" (default), "github_issues" (the issue is the ticket; approvers
     # are then keyed by GitHub login instead of email), or "jira".
@@ -523,6 +532,11 @@ class Settings:
             raise ValueError(
                 "approval_sla_seconds must be >= 1 when set, got "
                 f"{self.approval_sla_seconds} (omit it to disable the SLA signal)"
+            )
+        if self.execution_sla_seconds is not None and self.execution_sla_seconds < 1:
+            raise ValueError(
+                "execution_sla_seconds must be >= 1 when set, got "
+                f"{self.execution_sla_seconds} (omit it to disable the SLA signal)"
             )
         # OIDC is all-or-nothing: a partial config that looked enabled but
         # silently verified nothing would be a fail-open auth hole.
@@ -874,6 +888,9 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "approval_sla_seconds" in dashboard:
         value = dashboard["approval_sla_seconds"]
         out["approval_sla_seconds"] = None if value is None else int(value)
+    if "execution_sla_seconds" in dashboard:
+        value = dashboard["execution_sla_seconds"]
+        out["execution_sla_seconds"] = None if value is None else int(value)
 
     notifications = data.get("notifications", {}) or {}
     if "slack_channel" in notifications:
@@ -1042,4 +1059,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
     if "FOUNDRY_APPROVAL_SLA_SECONDS" in env:
         raw = env["FOUNDRY_APPROVAL_SLA_SECONDS"].strip()
         out["approval_sla_seconds"] = None if raw == "" else int(raw)
+    if "FOUNDRY_EXECUTION_SLA_SECONDS" in env:
+        raw = env["FOUNDRY_EXECUTION_SLA_SECONDS"].strip()
+        out["execution_sla_seconds"] = None if raw == "" else int(raw)
     return out

@@ -240,6 +240,7 @@ def create_app(
     rate_limit_api_per_minute: int = 60,
     auto_decompose_epics: bool = False,
     approval_sla_seconds: int | None = None,
+    execution_sla_seconds: int | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -311,6 +312,10 @@ def create_app(
     # Approval-queue SLA for the fleet strip + GET /metrics/approvals (issue
     # #37). None = no SLA configured (no breach signal); read-only, blocks no run.
     app.state.approval_sla_seconds = approval_sla_seconds
+    # Execution SLA for the fleet strip + GET /metrics/executions (issue #37):
+    # how long a run may sit in AGENT_RUNNING (agent dispatched, no PR yet)
+    # before it is flagged. None = no SLA (no breach signal); read-only.
+    app.state.execution_sla_seconds = execution_sla_seconds
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.deduplicator = WebhookDeduplicator(
         session_factory,
@@ -1141,7 +1146,11 @@ def create_app(
 
         _require_api_token(app, request)
         with app.state.session_factory() as session:
-            return fleet_status(session, sla_seconds=app.state.approval_sla_seconds)
+            return fleet_status(
+                session,
+                sla_seconds=app.state.approval_sla_seconds,
+                execution_sla_seconds=app.state.execution_sla_seconds,
+            )
 
     @app.get("/metrics/approvals")
     def metrics_approvals(request: Request) -> dict[str, Any]:
@@ -1157,6 +1166,24 @@ def create_app(
         with app.state.session_factory() as session:
             return approval_queue(
                 session, sla_seconds=app.state.approval_sla_seconds
+            )
+
+    @app.get("/metrics/executions")
+    def metrics_executions(request: Request) -> dict[str, Any]:
+        """In-flight agent runs with per-run run-time age - the drill-down behind
+        the fleet strip's ``agents_running`` count, the machine-state complement
+        to ``GET /metrics/approvals``. Every run dispatched to an agent and not
+        yet at a PR, oldest first, each with how long it has been running and
+        (when an execution SLA is configured) whether it has breached - the
+        hung/runaway-agent signal. Token-gated and fail-closed like the other
+        metrics endpoints; read-only, changes no gate.
+        """
+        from foundry.memory.metrics import execution_queue
+
+        _require_api_token(app, request)
+        with app.state.session_factory() as session:
+            return execution_queue(
+                session, sla_seconds=app.state.execution_sla_seconds
             )
 
     @app.post("/runs/{run_id}/approval")
@@ -1927,6 +1954,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         rate_limit_api_per_minute=settings.rate_limit_api_per_minute,
         auto_decompose_epics=settings.epics_auto_decompose,
         approval_sla_seconds=settings.approval_sla_seconds,
+        execution_sla_seconds=settings.execution_sla_seconds,
     )
 
 
