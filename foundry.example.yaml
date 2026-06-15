@@ -61,8 +61,9 @@ decomposition:
 policy:
   # Not sure where to start? Foundry ships a vetted starter library of policy
   # presets (issue #31). `foundry-policy presets` lists them (baseline / soc2 /
-  # change-management); `foundry-policy show <name>` prints one to copy in here;
-  # `foundry-policy explain <name>` shows the gate knobs it resolves to. The
+  # change-management / pci-dss); `foundry-policy show <name>` prints one to copy
+  # in here; `foundry-policy explain <name>` shows the gate knobs it resolves to
+  # (including the two-person-rule approval count and per-path roles). The
   # presets use only the knobs below - they are a head start, not a new mechanism.
   #
   # Policy backend: "local" (in-process Python engine, the default) or "opa"
