@@ -383,7 +383,7 @@ tests/             one module per package, plus the gated Temporal/Postgres/E2E 
 tests/fixtures/    spec-derived webhook payloads pinning every payload mapping
 migrations/        Alembic migrations — the sole schema owner on Postgres; SQLite dev uses init_schema/create_all
 examples/          reference Claude Code runner workflow
-scripts/           demo.py (offline narrated demo) + the live E2E smoke test
+scripts/           demo.py (offline narrated demo), the live E2E smoke test, wait_for_temporal.py (real-server CI readiness)
 docs/              quickstart
 ```
 
@@ -397,7 +397,7 @@ Foundry takes its name from the Mandalorian forge, where the Armorer works raw b
 
 ## Where it's going
 
-The loop is complete, closed (the agent now fixes its own failing CI under governance), multi-vendor on every side (three trackers, two SCMs, five agent providers), visible (the dashboard), deployable (`docker compose up`, Alembic migrations, Postgres in CI) and released (GHCR image on tags). What's left is hardening against live traffic: finishing the Temporal driver against a real server and battle-testing the webhook payload mappings with the E2E smoke script. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
+The loop is complete, closed (the agent now fixes its own failing CI under governance), multi-vendor on every side (three trackers, two SCMs, five agent providers), visible (the dashboard), deployable (`docker compose up`, Alembic migrations, Postgres in CI) and released (GHCR image on tags). The durable Temporal driver is now CI-proven end-to-end against a real `temporalio/auto-setup` server (the docker-compose Temporal profile), not just the in-memory time-skipping harness. What's left is hardening against live traffic: battle-testing the webhook payload mappings with the E2E smoke script. The long game, per the vision, is to grow this from ticket-to-PR into a full Engineering OS: planning, build, test, deploy, observability and incidents, all under the same control plane. One honest loop first, though.
 
 ---
 
