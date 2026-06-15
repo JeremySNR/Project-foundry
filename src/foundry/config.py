@@ -131,6 +131,18 @@ class Settings:
     oidc_jwks_uri: str | None = None
     oidc_algorithms: tuple[str, ...] = ("RS256",)
     oidc_leeway_seconds: int = 60
+    # IdP-group -> approver-role mapping (issue #34). When an approval is
+    # authenticated via OIDC, the approver *identity* is read from the verified
+    # subject_claim (falling back to ``sub`` when absent), never the request
+    # body, and roles are the union of the committed ``approvers`` grant for that
+    # identity and the roles mapped from the verified group_claim through
+    # ``oidc_group_role_map`` ({group -> roles}). All committed config; only the
+    # cryptographically-verified claims come from the token (invariant #5).
+    # Empty map => no group-derived roles (group-claim binding still applies the
+    # verified identity, just grants no extra roles).
+    oidc_subject_claim: str = "email"
+    oidc_group_claim: str = "groups"
+    oidc_group_role_map: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     # --- webhook replay protection (behaviour: yaml) ---
     # How long a processed delivery id is remembered in foundry_webhook_deliveries
@@ -434,6 +446,23 @@ class Settings:
             raise ValueError(
                 f"oidc.leeway_seconds must be >= 0, got {self.oidc_leeway_seconds}"
             )
+        # Role names in the IdP-group map must be real ApprovalRoles, validated at
+        # load time so a typo is a deploy-time error, not a silently-empty grant.
+        if self.oidc_group_role_map:
+            from foundry.schemas.common import ApprovalRole
+
+            valid = {r.value for r in ApprovalRole}
+            for group, roles in self.oidc_group_role_map:
+                bad = [r for r in roles if r not in valid]
+                if bad:
+                    raise ValueError(
+                        f"oidc.group_role_map group {group!r} lists unknown "
+                        f"approval roles {bad}; valid roles are {sorted(valid)}"
+                    )
+            if not self.oidc_subject_claim:
+                raise ValueError("oidc.subject_claim must be non-empty")
+            if not self.oidc_group_claim:
+                raise ValueError("oidc.group_claim must be non-empty")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -455,6 +484,11 @@ class Settings:
             if email == user:
                 return frozenset(roles)
         return frozenset()
+
+    @property
+    def group_role_map(self) -> dict[str, tuple[str, ...]]:
+        """IdP group name -> approver roles that membership grants."""
+        return {group: roles for group, roles in self.oidc_group_role_map}
 
     @property
     def sensitive_globs_map(self) -> dict[str, tuple[str, ...]]:
@@ -631,6 +665,15 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["oidc_algorithms"] = tuple(oidc["algorithms"] or [])
     if "leeway_seconds" in oidc:
         out["oidc_leeway_seconds"] = int(oidc["leeway_seconds"])
+    if "subject_claim" in oidc:
+        out["oidc_subject_claim"] = str(oidc["subject_claim"])
+    if "group_claim" in oidc:
+        out["oidc_group_claim"] = str(oidc["group_claim"])
+    if "group_role_map" in oidc:
+        out["oidc_group_role_map"] = tuple(
+            (str(group), tuple(str(r) for r in (roles or [])))
+            for group, roles in (oidc["group_role_map"] or {}).items()
+        )
 
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
@@ -701,6 +744,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_OIDC_ISSUER": "oidc_issuer",
         "FOUNDRY_OIDC_AUDIENCE": "oidc_audience",
         "FOUNDRY_OIDC_JWKS_URI": "oidc_jwks_uri",
+        "FOUNDRY_OIDC_SUBJECT_CLAIM": "oidc_subject_claim",
+        "FOUNDRY_OIDC_GROUP_CLAIM": "oidc_group_claim",
     }
     for env_key, field_name in mapping.items():
         if env_key in env:

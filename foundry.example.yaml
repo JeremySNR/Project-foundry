@@ -227,6 +227,23 @@ auth:
   #   jwks_uri: "https://login.example.com/.well-known/jwks.json"
   #   algorithms: ["RS256"]   # signing-algorithm allow-list (no alg:none / HS confusion)
   #   leeway_seconds: 60      # clock-skew tolerance for exp/nbf
+  #
+  #   # --- approver identity + IdP-group -> role mapping (issue #34) ---
+  #   # When an approval comes in over an OIDC-authenticated REST call, the
+  #   # approver IDENTITY is taken from the VERIFIED token (subject_claim below,
+  #   # falling back to "sub"), NOT the request body - a token holder can't
+  #   # approve as someone else. ROLES are the committed `approval.approvers`
+  #   # grant for that verified identity UNIONED with the roles the verified
+  #   # group_claim maps to via group_role_map. The map is committed config; only
+  #   # the cryptographically-signed claims come from the token (invariant #5).
+  #   # Env overrides for the claim names: FOUNDRY_OIDC_SUBJECT_CLAIM /
+  #   # FOUNDRY_OIDC_GROUP_CLAIM (the map itself is YAML-only).
+  #   subject_claim: "email"   # verified claim that identifies the approver
+  #   group_claim: "groups"    # verified claim carrying IdP group membership
+  #   group_role_map:          # IdP group -> approver roles membership grants
+  #     eng-leads: ["engineering"]
+  #     security-team: ["security"]
+  #     qa-guild: ["qa"]
 
 notifications:
   # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status
