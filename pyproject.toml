@@ -89,6 +89,7 @@ test = [
 
 [project.scripts]
 foundry-catalog = "foundry.catalog.cli:main"
+foundry-evidence = "foundry.compliance.cli:main"
 foundry-memory = "foundry.memory.cli:main"
 
 [project.urls]
