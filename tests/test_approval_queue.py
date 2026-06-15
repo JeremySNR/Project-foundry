@@ -34,6 +34,7 @@ def _add_run(
     *,
     status: RunStatus,
     updated_at: datetime,
+    created_at: datetime | None = None,
     risk: OverallRisk | None = None,
     current_step: str | None = None,
 ) -> str:
@@ -49,7 +50,7 @@ def _add_run(
             trigger_type="label",
             risk_level=risk,
             current_step=current_step,
-            created_at=updated_at,
+            created_at=created_at if created_at is not None else updated_at,
             updated_at=updated_at,
         )
     )
@@ -125,9 +126,9 @@ def test_review_required_dates_from_risk_escalated(session_factory) -> None:
     assert q["runs"][0]["waiting_seconds"] == 1800
 
 
-def test_falls_back_to_updated_at_without_wait_event(session_factory) -> None:
-    """needs_clarification (and remediation-denied review) have no wait-start
-    event - the run's last-touch time is when it entered the parked state."""
+def test_needs_clarification_dates_from_created_at(session_factory) -> None:
+    """needs_clarification is only ever parked at intake and has no transition
+    event - it dates from the run's immutable created_at."""
     with session_factory() as session:
         _add_run(
             session,
@@ -138,6 +139,107 @@ def test_falls_back_to_updated_at_without_wait_event(session_factory) -> None:
         q = approval_queue(session, now=NOW)
     assert q["count"] == 1
     assert q["runs"][0]["waiting_seconds"] == 2 * 3600
+
+
+def test_marker_less_state_uses_created_at_not_drifted_updated_at(
+    session_factory,
+) -> None:
+    """The core fix: updated_at carries onupdate=utcnow, so a later row touch
+    must not reset the SLA clock for a state with no transition marker. The
+    immutable created_at is the faithful wait-start."""
+    with session_factory() as session:
+        # Parked at intake 4h ago; a later write (e.g. a tracker write-back)
+        # advanced updated_at to 30m ago. The wait is the 4h, not the 30m.
+        _add_run(
+            session,
+            status=RunStatus.NEEDS_CLARIFICATION,
+            created_at=NOW - timedelta(hours=4),
+            updated_at=NOW - timedelta(minutes=30),
+        )
+        session.commit()
+        q = approval_queue(session, now=NOW)
+    assert q["runs"][0]["waiting_seconds"] == 4 * 3600
+
+
+def test_review_required_dates_from_remediation_denied_run_blocked(
+    session_factory,
+) -> None:
+    """A remediation-denied REVIEW_REQUIRED is marked by RUN_BLOCKED, not a
+    RISK_ESCALATED; its wait dates from that transition, not updated_at."""
+    with session_factory() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.REVIEW_REQUIRED,
+            created_at=NOW - timedelta(hours=8),
+            updated_at=NOW - timedelta(minutes=5),
+        )
+        _add_event(
+            session, rid, AuditEventType.RUN_BLOCKED, NOW - timedelta(hours=2)
+        )
+        session.commit()
+        q = approval_queue(session, now=NOW)
+    assert q["runs"][0]["waiting_seconds"] == 2 * 3600
+
+
+def test_review_required_dates_from_failed_redispatch_agent_failed(
+    session_factory,
+) -> None:
+    """A failed re-dispatch hands the PR back to a human (REVIEW_REQUIRED),
+    marked by AGENT_FAILED."""
+    with session_factory() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.REVIEW_REQUIRED,
+            updated_at=NOW - timedelta(hours=9),
+        )
+        _add_event(
+            session, rid, AuditEventType.AGENT_FAILED, NOW - timedelta(hours=1)
+        )
+        session.commit()
+        q = approval_queue(session, now=NOW)
+    assert q["runs"][0]["waiting_seconds"] == 3600
+
+
+def test_review_required_takes_latest_of_multiple_markers(session_factory) -> None:
+    """A run can escalate, be retried, then re-escalate - the *current* wait is
+    the latest transition marker, not the first."""
+    with session_factory() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.REVIEW_REQUIRED,
+            updated_at=NOW - timedelta(hours=6),
+        )
+        # An early escalation, a later denied remediation. The clock is the
+        # latest (the RUN_BLOCKED 45m ago), not the 6h-old RISK_ESCALATED.
+        _add_event(
+            session, rid, AuditEventType.RISK_ESCALATED, NOW - timedelta(hours=6)
+        )
+        _add_event(
+            session, rid, AuditEventType.RUN_BLOCKED, NOW - timedelta(minutes=45)
+        )
+        session.commit()
+        q = approval_queue(session, now=NOW)
+    assert q["runs"][0]["waiting_seconds"] == 45 * 60
+
+
+def test_marker_only_dates_the_status_it_belongs_to(session_factory) -> None:
+    """The per-status mapping is defensive: a generic RUN_BLOCKED does not date
+    a WAITING_APPROVAL run (whose only marker is APPROVAL_REQUESTED)."""
+    with session_factory() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.WAITING_APPROVAL,
+            created_at=NOW - timedelta(hours=3),
+            updated_at=NOW - timedelta(hours=3),
+        )
+        # A stray RUN_BLOCKED (not a marker for WAITING_APPROVAL) must be ignored
+        # - the wait falls back to created_at, not this 10m-old event.
+        _add_event(
+            session, rid, AuditEventType.RUN_BLOCKED, NOW - timedelta(minutes=10)
+        )
+        session.commit()
+        q = approval_queue(session, now=NOW)
+    assert q["runs"][0]["waiting_seconds"] == 3 * 3600
 
 
 def test_only_human_wait_states_are_queued(session_factory) -> None:

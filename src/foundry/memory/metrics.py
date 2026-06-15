@@ -41,17 +41,36 @@ HUMAN_WAIT_STATUSES = (
     RunStatus.NEEDS_CLARIFICATION,
 )
 
-# Audit events that mark a run *entering* a human-wait state. The approval-queue
-# clock is dated from when the human was first asked, not from the run row's
-# ``updated_at``: an N-of-M partial sign-off advances ``updated_at`` (it emits an
-# APPROVAL_GRANTED while the run stays parked) and must not silently reset an
-# SLA clock. APPROVAL_REQUESTED parks WAITING_APPROVAL at intake; RISK_ESCALATED
-# parks a diff-aware REVIEW_REQUIRED. States with no such marker (e.g.
-# NEEDS_CLARIFICATION, or a remediation-denied REVIEW_REQUIRED) fall back to
-# ``updated_at``, which for a parked run is when it entered the state.
-_WAIT_START_EVENTS = (
-    AuditEventType.APPROVAL_REQUESTED,
-    AuditEventType.RISK_ESCALATED,
+# Audit events that mark a run *entering* its current human-wait state, mapped
+# per status. The approval-queue clock is dated from the *latest* such event -
+# i.e. when the run last transitioned into the state it is parked in - not from
+# the run row's ``updated_at``. ``updated_at`` carries ``onupdate=utcnow``, so
+# *any* later row touch (an N-of-M partial sign-off's APPROVAL_GRANTED, a
+# tracker write-back, ...) advances it and would silently reset the SLA clock.
+# Audit rows are immutable and never re-dated, so the transition event is the
+# faithful wait-start. The markers per parked status:
+#   - WAITING_APPROVAL parks at intake, marked by APPROVAL_REQUESTED.
+#   - REVIEW_REQUIRED is reached by several paths, each leaving a marker: a
+#     diff-aware risk escalation (sensitive area / path-required role / diff too
+#     large) -> RISK_ESCALATED; a failed re-dispatch handing the PR back to a
+#     human -> AGENT_FAILED; a denied remediation -> RUN_BLOCKED. The latest of
+#     these is the current entry (a run can escalate, be retried, re-escalate).
+#   - NEEDS_CLARIFICATION is only ever parked at intake and has no dedicated
+#     transition event, so it dates from the run's immutable ``created_at``
+#     (exact - intake is when it entered the state), handled by the caller.
+_WAIT_START_EVENTS_BY_STATUS: dict[RunStatus, tuple[AuditEventType, ...]] = {
+    RunStatus.WAITING_APPROVAL: (AuditEventType.APPROVAL_REQUESTED,),
+    RunStatus.REVIEW_REQUIRED: (
+        AuditEventType.RISK_ESCALATED,
+        AuditEventType.AGENT_FAILED,
+        AuditEventType.RUN_BLOCKED,
+    ),
+    RunStatus.NEEDS_CLARIFICATION: (),
+}
+
+# The flat set of every marker event, for the single audit-trail query.
+_ALL_WAIT_START_EVENTS = tuple(
+    {e for events in _WAIT_START_EVENTS_BY_STATUS.values() for e in events}
 )
 
 
@@ -296,28 +315,49 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _wait_since_map(session, run_ids: list[str]) -> dict[str, datetime]:
-    """For each run id, the time it entered its current human-wait state.
+def _wait_since_map(session, runs: list[FoundryRun]) -> dict[str, datetime]:
+    """For each run, the time it last transitioned into its current human-wait
+    state - the latest marker event *valid for that run's status*.
 
-    The latest :data:`_WAIT_START_EVENTS` audit event for the run. Runs without
-    one are simply absent from the map and the caller falls back to
-    ``updated_at``.
+    Markers are looked up per status (:data:`_WAIT_START_EVENTS_BY_STATUS`) so a
+    generic event (e.g. ``RUN_BLOCKED``) only dates the state it actually marks
+    the entry of. Runs whose status has no marker - or that carry none yet - are
+    absent from the map; the caller falls back to the run's immutable
+    ``created_at``.
     """
-    if not run_ids:
+    if not runs:
         return {}
+    # Latest created_at per (run, event_type) over just the marker event types.
     rows = (
         session.query(
             FoundryAuditEvent.run_id,
+            FoundryAuditEvent.event_type,
             func.max(FoundryAuditEvent.created_at),
         )
         .filter(
-            FoundryAuditEvent.run_id.in_(run_ids),
-            FoundryAuditEvent.event_type.in_(_WAIT_START_EVENTS),
+            FoundryAuditEvent.run_id.in_([r.id for r in runs]),
+            FoundryAuditEvent.event_type.in_(_ALL_WAIT_START_EVENTS),
         )
-        .group_by(FoundryAuditEvent.run_id)
+        .group_by(FoundryAuditEvent.run_id, FoundryAuditEvent.event_type)
         .all()
     )
-    return {run_id: created_at for run_id, created_at in rows if created_at is not None}
+    latest_by_run_event: dict[tuple[str, AuditEventType], datetime] = {
+        (run_id, event_type): created_at
+        for run_id, event_type, created_at in rows
+        if created_at is not None
+    }
+
+    wait_since: dict[str, datetime] = {}
+    for run in runs:
+        markers = _WAIT_START_EVENTS_BY_STATUS.get(run.status, ())
+        candidates = [
+            latest_by_run_event[(run.id, et)]
+            for et in markers
+            if (run.id, et) in latest_by_run_event
+        ]
+        if candidates:
+            wait_since[run.id] = max(candidates)
+    return wait_since
 
 
 def approval_queue(
@@ -328,7 +368,8 @@ def approval_queue(
 
     Every run currently parked on a person (:data:`HUMAN_WAIT_STATUSES`), oldest
     first, each with how long it has been waiting (``waiting_seconds``, derived
-    from the audit trail - see :data:`_WAIT_START_EVENTS`). When ``sla_seconds``
+    from the audit trail - see :data:`_WAIT_START_EVENTS_BY_STATUS`). When
+    ``sla_seconds``
     is set, runs waiting at least that long are flagged ``sla_breached`` and
     counted in the ``sla_breaches`` summary; with no SLA the breach signal is
     inert (``sla_breaches`` is 0), matching the historical behaviour.
@@ -339,11 +380,15 @@ def approval_queue(
         .filter(FoundryRun.status.in_(HUMAN_WAIT_STATUSES))
         .all()
     )
-    wait_since = _wait_since_map(session, [r.id for r in runs])
+    wait_since = _wait_since_map(session, runs)
 
     entries: list[dict] = []
     for run in runs:
-        since = wait_since.get(run.id) or run.updated_at
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when the run's status carries no transition marker - today only
+        # NEEDS_CLARIFICATION, which is always parked at intake, so created_at is
+        # exactly when it entered the state.
+        since = wait_since.get(run.id) or run.created_at
         # Clamp at 0: a future-dated row (clock skew) is not negative wait time.
         waited = max(0, int((now - _as_utc(since)).total_seconds()))
         breached = sla_seconds is not None and waited >= sla_seconds
