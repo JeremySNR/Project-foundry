@@ -381,6 +381,80 @@ def test_fleet_counts_live_and_terminal_states(client) -> None:
     assert body["active_cost_usd"] is None
 
 
+def _client_with(**kwargs) -> TestClient:
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+    orch = FoundryOrchestrator(sf, provider=InMemoryFakeProvider())
+    return TestClient(
+        create_app(
+            webhook_secret=SECRET,
+            session_factory=sf,
+            orchestrator=orch,
+            approvers=APPROVERS,
+            api_token=API_TOKEN,
+            **kwargs,
+        )
+    )
+
+
+def test_fleet_includes_approval_queue_summary(client) -> None:
+    # No SLA configured by default: the breach signal is inert, oldest is None.
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["approval_sla_seconds"] is None
+    assert body["approvals_breaching_sla"] == 0
+    assert body["oldest_wait_seconds"] is None
+
+    # Park a run on a human; the strip now reports a non-negative oldest wait.
+    _post_webhook(client, _ready_payload("issue-w", "LIN-400"), delivery="d-w")
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["awaiting_human"] == 1
+    assert body["oldest_wait_seconds"] is not None
+    assert body["oldest_wait_seconds"] >= 0
+
+
+def test_approvals_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/approvals").status_code == 401
+    assert (
+        client.get(
+            "/metrics/approvals", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_approvals_empty_database(client) -> None:
+    body = client.get("/metrics/approvals", headers=AUTH).json()
+    assert body["count"] == 0
+    assert body["runs"] == []
+    assert body["oldest_wait_seconds"] is None
+    assert body["sla_breaches"] == 0
+    assert body["sla_seconds"] is None
+
+
+def test_approvals_lists_parked_run(client) -> None:
+    _post_webhook(client, _ready_payload("issue-w", "LIN-400"), delivery="d-w")
+    body = client.get("/metrics/approvals", headers=AUTH).json()
+    assert body["count"] == 1
+    entry = body["runs"][0]
+    assert entry["linear_issue_key"] == "LIN-400"
+    assert entry["status"] == "waiting_approval"
+    assert entry["waiting_seconds"] >= 0
+    assert entry["sla_breached"] is False  # no SLA configured
+
+
+def test_approvals_reflects_configured_sla() -> None:
+    client = _client_with(approval_sla_seconds=14_400)  # 4h
+    _post_webhook(client, _ready_payload("issue-w", "LIN-400"), delivery="d-w")
+    body = client.get("/metrics/approvals", headers=AUTH).json()
+    assert body["sla_seconds"] == 14_400
+    # A just-parked run hasn't breached a 4h SLA.
+    assert body["sla_breaches"] == 0
+    assert body["runs"][0]["sla_breached"] is False
+    fleet = client.get("/metrics/fleet", headers=AUTH).json()
+    assert fleet["approval_sla_seconds"] == 14_400
+
+
 def test_final_summary_appears_in_timeline(client) -> None:
     _run_to_merged(client)
     run_id = _latest_run_id(client)

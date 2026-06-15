@@ -14,7 +14,13 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
 
-from foundry.db.models import FoundryAgentJob, FoundryRun, FoundryRunOutcome
+from foundry.db.models import (
+    AuditEventType,
+    FoundryAgentJob,
+    FoundryAuditEvent,
+    FoundryRun,
+    FoundryRunOutcome,
+)
 from foundry.memory.priors import routing_prior_rows, smoothed_confidence
 from foundry.schemas.common import (
     ACTIVE_RUN_STATUSES,
@@ -25,6 +31,28 @@ from foundry.schemas.common import (
 # Buckets supported by ``delivery_trends``. Kept small and explicit so the
 # endpoint can validate the query param without trusting caller input.
 TREND_BUCKETS = ("day", "week")
+
+# Run statuses that mean "parked on a human" - the approval queue. Mirrors the
+# dashboard's AWAITING set and ``fleet_status``'s ``awaiting_human`` so the
+# three views can never drift on what counts as waiting on a person.
+HUMAN_WAIT_STATUSES = (
+    RunStatus.WAITING_APPROVAL,
+    RunStatus.REVIEW_REQUIRED,
+    RunStatus.NEEDS_CLARIFICATION,
+)
+
+# Audit events that mark a run *entering* a human-wait state. The approval-queue
+# clock is dated from when the human was first asked, not from the run row's
+# ``updated_at``: an N-of-M partial sign-off advances ``updated_at`` (it emits an
+# APPROVAL_GRANTED while the run stays parked) and must not silently reset an
+# SLA clock. APPROVAL_REQUESTED parks WAITING_APPROVAL at intake; RISK_ESCALATED
+# parks a diff-aware REVIEW_REQUIRED. States with no such marker (e.g.
+# NEEDS_CLARIFICATION, or a remediation-denied REVIEW_REQUIRED) fall back to
+# ``updated_at``, which for a parked run is when it entered the state.
+_WAIT_START_EVENTS = (
+    AuditEventType.APPROVAL_REQUESTED,
+    AuditEventType.RISK_ESCALATED,
+)
 
 
 def _percentile(sorted_values: list[int], fraction: float) -> int | None:
@@ -261,7 +289,93 @@ def delivery_trends(session, *, since: datetime, bucket: str = "week") -> dict:
     }
 
 
-def fleet_status(session) -> dict:
+def _as_utc(dt: datetime) -> datetime:
+    """Normalise a stored timestamp to UTC-aware (SQLite hands them back naive)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _wait_since_map(session, run_ids: list[str]) -> dict[str, datetime]:
+    """For each run id, the time it entered its current human-wait state.
+
+    The latest :data:`_WAIT_START_EVENTS` audit event for the run. Runs without
+    one are simply absent from the map and the caller falls back to
+    ``updated_at``.
+    """
+    if not run_ids:
+        return {}
+    rows = (
+        session.query(
+            FoundryAuditEvent.run_id,
+            func.max(FoundryAuditEvent.created_at),
+        )
+        .filter(
+            FoundryAuditEvent.run_id.in_(run_ids),
+            FoundryAuditEvent.event_type.in_(_WAIT_START_EVENTS),
+        )
+        .group_by(FoundryAuditEvent.run_id)
+        .all()
+    )
+    return {run_id: created_at for run_id, created_at in rows if created_at is not None}
+
+
+def approval_queue(
+    session, *, now: datetime | None = None, sla_seconds: int | None = None
+) -> dict:
+    """The human-approval queue with per-run wait age - the drill-down behind
+    the fleet strip's ``awaiting_human`` count.
+
+    Every run currently parked on a person (:data:`HUMAN_WAIT_STATUSES`), oldest
+    first, each with how long it has been waiting (``waiting_seconds``, derived
+    from the audit trail - see :data:`_WAIT_START_EVENTS`). When ``sla_seconds``
+    is set, runs waiting at least that long are flagged ``sla_breached`` and
+    counted in the ``sla_breaches`` summary; with no SLA the breach signal is
+    inert (``sla_breaches`` is 0), matching the historical behaviour.
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(HUMAN_WAIT_STATUSES))
+        .all()
+    )
+    wait_since = _wait_since_map(session, [r.id for r in runs])
+
+    entries: list[dict] = []
+    for run in runs:
+        since = wait_since.get(run.id) or run.updated_at
+        # Clamp at 0: a future-dated row (clock skew) is not negative wait time.
+        waited = max(0, int((now - _as_utc(since)).total_seconds()))
+        breached = sla_seconds is not None and waited >= sla_seconds
+        status = run.status.value if isinstance(run.status, RunStatus) else str(run.status)
+        entries.append(
+            {
+                "run_id": run.id,
+                "linear_issue_key": run.linear_issue_key,
+                "status": status,
+                "current_step": run.current_step,
+                "risk_level": run.risk_level.value if run.risk_level is not None else None,
+                "waiting_since": _as_utc(since).isoformat(),
+                "waiting_seconds": waited,
+                "sla_breached": breached,
+            }
+        )
+
+    entries.sort(key=lambda e: e["waiting_seconds"], reverse=True)
+    breaches = sum(1 for e in entries if e["sla_breached"])
+    return {
+        "now": now.isoformat(),
+        "sla_seconds": sla_seconds,
+        "count": len(entries),
+        "oldest_wait_seconds": entries[0]["waiting_seconds"] if entries else None,
+        "sla_breaches": breaches,
+        "runs": entries,
+    }
+
+
+def fleet_status(
+    session, *, sla_seconds: int | None = None, now: datetime | None = None
+) -> dict:
     """Live operational snapshot — every run's *current* state across the org.
 
     This is the "what are the agents doing right now" view the historical
@@ -309,11 +423,20 @@ def fleet_status(session) -> dict:
         .scalar()
     )
 
+    # Turn the bare ``awaiting_human`` count into an actionable signal: how long
+    # has the oldest parked run been waiting, and how many have breached the SLA.
+    # Reuses the same derivation the GET /metrics/approvals drill-down serves, so
+    # the strip summary and the queue list can never disagree.
+    queue = approval_queue(session, now=now, sla_seconds=sla_seconds)
+
     return {
         "total_runs": sum(by_status.values()),
         "runs_active": _count(*ACTIVE_RUN_STATUSES),
         "runs_terminal": _count(*TERMINAL_RUN_STATUSES),
         "awaiting_human": awaiting_human,
+        "oldest_wait_seconds": queue["oldest_wait_seconds"],
+        "approval_sla_seconds": sla_seconds,
+        "approvals_breaching_sla": queue["sla_breaches"],
         "agents_running": _count(RunStatus.AGENT_RUNNING),
         "prs_open": _count(RunStatus.PR_OPEN),
         "active_cost_usd": round(active_cost, 2) if active_cost is not None else None,
