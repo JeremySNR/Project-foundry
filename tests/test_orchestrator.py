@@ -6,7 +6,11 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from foundry.agents.manual import InMemoryFakeProvider
-from foundry.connectors import GitHubConnector, InMemoryIssueTracker
+from foundry.connectors import (
+    GitHubConnector,
+    InMemoryIssueTracker,
+    InMemoryNotifier,
+)
 from foundry.db import (
     FoundryAgentJob,
     FoundryArtifact,
@@ -2224,3 +2228,81 @@ def test_min_approvals_records_each_signoff_in_audit(session_factory) -> None:
             .all()
         )
     assert len(records) == 2
+
+
+# --- N-of-M mid-flow re-ping (issue #31) -------------------------------------
+
+
+def test_partial_signoff_nudges_next_approver(session_factory) -> None:
+    """A partial N-of-M sign-off re-pings the next approver on both surfaces: a
+    tracker comment and a chat progress nudge carrying the (collected/required)
+    counts and who just signed (issue #31)."""
+    tracker = InMemoryIssueTracker()
+    notifier = InMemoryNotifier()
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        issue_tracker=tracker,
+        notifier=notifier,
+        min_approvals=2,
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    # comments[0] is the intake analysis comment; the nudge is the next one.
+    assert len(tracker.comments["i-1"]) == 1
+    assert not notifier.progress  # nothing nudged before the first sign-off
+
+    orch.approve(run_id, user="alice@example.com")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    # Chat progress nudge.
+    assert len(notifier.progress) == 1
+    nudge = notifier.progress[0]
+    assert nudge.issue_id == "i-1"
+    assert (nudge.collected, nudge.required) == (1, 2)
+    assert nudge.last_approver == "alice@example.com"
+    assert nudge.remaining == 1
+
+    # Tracker progress comment.
+    assert len(tracker.comments["i-1"]) == 2
+    progress_comment = tracker.comments["i-1"][1]
+    assert "approval progress" in progress_comment.lower()
+    assert "1 of 2 distinct sign-offs" in progress_comment
+    assert "alice@example.com" in progress_comment
+
+
+def test_final_signoff_does_not_nudge(session_factory) -> None:
+    """The sign-off that *meets* the threshold advances the run to APPROVED and
+    must not also fire a 'more needed' progress nudge."""
+    notifier = InMemoryNotifier()
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        notifier=notifier,
+        min_approvals=2,
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="alice@example.com")
+    orch.approve(run_id, user="bob@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+    # Exactly one nudge (after the first sign-off), none after the final one.
+    assert len(notifier.progress) == 1
+
+
+def test_single_approval_never_nudges(session_factory) -> None:
+    """Default ``min_approvals=1`` never reaches the partial branch, so no
+    progress nudge is sent and the tracker keeps only its intake comment - the
+    single-approval path is byte-for-byte unchanged (invariant #1)."""
+    tracker = InMemoryIssueTracker()
+    notifier = InMemoryNotifier()
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        issue_tracker=tracker,
+        notifier=notifier,
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+    assert notifier.progress == []
+    assert len(tracker.comments["i-1"]) == 1  # intake comment only

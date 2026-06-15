@@ -140,6 +140,34 @@ def format_analysis_comment(
     return "\n".join(lines)
 
 
+def format_approval_progress_comment(
+    *, collected: int, required: int, last_approver: str
+) -> str:
+    """Re-ping the next approver after a partial N-of-M sign-off (issue #31).
+
+    The intake comment tells approvers how many *distinct* sign-offs a run needs
+    up front; this nudges the *next* approver once one has landed but the run is
+    still short, so a two-person-rule run doesn't go silent at ``(1/2)`` between
+    sign-offs. Presentation-only - it never advances or releases the run, the
+    orchestrator's count check still gates that.
+    """
+    remaining = max(0, required - collected)
+    plural = "s" if remaining != 1 else ""
+    return "\n".join(
+        [
+            "**Foundry: approval progress.**",
+            "",
+            f"- {collected} of {required} distinct sign-offs collected "
+            f"(latest: {last_approver})",
+            f"- {remaining} more approver{plural} required before this run can "
+            "proceed",
+            "",
+            "Reply to proceed:",
+            "`/foundry approve` · `/foundry reject` · `/foundry stop`",
+        ]
+    )
+
+
 def format_cursor_delegation(agent_instructions: str) -> str:
     """The @Cursor delegation comment that hands approved work to Cursor.
 

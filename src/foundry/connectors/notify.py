@@ -46,12 +46,37 @@ class ApprovalRequest:
     min_approvals: int = 1
 
 
+@dataclass(frozen=True)
+class ApprovalProgress:
+    """A mid-flow nudge for the *next* approver of an N-of-M run (issue #31).
+
+    The first approval prompt (``ApprovalRequest``) tells approvers up front how
+    many *distinct* sign-offs a run needs. Once one lands but the run is still
+    short, this is what re-pings the next approver - so a two-person-rule run
+    doesn't go silent between sign-offs. ``collected``/``required`` are the
+    distinct-approver count so far and the effective minimum; ``last_approver``
+    is who just signed.
+    """
+
+    issue_id: str
+    issue_key: str | None
+    collected: int
+    required: int
+    last_approver: str
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.required - self.collected)
+
+
 class RunNotifier(Protocol):
     def approval_requested(self, request: ApprovalRequest) -> None: ...
 
     def status_changed(
         self, issue_id: str, issue_key: str | None, status: RunStatus
     ) -> None: ...
+
+    def approval_progress(self, progress: ApprovalProgress) -> None: ...
 
 
 @dataclass
@@ -60,6 +85,7 @@ class InMemoryNotifier:
 
     approvals: list[ApprovalRequest] = field(default_factory=list)
     statuses: list[tuple[str, str | None, RunStatus]] = field(default_factory=list)
+    progress: list[ApprovalProgress] = field(default_factory=list)
 
     def approval_requested(self, request: ApprovalRequest) -> None:
         self.approvals.append(request)
@@ -68,3 +94,6 @@ class InMemoryNotifier:
         self, issue_id: str, issue_key: str | None, status: RunStatus
     ) -> None:
         self.statuses.append((issue_id, issue_key, status))
+
+    def approval_progress(self, progress: ApprovalProgress) -> None:
+        self.progress.append(progress)
