@@ -57,6 +57,22 @@ Foundry fails closed by design, but you still need to deploy it sensibly:
   group that grants the wrong role still cannot approve sensitive work. The
   static-token path is unchanged: identity is the body `user`, roles come from
   `approval.approvers`, and the IdP-group map plays no part.
+- **Dashboard browser login / SSO (optional).** When the browser-login parts
+  are configured (`auth.oidc` `client_id` / `authorization_endpoint` /
+  `token_endpoint` / `redirect_uri`) plus the env-only secrets
+  `FOUNDRY_OIDC_CLIENT_SECRET` and `FOUNDRY_SESSION_SECRET`, an operator can sign
+  in to `/dashboard` through your IdP (OAuth2 authorization-code with PKCE)
+  instead of pasting an API token. The flow enforces a CSRF `state`, an OIDC
+  `nonce` (anti-replay) and PKCE `S256`, and verifies the returned id_token with
+  the same hardened verifier (audience = the client id). Success mints a
+  **signed session cookie** (`HttpOnly`, `SameSite=Lax`, `Secure` unless
+  `cookie_secure: false` for local HTTP) carrying only the verified subject —
+  it is HMAC-signed for integrity and expiry, **not** encryption, so nothing
+  secret is stored in it. The session cookie authenticates the dashboard's
+  **read** calls; it is deliberately **rejected on the approval endpoint**, so a
+  cookie a browser sends automatically can never be tricked (CSRF) into driving
+  an approval — approvals still require a bearer token or a signed webhook. Keep
+  `FOUNDRY_SESSION_SECRET` secret and rotate it to invalidate all live sessions.
 - Terminate TLS in front of the API; webhook signatures authenticate payloads,
   not transport.
 - Keep the approver → roles mapping in reviewed, committed YAML.
