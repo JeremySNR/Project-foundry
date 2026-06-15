@@ -577,3 +577,90 @@ def test_advisory_action_never_needs_approval() -> None:
     assert not any(
         "recorded human approval" in r for r in decision.reasons
     )
+
+
+# --- per-repo required approval roles (issue #31) ------------------------------
+
+
+def test_required_approvals_unions_risk_and_repo_roles() -> None:
+    """The shared helper adds per-repo roles to the risk-derived ones."""
+    from foundry.policy.engine import PolicyRisk, required_approvals
+
+    # No risk areas, but the routed repo demands security.
+    assert required_approvals(PolicyRisk(overall_risk="low"), [ApprovalRole.SECURITY]) == [
+        ApprovalRole.SECURITY
+    ]
+    # Auth risk derives engineering; the repo additionally demands security.
+    assert required_approvals(
+        PolicyRisk(overall_risk="high", auth=True), [ApprovalRole.SECURITY]
+    ) == [ApprovalRole.ENGINEERING, ApprovalRole.SECURITY]
+    # A per-repo role that duplicates a risk-derived one is not doubled.
+    assert required_approvals(
+        PolicyRisk(overall_risk="medium", auth=True), [ApprovalRole.ENGINEERING]
+    ) == [ApprovalRole.ENGINEERING]
+    # No repo roles -> unchanged risk-derived behaviour.
+    assert required_approvals(PolicyRisk(overall_risk="low")) == []
+
+
+def test_repo_required_role_blocks_until_signed() -> None:
+    """A repo-scoped role denies dispatch until that role approves - even when
+    the risk classifier flagged nothing sensitive (issue #31)."""
+    payload = PolicyInput.model_validate(
+        {
+            "action": "start_agent",
+            "ticket": {"readiness": "ready"},
+            "risk": {"overall_risk": "low"},
+            "repo": {"name": "payments-service", "confidence": 90,
+                     "required_roles": ["security"]},
+            "approval": {},
+            "approval_present": True,
+        }
+    )
+    denied = _engine().evaluate(payload)
+    assert denied.allowed is False
+    assert ApprovalRole.SECURITY in denied.required_approvals
+    assert any("'security' approval, which is missing" in r for r in denied.reasons)
+
+    payload.approval = {"security": True}
+    allowed = _engine().evaluate(payload)
+    assert allowed.allowed is True
+    # Low-risk work reaches draft_pr once the per-repo role is signed.
+    assert allowed.allowed_agent_mode is AgentMode.DRAFT_PR
+
+
+def test_repo_required_role_is_strictly_additive() -> None:
+    """Per-repo roles can only *add* a requirement, never drop a risk-derived
+    one (invariant #1): auth still needs engineering even with a repo security
+    rule, and granting only the repo role does not unlock the run."""
+    payload = PolicyInput.model_validate(
+        {
+            "action": "start_agent",
+            "ticket": {"readiness": "ready"},
+            "risk": {"overall_risk": "high", "auth": True},
+            "repo": {"confidence": 90, "required_roles": ["security"]},
+            "approval": {"security": True},
+            "approval_present": True,
+        }
+    )
+    decision = _engine().evaluate(payload)
+    assert decision.allowed is False
+    assert set(decision.required_approvals) == {
+        ApprovalRole.ENGINEERING,
+        ApprovalRole.SECURITY,
+    }
+    assert any("'engineering' approval, which is missing" in r for r in decision.reasons)
+
+
+def test_no_repo_roles_is_unchanged_behaviour() -> None:
+    """With no per-repo roles, decisions are identical to the pre-#31 gate."""
+    base = {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90},
+        "approval": {},
+        "approval_present": True,
+    }
+    decision = _engine().evaluate(PolicyInput.model_validate(base))
+    assert decision.allowed is True
+    assert decision.required_approvals == []

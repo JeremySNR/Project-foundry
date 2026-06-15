@@ -63,6 +63,14 @@ class PolicyRepo(BaseModel):
 
     name: str | None = None
     confidence: int = Field(default=0, ge=0, le=100)
+    # Extra approval roles required for any run routed to this repo, on top of
+    # whatever the risk classifier derives (issue #31, per-repo policy scoping).
+    # The orchestrator resolves these from ``policy.repo_required_roles`` for the
+    # routed repo and stamps them here, so both the Python engine and the Rego
+    # bundle read the *same* field - the per-repo approval matrix lives in
+    # config, not duplicated in two policy languages. Strictly additive: these
+    # can only add a required approval, never remove one (invariant #1).
+    required_roles: list[ApprovalRole] = Field(default_factory=list)
 
 
 class PolicyActor(BaseModel):
@@ -180,8 +188,25 @@ def _action_str(action: object) -> str:
     return action.value if isinstance(action, PolicyAction) else str(action)
 
 
-def required_approvals(risk: PolicyRisk) -> list[ApprovalRole]:
-    """Derive required approval roles from the sensitive areas in play.
+def required_approvals(
+    risk: PolicyRisk, repo_roles: list[ApprovalRole] | None = None
+) -> list[ApprovalRole]:
+    """Derive required approval roles for a run.
+
+    The roles are the union of two sources:
+
+    - the **sensitive areas** the risk classifier flagged (``auth`` /
+      ``infrastructure`` -> ``engineering``; ``customer_data`` / ``pii`` /
+      ``payments`` -> ``security``), and
+    - any **per-repo** roles an operator scoped to the run's routed repo via
+      ``policy.repo_required_roles`` (issue #31). These are passed in as
+      ``repo_roles`` (resolved by the orchestrator and carried on
+      ``PolicyInput.repo.required_roles``), so the same union is computed by the
+      gate and by the orchestrator's ``approve()`` pre-check.
+
+    The union is **strictly additive** - per-repo roles can only add a required
+    approval, never drop one - so per-repo scoping is a one-way ratchet towards
+    stricter (invariant #1).
 
     Shared by the gate and the orchestrator: ``approve()`` uses it to refuse an
     approval from someone lacking a required role *before* recording it, so the
@@ -192,6 +217,7 @@ def required_approvals(risk: PolicyRisk) -> list[ApprovalRole]:
         required.append(ApprovalRole.ENGINEERING)
     if risk.customer_data or risk.pii or risk.payments:
         required.append(ApprovalRole.SECURITY)
+    required.extend(repo_roles or [])
     # De-duplicate while preserving order.
     seen: set[ApprovalRole] = set()
     ordered: list[ApprovalRole] = []
@@ -217,7 +243,7 @@ class LocalPolicyEngine:
 
     def evaluate(self, payload: PolicyInput) -> PolicyDecision:
         reasons: list[str] = []
-        required = required_approvals(payload.risk)
+        required = required_approvals(payload.risk, payload.repo.required_roles)
         threshold = self._repo_confidence_threshold
 
         # Hard-forbidden actions are denied unconditionally - no risk level or

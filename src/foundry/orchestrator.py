@@ -157,6 +157,7 @@ class FoundryOrchestrator:
         max_files_changed: int = 12,
         forbidden_globs: tuple[str, ...] | list[str] | None = None,
         repo_forbidden_globs: Mapping[str, tuple[str, ...]] | None = None,
+        repo_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         max_agent_retries: int = 2,
         retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
@@ -205,6 +206,16 @@ class FoundryOrchestrator:
         # repo, layered *on top of* the global list above - never replacing it.
         self._repo_forbidden_globs = {
             repo: list(globs) for repo, globs in (repo_forbidden_globs or {}).items()
+        }
+        # Per-repo required approval roles (issue #31, per-repo policy scoping):
+        # extra approval roles demanded of any run routed to a given repo, on top
+        # of whatever the risk classifier derives. Strictly additive - they only
+        # ever *add* a required approval (invariant #1). Role names are validated
+        # against the ApprovalRole vocabulary at config load, so coercing here is
+        # safe.
+        self._repo_required_roles = {
+            repo: [ApprovalRole(r) for r in roles]
+            for repo, roles in (repo_required_roles or {}).items()
         }
         if sensitive_path_globs is None:
             from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
@@ -391,12 +402,30 @@ class FoundryOrchestrator:
             )
             return existing
 
+        # The *effective* approval roles a human must hold = the risk-derived
+        # roles unioned with any per-repo roles configured for the routed repo
+        # (issue #31). Surfaced in the tracker/chat approval prompts so an
+        # approver is told exactly which roles to sign with, matching what
+        # approve() and the gate require - no approve->blocked whiplash.
+        repo_name = context.best_repository.repo if context.best_repository else None
+        effective_roles = [
+            r.value
+            for r in required_approvals(
+                PolicyRisk(
+                    overall_risk=risk.overall_risk,
+                    **risk.sensitive_areas.model_dump(),
+                ),
+                self._repo_required_roles_for(repo_name),
+            )
+        ]
         # Mirror the outcome back to the tracker (Linear) if one is configured.
         if self._tracker is not None:
             try:
                 self._tracker.post_comment(
                     ticket.issue_id,
-                    format_analysis_comment(analysis, risk, plan, status),
+                    format_analysis_comment(
+                        analysis, risk, plan, status, required_roles=effective_roles
+                    ),
                 )
                 self._tracker.set_state(ticket.issue_id, state_for(status))
             except Exception:
@@ -408,7 +437,9 @@ class FoundryOrchestrator:
         # Mirror the same outcome onto the chat surface: an actionable approval
         # message when the run parks for approval, else a status notification.
         if status is RunStatus.WAITING_APPROVAL:
-            self._notify_approval(ticket, analysis, risk, plan)
+            self._notify_approval(
+                ticket, analysis, risk, plan, required_roles=effective_roles
+            )
         else:
             self._notify_run_status(ticket.issue_id, ticket.issue_key, status)
         return run_id
@@ -502,11 +533,23 @@ class FoundryOrchestrator:
         analysis: TicketAnalysis,
         risk: RiskAssessment,
         plan: DeliveryPlan,
+        *,
+        required_roles: list[str] | None = None,
     ) -> None:
-        """Post the interactive approval message to the chat surface."""
+        """Post the interactive approval message to the chat surface.
+
+        ``required_roles`` is the *effective* approval roles (risk-derived plus
+        any per-repo roles, issue #31); it falls back to the risk-derived roles
+        for callers that don't compute the union.
+        """
         if self._notifier is None:
             return
         repo = plan.affected_repositories[0] if plan.affected_repositories else "unknown"
+        roles = (
+            tuple(required_roles)
+            if required_roles is not None
+            else tuple(r.value for r in risk.required_approvals)
+        )
         request = ApprovalRequest(
             issue_id=ticket.issue_id,
             issue_key=ticket.issue_key,
@@ -516,7 +559,7 @@ class FoundryOrchestrator:
             agent_mode=risk.allowed_agent_mode.value,
             repo=repo,
             acceptance_criteria=tuple(analysis.acceptance_criteria),
-            required_approvals=tuple(r.value for r in risk.required_approvals),
+            required_approvals=roles,
         )
         try:
             self._notifier.approval_requested(request)
@@ -576,7 +619,12 @@ class FoundryOrchestrator:
                 PolicyRisk(
                     overall_risk=risk.overall_risk,
                     **risk.sensitive_areas.model_dump(),
-                )
+                ),
+                # The routed repo may demand extra roles (issue #31). Refuse an
+                # approver lacking them here, before recording, just as for the
+                # risk-derived roles - so a per-repo rule never surfaces as an
+                # approve->blocked whiplash at dispatch.
+                self._repo_required_roles_for(self._run_repo(session, run_id)),
             )
             missing = [role for role in required if role not in granted_roles]
             if missing:
@@ -1882,8 +1930,8 @@ class FoundryOrchestrator:
             tracker_issue_id=ticket.issue_id,
         )
 
-    @staticmethod
     def _policy_input(
+        self,
         action: PolicyAction,
         analysis: TicketAnalysis,
         context: ContextBundle,
@@ -1894,6 +1942,7 @@ class FoundryOrchestrator:
         approval_present: bool = False,
     ) -> PolicyInput:
         best_repo = context.best_repository
+        repo_name = best_repo.repo if best_repo else None
         return PolicyInput(
             action=action,
             ticket=PolicyTicket(
@@ -1905,14 +1954,29 @@ class FoundryOrchestrator:
                 **risk.sensitive_areas.model_dump(),
             ),
             repo=PolicyRepo(
-                name=best_repo.repo if best_repo else None,
+                name=repo_name,
                 confidence=best_repo.confidence if best_repo else 0,
+                # Stamp the routed repo's configured approval roles so the gate
+                # (and OPA, via the same field) requires them (issue #31).
+                required_roles=self._repo_required_roles_for(repo_name),
             ),
             retry=retry or PolicyRetry(),
             budget=budget or PolicyBudget(),
             approval={role: True for role in (approvals or set())},
             approval_present=approval_present,
         )
+
+    def _repo_required_roles_for(self, repo: str | None) -> list[ApprovalRole]:
+        """Approval roles scoped to ``repo`` via ``policy.repo_required_roles``.
+
+        Empty unless an operator configured extra roles for this repo. The
+        result is unioned with the risk-derived roles by
+        :func:`policy.engine.required_approvals`; it can only *add* a required
+        approval, never remove one (invariant #1).
+        """
+        if not repo:
+            return []
+        return list(self._repo_required_roles.get(repo, []))
 
     def _forbidden_globs_for(self, repo: str | None) -> list[str]:
         """Global forbidden globs plus any extra ones scoped to ``repo``.

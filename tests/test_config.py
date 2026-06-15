@@ -66,6 +66,9 @@ policy:
   repo_forbidden_globs:
     payments-service: ["**/ledger/**", "**/reconciliation/**"]
     platform-monorepo: ["services/billing/**"]
+  repo_required_roles:
+    payments-service: ["security"]
+    platform-monorepo: ["engineering", "security"]
 triggers:
   label: "ai:go"
   status: "Ready for Foundry"
@@ -105,12 +108,35 @@ def test_load_from_yaml(tmp_path) -> None:
         "payments-service": ("**/ledger/**", "**/reconciliation/**"),
         "platform-monorepo": ("services/billing/**",),
     }
+    assert s.repo_required_roles_map == {
+        "payments-service": ("security",),
+        "platform-monorepo": ("engineering", "security"),
+    }
     assert s.temporal_address == "temporal.internal:7233"
 
 
 def test_repo_forbidden_globs_default_empty() -> None:
     """No config => no per-repo forbidden globs (global list unchanged)."""
     assert Settings.from_env({}).repo_forbidden_map == {}
+
+
+def test_repo_required_roles_default_empty() -> None:
+    """No config => no per-repo approval roles (risk-derived roles unchanged)."""
+    assert Settings.from_env({}).repo_required_roles_map == {}
+
+
+def test_repo_required_roles_rejects_unknown_role(tmp_path) -> None:
+    """An unknown approval role is a deploy-time error, not a silently-dropped
+    rule that would leave a repo less protected than intended (issue #31)."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "policy:\n  repo_required_roles:\n"
+        "    payments-service: ['securty']\n"  # typo
+    )
+    with pytest.raises(ValueError, match="unknown approval roles"):
+        Settings.load(path, env={})
 
 
 def test_legacy_authorised_approvers_yaml_still_loads(tmp_path) -> None:

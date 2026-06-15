@@ -1831,3 +1831,93 @@ def test_per_repo_forbidden_globs_reach_agent_do_not_modify(session_factory) -> 
     do_not_modify = provider._inputs[job.job_id].constraints.do_not_modify
     assert "**/ledger/**" in do_not_modify  # per-repo rule present
     assert "migrations/**" in do_not_modify  # global floor still present
+
+
+# --- per-repo required approval roles (issue #31) ------------------------------
+
+
+def test_per_repo_required_role_refuses_unqualified_approval(session_factory) -> None:
+    """A repo-scoped required role (issue #31) is enforced at approve() the same
+    way risk-derived roles are: an approver lacking it is refused before any
+    void approval is recorded, even though the risk classifier flagged nothing
+    sensitive for this low-risk feature."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        repo_required_roles={"customer-web": ("security",)},
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    # Approving without the repo-required security role is refused up front.
+    with pytest.raises(OrchestratorError, match="security"):
+        orch.approve(run_id, user="dev@example.com")
+    # The run is untouched - still awaiting a qualified approval.
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+
+    # With the security role granted, approval lands and dispatch proceeds.
+    orch.approve(
+        run_id, user="sec@example.com", granted_roles={ApprovalRole.SECURITY}
+    )
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+    orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+
+def test_per_repo_required_role_scoped_to_its_repo(session_factory) -> None:
+    """The same rule does not apply to a run routed to a different repo: an
+    ordinary approval still works there (per-repo scoping, not global)."""
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        repo_required_roles={"payments-service": ("security",)},
+    )
+    # This run routes to customer-web, which has no per-repo rule.
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")  # no roles needed
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_per_repo_required_role_unions_with_risk_roles(session_factory) -> None:
+    """Per-repo roles are additive on top of risk-derived ones: an auth ticket
+    already needs engineering; the repo additionally needs security, so both
+    must be granted to approve."""
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        repo_required_roles={"customer-web": ("security",)},
+    )
+    ticket = _ready_ticket(
+        title="Rotate auth login session tokens",
+        description="Acceptance Criteria:\n- auth tokens rotate\n- login still works",
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    # Engineering alone (the risk-derived role) is not enough now.
+    with pytest.raises(OrchestratorError, match="security"):
+        orch.approve(
+            run_id, user="eng@example.com", granted_roles={ApprovalRole.ENGINEERING}
+        )
+    # Both roles together satisfy the union.
+    orch.approve(
+        run_id,
+        user="lead@example.com",
+        granted_roles={ApprovalRole.ENGINEERING, ApprovalRole.SECURITY},
+    )
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_per_repo_required_role_surfaces_in_tracker_comment(session_factory) -> None:
+    """The approval-required comment lists the effective roles (risk-derived plus
+    per-repo), so an approver is told the security sign-off this repo needs even
+    though the risk classifier inferred no sensitive area."""
+    tracker = InMemoryIssueTracker()
+    orch = _orch(
+        session_factory,
+        issue_tracker=tracker,
+        repo_required_roles={"customer-web": ("security",)},
+    )
+    orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    comment = tracker.comments["i-1"][0]
+    assert "Required approval:" in comment
+    assert "security" in comment

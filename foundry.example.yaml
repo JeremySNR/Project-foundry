@@ -91,6 +91,17 @@ policy:
   # repo_forbidden_globs:
   #   payments-service: ["**/ledger/**", "**/reconciliation/**"]
   #   platform-monorepo: ["services/billing/**", "services/identity/**"]
+  # Per-repo required approval roles (issue #31, per-repo policy scoping /
+  # multi-role approval matrices). Any run routed to the named repo additionally
+  # requires these approval roles, on top of whatever the risk classifier derives
+  # (auth/infrastructure -> engineering, customer_data/pii/payments -> security).
+  # Strictly additive: a repo can only *add* a required approval, never remove a
+  # risk-derived one, so the approval gate is a one-way ratchet towards stricter.
+  # Valid roles: product, engineering, security, qa (validated at load). The repo
+  # name is the one Foundry routed the run to (the context bundle's best repo).
+  # repo_required_roles:
+  #   payments-service: ["security"]
+  #   platform-monorepo: ["engineering", "security"]
   # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)
   # risk pass never flagged the area, the run escalates to human review.
   # Override per area; unlisted areas keep the built-in defaults.

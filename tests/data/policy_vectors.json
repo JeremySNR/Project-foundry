@@ -164,6 +164,96 @@
       }
     },
     {
+      "name": "repo_required_role_missing_denied",
+      "_comment": "Per-repo policy scoping (#31): a repo demands 'security' even though the risk classifier flagged nothing sensitive. repo.required_roles is the resolved per-repo list the orchestrator stamps for the routed repo; both engines union it with the risk-derived roles. Unapproved -> denied.",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90, "required_roles": ["security"]},
+        "approval": {},
+        "approval_present": true
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["sensitive work requires 'security' approval, which is missing"],
+        "required_approvals": ["security"]
+      }
+    },
+    {
+      "name": "repo_required_role_granted_allows_draft",
+      "_comment": "The same per-repo 'security' requirement, now satisfied by a security approval. Low-risk work -> draft_pr once the per-repo role is signed.",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "low"},
+        "repo": {"confidence": 90, "required_roles": ["security"]},
+        "approval": {"security": true},
+        "approval_present": true
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": ["security"]
+      }
+    },
+    {
+      "name": "repo_required_role_unions_with_risk_role_partial_denied",
+      "_comment": "Per-repo roles are strictly additive (invariant #1): auth risk derives 'engineering' and the routed repo additionally requires 'security'. Engineering alone is granted, so the union still demands the missing security sign-off.",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "high", "auth": true},
+        "repo": {"confidence": 90, "required_roles": ["security"]},
+        "approval": {"engineering": true},
+        "approval_present": true
+      },
+      "expected": {
+        "allow": false,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["sensitive work requires 'security' approval, which is missing"],
+        "required_approvals": ["engineering", "security"]
+      }
+    },
+    {
+      "name": "repo_required_role_unions_with_risk_role_both_granted_allowed",
+      "_comment": "The full union (risk-derived engineering + per-repo security) is satisfied. High-risk work is still capped at human_only, mirroring multi_role_both_approved_high_risk_human_only.",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "high", "auth": true},
+        "repo": {"confidence": 90, "required_roles": ["security"]},
+        "approval": {"engineering": true, "security": true},
+        "approval_present": true
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "human_only",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": ["engineering", "security"]
+      }
+    },
+    {
+      "name": "repo_required_role_duplicate_of_risk_role_not_doubled",
+      "_comment": "A per-repo role that duplicates a risk-derived one (auth already implies engineering) is de-duplicated: required_approvals lists 'engineering' once, and a single engineering approval satisfies it.",
+      "input": {
+        "action": "start_agent",
+        "ticket": {"readiness": "ready"},
+        "risk": {"overall_risk": "medium", "auth": true},
+        "repo": {"confidence": 90, "required_roles": ["engineering"]},
+        "approval": {"engineering": true},
+        "approval_present": true
+      },
+      "expected": {
+        "allow": true,
+        "allowed_agent_mode": "draft_pr",
+        "reasons": ["all minimum policy checks passed"],
+        "required_approvals": ["engineering"]
+      }
+    },
+    {
       "name": "multi_role_auth_payments_none_approved",
       "input": {
         "action": "start_agent",

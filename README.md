@@ -169,6 +169,8 @@ policy:
   forbidden_globs: ["infra/**", "**/infra/**", "migrations/**", "**/migrations/**", "**/.env*", "**/secrets/**"]
   repo_forbidden_globs:           # per-repo extras for monorepos; additive on top
     payments-service: ["**/ledger/**"]   # of forbidden_globs, scoped to the routed repo
+  repo_required_roles:            # per-repo approval roles (#31), additive on top of
+    payments-service: ["security"]       # risk-derived roles; can only make approval stricter
   sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
     auth: ["**/auth/**", "**/login/**", "**/sso/**"]
     payments: ["**/billing/**", "**/stripe/**"]
