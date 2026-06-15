@@ -88,6 +88,16 @@ required_approvals contains "security" if input.risk.customer_data
 required_approvals contains "security" if input.risk.pii
 required_approvals contains "security" if input.risk.payments
 
+# Per-repo required roles (issue #31, per-repo policy scoping). The orchestrator
+# resolves policy.repo_required_roles for the run's routed repo and stamps them
+# onto input.repo.required_roles, so the gate and LocalPolicyEngine compute the
+# same union. Strictly additive (invariant #1): these can only add a required
+# approval, never remove a risk-derived one. Absent for runs with no per-repo
+# config, leaving existing decisions byte-for-byte unchanged.
+required_approvals contains role if {
+	some role in object.get(input.repo, "required_roles", [])
+}
+
 # --- deny reasons ---
 deny_reasons contains msg if {
 	is_forbidden

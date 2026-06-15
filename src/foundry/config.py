@@ -259,6 +259,13 @@ class Settings:
     # protected subtrees, never drop a global one, so the sticky forbidden-path
     # block stays a one-way ratchet towards stricter.
     repo_forbidden_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # repo name -> extra approval roles required for any run routed to that repo,
+    # on top of the roles the risk classifier derives (issue #31, per-repo policy
+    # scoping / multi-role approval matrices). Strictly additive: a repo's roles
+    # can only *add* a required approval, never drop a risk-derived one, so the
+    # approval gate stays a one-way ratchet towards stricter (invariant #1). Role
+    # names are validated against the ApprovalRole vocabulary at load.
+    repo_required_roles: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     # --- remediation / feedback loop (behaviour: yaml) ---
     # When CI fails or a reviewer requests changes, Foundry can re-dispatch the
@@ -498,6 +505,21 @@ class Settings:
             raise ValueError(
                 f"oidc.leeway_seconds must be >= 0, got {self.oidc_leeway_seconds}"
             )
+        # Per-repo required approval roles must be real ApprovalRoles, validated
+        # at load so a typo is a deploy-time error, not a silently-ignored rule
+        # that would leave a repo less protected than the operator intended
+        # (issue #31).
+        if self.repo_required_roles:
+            from foundry.schemas.common import ApprovalRole
+
+            valid_roles = {r.value for r in ApprovalRole}
+            for repo, roles in self.repo_required_roles:
+                bad = [r for r in roles if r not in valid_roles]
+                if bad:
+                    raise ValueError(
+                        f"policy.repo_required_roles repo {repo!r} lists unknown "
+                        f"approval roles {bad}; valid roles are {sorted(valid_roles)}"
+                    )
         # Role names in the IdP-group map must be real ApprovalRoles, validated at
         # load time so a typo is a deploy-time error, not a silently-empty grant.
         if self.oidc_group_role_map:
@@ -582,6 +604,11 @@ class Settings:
     def repo_forbidden_map(self) -> dict[str, tuple[str, ...]]:
         """repo name -> extra forbidden globs scoped to that repo."""
         return {repo: globs for repo, globs in self.repo_forbidden_globs}
+
+    @property
+    def repo_required_roles_map(self) -> dict[str, tuple[str, ...]]:
+        """repo name -> extra approval roles required for runs routed there."""
+        return {repo: roles for repo, roles in self.repo_required_roles}
 
     @property
     def oidc_enabled(self) -> bool:
@@ -684,6 +711,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["repo_forbidden_globs"] = tuple(
             (str(repo), tuple(globs))
             for repo, globs in (policy["repo_forbidden_globs"] or {}).items()
+        )
+    if "repo_required_roles" in policy:
+        out["repo_required_roles"] = tuple(
+            (str(repo), tuple(str(role) for role in roles))
+            for repo, roles in (policy["repo_required_roles"] or {}).items()
         )
 
     remediation = data.get("remediation", {}) or {}

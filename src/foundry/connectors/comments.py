@@ -67,10 +67,22 @@ def format_analysis_comment(
     risk: RiskAssessment,
     plan: DeliveryPlan,
     status: RunStatus,
+    *,
+    required_roles: list[str] | None = None,
 ) -> str:
-    """Render the planning summary comment posted to the issue."""
+    """Render the planning summary comment posted to the issue.
+
+    ``required_roles`` is the *effective* set of approval roles a human must
+    hold - the risk-derived roles unioned with any per-repo roles scoped to the
+    routed repo (issue #31). It defaults to the risk-derived roles so callers
+    that don't compute the union still render correctly.
+    """
     repo = plan.affected_repositories[0] if plan.affected_repositories else "_unknown_"
-    approvals = [r.value for r in risk.required_approvals]
+    approvals = (
+        list(required_roles)
+        if required_roles is not None
+        else [r.value for r in risk.required_approvals]
+    )
     lines = [
         "**Foundry analysis complete.**",
         "",
