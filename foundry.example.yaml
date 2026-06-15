@@ -302,6 +302,18 @@ dashboard:
   # reset it.
   review_sla_seconds: 86400  # 24h
 
+  # Review staleness SLA: how long (seconds) an open PR may go with NO observed
+  # activity (no PR_OPENED/PR_UPDATED - i.e. no push) before the fleet strip and
+  # GET /metrics/reviews flag it as stale. Distinct from review_sla_seconds (total
+  # open time): this is the "stale since last push" signal that tells an
+  # actively-pushed PR from an abandoned one - "which open PRs has nobody touched
+  # in N hours?". Read-only: it changes no policy gate and blocks no run. Omit it
+  # (the default) for no signal - the "since last push" age is still shown, but
+  # nothing is flagged. Env override: FOUNDRY_REVIEW_STALE_SLA_SECONDS (empty
+  # string disables it). The clock is dated from the latest PR_OPENED/PR_UPDATED
+  # event, so a fresh push resets it.
+  review_stale_sla_seconds: 172800  # 48h
+
 auth:
   # OIDC bearer auth for the token-gated API + dashboard (issue #34). OPTIONAL
   # and additive: when configured, a valid OIDC JWT from your IdP is accepted on
