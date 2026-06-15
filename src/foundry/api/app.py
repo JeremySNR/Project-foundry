@@ -1100,6 +1100,34 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **delivery_by_repo(session, since=since)}
 
+    @app.get("/metrics/delivery/by-repo/trends")
+    def metrics_delivery_by_repo_trends(
+        request: Request, days: int = 90, bucket: str = "week"
+    ) -> dict[str, Any]:
+        """Per-repo delivery outcomes bucketed over time - the repo dimension of
+        ``/metrics/delivery/trends`` (the way ``/metrics/delivery/by-repo`` is to
+        ``/metrics/delivery``). Each repo carries a zero-filled series on one
+        shared time axis plus its window totals, so a caller can see whether a
+        given repo is shipping more or stalling. Token-gated and fail-closed like
+        the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS, delivery_by_repo_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **delivery_by_repo_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/agents")
     def metrics_agents(request: Request, days: int = 90) -> dict[str, Any]:
         """Per-provider agent scorecards: merge rate, retries and spend, broken
