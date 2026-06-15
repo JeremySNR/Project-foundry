@@ -115,7 +115,7 @@ later `alembic upgrade head`),
 ```bash
 pip install -e ".[test]" && pytest          # full offline suite (~500 tests)
 ruff check src tests                        # lint
-opa test src/foundry/policy -v              # Rego tests (needs opa CLI)
+opa test src/foundry/policy -v --ignore '*.yaml'  # Rego tests (needs opa CLI; ignore preset configs)
 python scripts/demo.py                      # offline end-to-end demo
 foundry-policy presets                      # browse the starter policy library
 make dev                                    # uvicorn API on :8000, SQLite

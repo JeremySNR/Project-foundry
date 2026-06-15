@@ -162,7 +162,11 @@ jobs:
           opa version
 
       - name: Run policy tests
-        run: opa test src/foundry/policy -v
+        # Ignore non-Rego files: the starter policy library (issue #31) ships
+        # preset *.yaml configs under src/foundry/policy/library/, and OPA's
+        # recursive loader would otherwise try to parse them as Rego data
+        # documents (a merge error). They are application config, not policy data.
+        run: opa test src/foundry/policy -v --ignore '*.yaml' --ignore '*.yml'
 
       # Machine-verified lock-step (AGENTS.md invariant #2): run the shared
       # decision vectors through the Rego bundle and assert they match the same
