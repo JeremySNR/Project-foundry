@@ -2,16 +2,17 @@
 
 Usage::
 
-    foundry-evidence run <run_id>     [--format json|html] [--output PATH]
-    foundry-evidence epic <run_id>    [--format json|html] [--output PATH]
+    foundry-evidence run <run_id>     [--format json|html|pdf] [--output PATH]
+    foundry-evidence epic <run_id>    [--format json|html|pdf] [--output PATH]
     foundry-evidence archive [--from ISO] [--to ISO] [--days N]
-                             [--format json|html] [--output PATH]
+                             [--format json|html|pdf] [--output PATH]
 
 This is the offline twin of the evidence endpoints (``GET /runs/{id}/evidence``,
 ``GET /runs/{id}/epic/evidence``, ``GET /evidence``): it reads the same
 content-hashed audit trail straight from the database and produces the *same*
-packs from the *same* builders/renderers, so an auditor can get a JSON or HTML
-evidence pack without standing up the API or holding a bearer token. Control
+packs from the *same* builders/renderers, so an auditor can get a JSON, HTML or
+PDF evidence pack without standing up the API or holding a bearer token (PDF
+needs the optional ``[pdf]`` extra). Control
 mappings come from committed config (``compliance.control_mappings``), never from
 input - exactly like the API.
 
@@ -98,8 +99,8 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--format",
         default="json",
-        choices=("json", "html"),
-        help="Output format (default: json).",
+        choices=("json", "html", "pdf"),
+        help="Output format (default: json). 'pdf' needs the optional [pdf] extra.",
     )
     p.add_argument(
         "--output",
@@ -129,6 +130,42 @@ def _emit(content: str, output: str | None) -> None:
     print(f"Wrote {output}", file=sys.stderr)
 
 
+def _emit_bytes(data: bytes, output: str | None) -> None:
+    """Write binary ``data`` (a rendered PDF) to ``output`` or stdout, verbatim."""
+    if output is None:
+        sys.stdout.buffer.write(data)
+        return
+    with open(output, "wb") as fh:
+        fh.write(data)
+    print(f"Wrote {output}", file=sys.stderr)
+
+
+def _render(
+    fmt: str,
+    pack: dict[str, Any],
+    output: str | None,
+    *,
+    html: Any,
+    pdf: Any,
+) -> None:
+    """Render ``pack`` in ``fmt`` and emit it, handling text vs binary output.
+
+    ``html`` / ``pdf`` are the format-specific renderers (so each subcommand
+    passes its own evidence/archive/epic pair). A ``pdf`` request without the
+    optional ``[pdf]`` extra fails loud with the install hint (exit 1).
+    """
+    from foundry.compliance import PdfRenderingUnavailable
+
+    if fmt == "pdf":
+        try:
+            _emit_bytes(pdf(pack), output)
+        except PdfRenderingUnavailable as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+    _emit(html(pack) if fmt == "html" else _dump_json(pack), output)
+
+
 def _dump_json(pack: dict[str, Any]) -> str:
     # Pack values are already JSON-serialisable (ISO strings, plain scalars), so
     # no custom encoder is needed. Insertion order is preserved (it mirrors the
@@ -138,6 +175,7 @@ def _dump_json(pack: dict[str, Any]) -> str:
 
 def _run_export(args: argparse.Namespace) -> None:
     from foundry.compliance.evidence import build_evidence_pack, render_evidence_html
+    from foundry.compliance.pdf import render_evidence_pdf
     from foundry.db.models import FoundryRun
 
     settings, session_factory = _session_factory()
@@ -151,8 +189,13 @@ def _run_export(args: argparse.Namespace) -> None:
             run,
             control_mappings=settings.compliance_control_mappings,
         )
-        content = render_evidence_html(pack) if args.format == "html" else _dump_json(pack)
-    _emit(content, args.output)
+    _render(
+        args.format,
+        pack,
+        args.output,
+        html=render_evidence_html,
+        pdf=render_evidence_pdf,
+    )
 
 
 def _epic_export(args: argparse.Namespace) -> None:
@@ -160,6 +203,7 @@ def _epic_export(args: argparse.Namespace) -> None:
         build_epic_evidence_pack,
         render_epic_evidence_html,
     )
+    from foundry.compliance.pdf import render_epic_evidence_pdf
     from foundry.db.models import FoundryRun
 
     settings, session_factory = _session_factory()
@@ -184,12 +228,13 @@ def _epic_export(args: argparse.Namespace) -> None:
             children,
             control_mappings=settings.compliance_control_mappings,
         )
-        content = (
-            render_epic_evidence_html(pack)
-            if args.format == "html"
-            else _dump_json(pack)
-        )
-    _emit(content, args.output)
+    _render(
+        args.format,
+        pack,
+        args.output,
+        html=render_epic_evidence_html,
+        pdf=render_epic_evidence_pdf,
+    )
 
 
 def _archive_export(args: argparse.Namespace) -> None:
@@ -197,6 +242,7 @@ def _archive_export(args: argparse.Namespace) -> None:
         build_evidence_archive,
         render_archive_html,
     )
+    from foundry.compliance.pdf import render_archive_pdf
 
     # Same bound semantics as GET /evidence: from inclusive, to exclusive, a
     # date-only `to` covers the whole day, default window is the last 90 days.
@@ -225,12 +271,13 @@ def _archive_export(args: argparse.Namespace) -> None:
             until=until,
             control_mappings=settings.compliance_control_mappings,
         )
-        content = (
-            render_archive_html(archive)
-            if args.format == "html"
-            else _dump_json(archive)
-        )
-    _emit(content, args.output)
+    _render(
+        args.format,
+        archive,
+        args.output,
+        html=render_archive_html,
+        pdf=render_archive_pdf,
+    )
 
 
 def _parse_iso_bound(value: str, *, inclusive_day_end: bool) -> datetime:
