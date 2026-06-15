@@ -82,6 +82,17 @@ _ALL_WAIT_START_EVENTS = tuple(
 # re-dispatch correctly resets the age to the current attempt.
 EXECUTION_IN_FLIGHT_STATUSES = (RunStatus.AGENT_RUNNING,)
 
+# Run states where Foundry has shipped a PR and is now waiting on review/CI - the
+# review-latency signal ("PRs sitting unreviewed for N hours"). The product
+# deliberately *stops at a reviewed PR*, so this is the queue that answers "where
+# is delivery stalling on review?". Kept tight to PR_OPEN: REVIEW_REQUIRED is a
+# run parked on a *human decision* and is already aged by the approval queue
+# (HUMAN_WAIT_STATUSES); AGENT_RUNNING is the agent's own time (the execution
+# queue). The clock is dated from the PR_OPENED event - the first time a PR was
+# observed for the run; later pushes emit PR_UPDATED, so a re-push doesn't reset
+# the review clock (the PR has been open and awaiting review the whole time).
+REVIEW_IN_FLIGHT_STATUSES = (RunStatus.PR_OPEN,)
+
 
 def _percentile(sorted_values: list[int], fraction: float) -> int | None:
     if not sorted_values:
@@ -511,11 +522,99 @@ def execution_queue(
     }
 
 
+def _pr_opened_since_map(session, runs: list[FoundryRun]) -> dict[str, datetime]:
+    """For each run, the time its PR was first opened - the ``PR_OPENED`` event.
+
+    A run sees ``PR_OPENED`` once (the first PR observation); subsequent pushes
+    emit ``PR_UPDATED``, so the review clock is anchored to when the PR opened and
+    is *not* reset by a later push (the PR has been awaiting review the whole
+    time). ``func.max`` is defensive - there is normally a single ``PR_OPENED``.
+
+    Runs that carry no ``PR_OPENED`` event yet are absent from the map; the caller
+    falls back to the run's immutable ``created_at``.
+    """
+    if not runs:
+        return {}
+    rows = (
+        session.query(
+            FoundryAuditEvent.run_id,
+            func.max(FoundryAuditEvent.created_at),
+        )
+        .filter(
+            FoundryAuditEvent.run_id.in_([r.id for r in runs]),
+            FoundryAuditEvent.event_type == AuditEventType.PR_OPENED,
+        )
+        .group_by(FoundryAuditEvent.run_id)
+        .all()
+    )
+    return {run_id: created_at for run_id, created_at in rows if created_at is not None}
+
+
+def review_queue(
+    session, *, now: datetime | None = None, sla_seconds: int | None = None
+) -> dict:
+    """Open PRs with per-run review-latency age - the drill-down behind the fleet
+    strip's ``prs_open`` count, and the review-side complement to
+    :func:`approval_queue` / :func:`execution_queue`.
+
+    Every run currently sitting at an open PR (:data:`REVIEW_IN_FLIGHT_STATUSES`),
+    oldest first, each with how long the PR has been awaiting review
+    (``unreviewed_seconds``, dated from the ``PR_OPENED`` audit event - when the PR
+    first opened). When ``sla_seconds`` is set, PRs open at least that long are
+    flagged ``sla_breached`` and counted in the ``sla_breaches`` summary - the
+    signal a VP/on-call wants for a PR stalling in review; with no SLA the breach
+    signal is inert (``sla_breaches`` is 0), matching the historical behaviour
+    byte-for-byte. The product deliberately stops at a reviewed PR, so this is
+    pure read-only visibility - it blocks no run and merges nothing.
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(REVIEW_IN_FLIGHT_STATUSES))
+        .all()
+    )
+    opened_since = _pr_opened_since_map(session, runs)
+
+    entries: list[dict] = []
+    for run in runs:
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a run somehow has no PR_OPENED event recorded yet.
+        since = opened_since.get(run.id) or run.created_at
+        # Clamp at 0: a future-dated row (clock skew) is not negative review time.
+        unreviewed = max(0, int((now - _as_utc(since)).total_seconds()))
+        breached = sla_seconds is not None and unreviewed >= sla_seconds
+        status = run.status.value if isinstance(run.status, RunStatus) else str(run.status)
+        entries.append(
+            {
+                "run_id": run.id,
+                "linear_issue_key": run.linear_issue_key,
+                "status": status,
+                "current_step": run.current_step,
+                "risk_level": run.risk_level.value if run.risk_level is not None else None,
+                "pr_opened_since": _as_utc(since).isoformat(),
+                "unreviewed_seconds": unreviewed,
+                "sla_breached": breached,
+            }
+        )
+
+    entries.sort(key=lambda e: e["unreviewed_seconds"], reverse=True)
+    breaches = sum(1 for e in entries if e["sla_breached"])
+    return {
+        "now": now.isoformat(),
+        "sla_seconds": sla_seconds,
+        "count": len(entries),
+        "oldest_unreviewed_seconds": entries[0]["unreviewed_seconds"] if entries else None,
+        "sla_breaches": breaches,
+        "runs": entries,
+    }
+
+
 def fleet_status(
     session,
     *,
     sla_seconds: int | None = None,
     execution_sla_seconds: int | None = None,
+    review_sla_seconds: int | None = None,
     now: datetime | None = None,
 ) -> dict:
     """Live operational snapshot — every run's *current* state across the org.
@@ -574,6 +673,10 @@ def fleet_status(
     # agent run and how many have breached the execution SLA. Same derivation the
     # GET /metrics/executions drill-down serves, so they can never disagree.
     execution = execution_queue(session, now=now, sla_seconds=execution_sla_seconds)
+    # The review-side equivalent for ``prs_open``: the oldest open PR awaiting
+    # review and how many have breached the review SLA. Same derivation the
+    # GET /metrics/reviews drill-down serves, so they can never disagree.
+    review = review_queue(session, now=now, sla_seconds=review_sla_seconds)
 
     return {
         "total_runs": sum(by_status.values()),
@@ -588,6 +691,9 @@ def fleet_status(
         "execution_sla_seconds": execution_sla_seconds,
         "executions_breaching_sla": execution["sla_breaches"],
         "prs_open": _count(RunStatus.PR_OPEN),
+        "oldest_review_seconds": review["oldest_unreviewed_seconds"],
+        "review_sla_seconds": review_sla_seconds,
+        "reviews_breaching_sla": review["sla_breaches"],
         "active_cost_usd": round(active_cost, 2) if active_cost is not None else None,
         "by_status": by_status,
     }

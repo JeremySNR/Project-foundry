@@ -241,6 +241,7 @@ def create_app(
     auto_decompose_epics: bool = False,
     approval_sla_seconds: int | None = None,
     execution_sla_seconds: int | None = None,
+    review_sla_seconds: int | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -316,6 +317,10 @@ def create_app(
     # how long a run may sit in AGENT_RUNNING (agent dispatched, no PR yet)
     # before it is flagged. None = no SLA (no breach signal); read-only.
     app.state.execution_sla_seconds = execution_sla_seconds
+    # Review SLA for the fleet strip + GET /metrics/reviews (issue #37): how long
+    # a run may sit at an open PR (PR_OPEN, awaiting review/CI) before it is
+    # flagged. None = no SLA (no breach signal); read-only, blocks no run.
+    app.state.review_sla_seconds = review_sla_seconds
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.deduplicator = WebhookDeduplicator(
         session_factory,
@@ -1150,6 +1155,7 @@ def create_app(
                 session,
                 sla_seconds=app.state.approval_sla_seconds,
                 execution_sla_seconds=app.state.execution_sla_seconds,
+                review_sla_seconds=app.state.review_sla_seconds,
             )
 
     @app.get("/metrics/approvals")
@@ -1185,6 +1191,22 @@ def create_app(
             return execution_queue(
                 session, sla_seconds=app.state.execution_sla_seconds
             )
+
+    @app.get("/metrics/reviews")
+    def metrics_reviews(request: Request) -> dict[str, Any]:
+        """Open PRs with per-run review-latency age - the drill-down behind the
+        fleet strip's ``prs_open`` count, the review-side complement to
+        ``GET /metrics/approvals`` and ``GET /metrics/executions``. Every run at an
+        open PR (PR_OPEN, awaiting review/CI), oldest first, each with how long the
+        PR has been open and (when a review SLA is configured) whether it has
+        breached - the "PRs sitting unreviewed for N hours" signal. Token-gated and
+        fail-closed like the other metrics endpoints; read-only, changes no gate.
+        """
+        from foundry.memory.metrics import review_queue
+
+        _require_api_token(app, request)
+        with app.state.session_factory() as session:
+            return review_queue(session, sla_seconds=app.state.review_sla_seconds)
 
     @app.post("/runs/{run_id}/approval")
     def approval(
@@ -1955,6 +1977,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         auto_decompose_epics=settings.epics_auto_decompose,
         approval_sla_seconds=settings.approval_sla_seconds,
         execution_sla_seconds=settings.execution_sla_seconds,
+        review_sla_seconds=settings.review_sla_seconds,
     )
 
 

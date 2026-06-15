@@ -289,6 +289,19 @@ dashboard:
   # the current attempt.
   execution_sla_seconds: 3600  # 1h
 
+  # Review SLA: how long (seconds) a run may sit at an open PR (PR_OPEN - the
+  # agent shipped a PR, now awaiting review/CI) before the fleet strip and
+  # GET /metrics/reviews flag it as breaching. The review-side complement to
+  # approval_sla_seconds / execution_sla_seconds: the "PRs sitting unreviewed for
+  # N hours" signal, the one place delivery stalls after Foundry has done its job
+  # (the product deliberately stops at a reviewed PR). Read-only: it changes no
+  # policy gate and blocks no run. Omit it (the default) for no SLA - the oldest
+  # review age is still shown, but nothing is flagged. Env override:
+  # FOUNDRY_REVIEW_SLA_SECONDS (empty string disables it). The clock is dated from
+  # the PR_OPENED audit event (when the PR first opened), so a later push does not
+  # reset it.
+  review_sla_seconds: 86400  # 24h
+
 auth:
   # OIDC bearer auth for the token-gated API + dashboard (issue #34). OPTIONAL
   # and additive: when configured, a valid OIDC JWT from your IdP is accepted on
