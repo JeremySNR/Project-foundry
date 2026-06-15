@@ -98,6 +98,7 @@ test = [
 foundry-catalog = "foundry.catalog.cli:main"
 foundry-evidence = "foundry.compliance.cli:main"
 foundry-memory = "foundry.memory.cli:main"
+foundry-policy = "foundry.policy.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/JeremySNR/Project-foundry"
@@ -110,6 +111,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "foundry.policy" = ["*.rego"]
+"foundry.policy.library" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,77 @@
+# Foundry starter policy preset: SOC 2 (change management & logical access)
+# ==========================================================================
+# A starting point for organisations aligning Foundry with SOC 2 Trust Services
+# Criteria. The mapping is indicative, not a certification:
+#
+#   * CC8.1 (change management) -> confident routing, a tight file-change ceiling,
+#     and a single remediation retry so changes stay small, scoped and reviewed.
+#   * CC6.1 / CC6.3 (logical access to sensitive resources) -> protected-path
+#     blocks over infra/CI/secrets, plus per-repo security sign-off on the
+#     services that handle regulated data.
+#   * CC1.x / CC2.x (oversight & accountability) -> human approval is already a
+#     hard gate rule; name your approvers and their roles below.
+#
+# Copy into your foundry.yaml and adapt the repo names and approvers - the repo
+# lists here are illustrative. Secrets still come from the environment.
+
+policy:
+  provider: local
+
+  # Stricter than the default 70: under change management you do not dispatch
+  # work to a repo you are not confident is the right one.
+  repo_confidence_threshold: 80
+
+  # Tighter blast-radius ceiling than the default 12 - keep changes reviewable.
+  max_files_changed: 10
+
+  # Protected paths the agent may never touch. Restates the built-in defaults
+  # (infra / migrations / .env / secrets) and adds the CI/CD, IaC and credential
+  # surfaces a SOC 2 auditor expects to be off-limits to automation. Matched at
+  # the repo root and at any nested depth.
+  forbidden_globs:
+    - "infra/**"
+    - "**/infra/**"
+    - "migrations/**"
+    - "**/migrations/**"
+    - "**/.env*"
+    - "**/secrets/**"
+    - "**/.github/workflows/**"   # CI/CD pipeline definitions
+    - "**/terraform/**"           # infrastructure as code
+    - "**/helm/**"
+    - "**/k8s/**"
+    - "**/Dockerfile*"
+    - "**/*.pem"                  # private keys / certificates
+    - "**/*.key"
+
+  # Per-repo required approval roles, on top of whatever the risk classifier
+  # derives. Strictly additive: these can only ADD a required sign-off, never
+  # drop a risk-derived one. Use them to mandate a security approval on the
+  # services that process regulated/customer data regardless of how the ticket
+  # text reads. Replace the repo names with yours.
+  repo_required_roles:
+    payments-service: ["security"]
+    billing-service: ["security"]
+    identity-service: ["security", "engineering"]
+
+remediation:
+  # A single retry: a recurring failure on a change-managed run should re-engage
+  # a human, not loop autonomously.
+  max_agent_retries: 1
+  retry_on:
+    - ci_failed
+    - changes_requested
+
+budget:
+  max_cost_per_run: 8.0
+  estimated_cost_per_dispatch: 1.0
+
+approval:
+  # Name the approvers and the roles they hold. The per-repo rules above are only
+  # enforceable if at least one approver actually holds the required role - e.g.
+  # a run routed to payments-service can be approved only by someone granted
+  # "security" here. Replace with your real approvers before adopting.
+  approvers:
+    - email: "security-lead@example.com"
+      roles: ["security"]
+    - email: "eng-lead@example.com"
+      roles: ["engineering"]

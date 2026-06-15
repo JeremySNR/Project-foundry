@@ -1,0 +1,67 @@
+# Foundry starter policy preset: CHANGE MANAGEMENT (ITIL-style)
+# =============================================================
+# For organisations running a formal change-management process (an ITIL change
+# advisory board, or an equivalent release-control gate). The intent: the agent
+# may prepare reviewable changes, but anything that *ships* a release - deploy
+# scripts, release manifests, version bumps, pipelines - stays in human hands,
+# and infrastructure repos require an engineering authoriser.
+#
+# Copy into your foundry.yaml and adapt repo names and approvers. Secrets still
+# come from the environment.
+
+policy:
+  provider: local
+
+  # The highest confidence bar of the starter presets: a formal change process
+  # cannot tolerate work landing in the wrong repository.
+  repo_confidence_threshold: 85
+
+  # The tightest blast radius of the presets - a change record should describe a
+  # small, well-understood diff.
+  max_files_changed: 8
+
+  # Protected paths. Restates the built-in defaults and adds the release/deploy
+  # surface so the agent never edits what actually ships software. Matched at the
+  # repo root and at any nested depth.
+  forbidden_globs:
+    - "infra/**"
+    - "**/infra/**"
+    - "migrations/**"
+    - "**/migrations/**"
+    - "**/.env*"
+    - "**/secrets/**"
+    - "**/.github/workflows/**"   # CI/CD pipelines
+    - "**/deploy/**"              # deployment scripts/manifests
+    - "**/release/**"             # release tooling
+    - "**/charts/**"              # Helm release charts
+    - "**/CHANGELOG*"             # release notes are a controlled artifact
+    - "**/VERSION"                # version bumps are a release event
+
+  # Infrastructure repositories require an engineering authoriser regardless of
+  # the risk classifier. Strictly additive (can only add a required role).
+  # Replace the repo names with yours.
+  repo_required_roles:
+    platform-infra: ["engineering"]
+    deploy-tools: ["engineering"]
+
+remediation:
+  # One retry, and only for CI failures: a reviewer requesting changes on a
+  # change-managed run should bring a human back into the loop, not trigger
+  # another autonomous attempt.
+  max_agent_retries: 1
+  retry_on:
+    - ci_failed
+
+budget:
+  max_cost_per_run: 6.0
+  estimated_cost_per_dispatch: 1.0
+
+approval:
+  # The per-repo rules above need an approver who actually holds the role - e.g.
+  # a run routed to platform-infra can be approved only by someone granted
+  # "engineering" here. Replace with your real change authorisers.
+  approvers:
+    - email: "change-manager@example.com"
+      roles: ["engineering"]
+    - email: "security-lead@example.com"
+      roles: ["security"]
