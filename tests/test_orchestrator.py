@@ -561,6 +561,114 @@ def test_custom_sensitive_globs_are_honoured(session_factory) -> None:
     assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
 
 
+# -- diff-aware per-path approval roles (issue #31/#35) --------------------------
+
+
+def test_diff_touching_path_required_role_escalates(session_factory) -> None:
+    """A PR touching a path the operator scoped to a role no approver holds
+    escalates to human review - per-path policy for monorepos.
+
+    ``**/legal/**`` is deliberately *not* one of the built-in sensitive-area
+    globs, so the escalation here can only come from the per-path rule, not the
+    existing unflagged-sensitive-area check.
+    """
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"path_required_roles": {"**/legal/**": ("security",)}},
+    )
+    # The favourites ticket derived no security role, so the single approver
+    # signed with none; a diff into the legal subtree now needs a security
+    # sign-off the run never obtained.
+    pr = _pr(files_changed=["src/legal/terms.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
+
+
+def test_diff_outside_path_rule_does_not_escalate(session_factory) -> None:
+    """A path rule only escalates the paths it actually matches."""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"path_required_roles": {"**/legal/**": ("security",)}},
+    )
+    pr = _pr(files_changed=["src/features/favourites/index.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
+
+
+def test_path_required_role_already_granted_does_not_escalate(session_factory) -> None:
+    """If the run's approver already signed with the path's required role (e.g.
+    risk forced it upfront), touching the path does not re-escalate - mirroring
+    how an *anticipated* sensitive area is not flagged again."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        path_required_roles={"**/helm/**": ("engineering",)},
+    )
+    # An infrastructure ticket derives the engineering role, so the approver
+    # signs with it; the helm path is then already covered.
+    ticket = _ready_ticket(
+        title="Tune the helm chart resource limits",
+        description=READY_DESC + "\nAdjust the helm chart for the favourites service.",
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.ENGINEERING}
+    )
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+    pr = _pr(files_changed=["deploy/helm/values.yaml"])
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
+
+
+def test_no_path_rules_is_unchanged(session_factory) -> None:
+    """With no path rules configured (the default) a legal-subtree diff is just
+    an ordinary open PR - the feature is byte-for-byte off by default."""
+    orch, run_id = _dispatched_run(session_factory)
+    pr = _pr(files_changed=["src/legal/terms.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
+
+
+def test_path_required_role_escalation_is_audited(session_factory) -> None:
+    """The escalation writes a risk.escalated event citing the path and role."""
+    import json
+
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"path_required_roles": {"**/legal/**": ("security",)}},
+    )
+    orch.record_pr(run_id, _pr(files_changed=["src/legal/terms.ts"]))
+    with session_factory() as s:
+        from foundry.db import FoundryAuditEvent
+
+        events = (
+            s.query(FoundryAuditEvent)
+            .filter(FoundryAuditEvent.run_id == run_id)
+            .all()
+        )
+    escalations = [
+        json.loads(e.metadata_json or "{}")
+        for e in events
+        if e.event_type.value == "risk.escalated"
+    ]
+    path_escalations = [
+        m for m in escalations if m.get("category") == "path_required_roles"
+    ]
+    assert len(path_escalations) == 1
+    meta = path_escalations[0]
+    assert meta["required_roles"] == ["security"]
+    assert meta["paths"]["security"] == ["src/legal/terms.ts"]
+
+
+def test_forbidden_path_beats_path_required_role(session_factory) -> None:
+    """A forbidden path is a sticky BLOCK and wins over the softer per-path
+    role escalation when a diff trips both."""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"path_required_roles": {"migrations/**": ("security",)}},
+    )
+    pr = _pr(files_changed=["migrations/0003_add_index.sql"])
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+
+
 # -- PR correlation ---------------------------------------------------------------
 
 

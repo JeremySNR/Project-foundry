@@ -72,6 +72,9 @@ policy:
   min_approvals: 2
   repo_min_approvals:
     payments-service: 3
+  path_required_roles:
+    "**/billing/**": ["security"]
+    "services/identity/**": ["engineering", "security"]
 triggers:
   label: "ai:go"
   status: "Ready for Foundry"
@@ -117,6 +120,10 @@ def test_load_from_yaml(tmp_path) -> None:
     }
     assert s.min_approvals == 2
     assert s.repo_min_approvals_map == {"payments-service": 3}
+    assert s.path_required_roles_map == {
+        "**/billing/**": ("security",),
+        "services/identity/**": ("engineering", "security"),
+    }
     assert s.temporal_address == "temporal.internal:7233"
 
 
@@ -166,6 +173,25 @@ def test_repo_required_roles_rejects_unknown_role(tmp_path) -> None:
     path.write_text(
         "policy:\n  repo_required_roles:\n"
         "    payments-service: ['securty']\n"  # typo
+    )
+    with pytest.raises(ValueError, match="unknown approval roles"):
+        Settings.load(path, env={})
+
+
+def test_path_required_roles_default_empty() -> None:
+    """No config => no per-path approval roles (diff re-check unchanged)."""
+    assert Settings.from_env({}).path_required_roles_map == {}
+
+
+def test_path_required_roles_rejects_unknown_role(tmp_path) -> None:
+    """A typo'd role on a path rule is a deploy-time error, not a subtree left
+    silently unprotected (issue #31/#35)."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "policy:\n  path_required_roles:\n"
+        "    '**/billing/**': ['securty']\n"  # typo
     )
     with pytest.raises(ValueError, match="unknown approval roles"):
         Settings.load(path, env={})

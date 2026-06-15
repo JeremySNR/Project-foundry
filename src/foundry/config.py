@@ -278,6 +278,20 @@ class Settings:
     # is max(min_approvals, per-repo value), so a repo can only ever demand *more*
     # sign-offs, never fewer (invariant #1).
     repo_min_approvals: tuple[tuple[str, int], ...] = ()
+    # path glob -> approval roles required when a PR's diff touches that path
+    # (issue #31/#35, per-*path* policy scoping for monorepos). Unlike
+    # ``repo_required_roles`` (resolved at intake from the routed repo, before any
+    # diff exists), these are evaluated *diff-aware* on every PR push, in the same
+    # orchestrator re-check as the sticky forbidden-path block and the
+    # unflagged-sensitive-area escalation: a diff touching a configured path whose
+    # role is not already covered by the run's approvers escalates the run to
+    # REVIEW_REQUIRED for a human sign-off. Strictly additive - it can only ever
+    # *escalate* a run to human review, never release one (invariant #1) - so the
+    # default empty tuple is byte-for-byte the historical behaviour. Enforced in
+    # the orchestrator lifecycle, like the forbidden-path block, so there is no
+    # policy-engine/Rego lock-step concern (invariant #2 does not apply). Role
+    # names are validated against the ApprovalRole vocabulary at load.
+    path_required_roles: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     # --- remediation / feedback loop (behaviour: yaml) ---
     # When CI fails or a reviewer requests changes, Foundry can re-dispatch the
@@ -532,6 +546,20 @@ class Settings:
                         f"policy.repo_required_roles repo {repo!r} lists unknown "
                         f"approval roles {bad}; valid roles are {sorted(valid_roles)}"
                     )
+        # Per-path required approval roles must be real ApprovalRoles too, for the
+        # same reason: a typo'd role on a path rule would silently leave a subtree
+        # unprotected (issue #31/#35). Validated at load, fail-closed.
+        if self.path_required_roles:
+            from foundry.schemas.common import ApprovalRole
+
+            valid_roles = {r.value for r in ApprovalRole}
+            for glob, roles in self.path_required_roles:
+                bad = [r for r in roles if r not in valid_roles]
+                if bad:
+                    raise ValueError(
+                        f"policy.path_required_roles path {glob!r} lists unknown "
+                        f"approval roles {bad}; valid roles are {sorted(valid_roles)}"
+                    )
         # N-of-M approval counts must be at least one sign-off (issue #31). A
         # value below 1 would be a gate weakening - never silently allowed.
         if self.min_approvals < 1:
@@ -638,6 +666,11 @@ class Settings:
     def repo_min_approvals_map(self) -> dict[str, int]:
         """repo name -> minimum distinct approver count for runs routed there."""
         return {repo: count for repo, count in self.repo_min_approvals}
+
+    @property
+    def path_required_roles_map(self) -> dict[str, tuple[str, ...]]:
+        """path glob -> approval roles required when a PR's diff touches it."""
+        return {glob: roles for glob, roles in self.path_required_roles}
 
     @property
     def oidc_enabled(self) -> bool:
@@ -752,6 +785,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["repo_min_approvals"] = tuple(
             (str(repo), int(count))
             for repo, count in (policy["repo_min_approvals"] or {}).items()
+        )
+    if "path_required_roles" in policy:
+        out["path_required_roles"] = tuple(
+            (str(glob), tuple(str(role) for role in roles))
+            for glob, roles in (policy["path_required_roles"] or {}).items()
         )
 
     remediation = data.get("remediation", {}) or {}
