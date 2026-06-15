@@ -2,16 +2,20 @@
 
 ``build_evidence_pack`` reads a single run's full chain out of the DB and
 returns a JSON-serialisable dict. ``verify_integrity`` recomputes what can be
-recomputed - every artifact's content hash, and the contiguity of the
-append-only audit sequence - so an auditor can confirm the export wasn't
-tampered with between storage and export. ``render_evidence_html`` produces a
-zero-build standalone page from that dict.
+recomputed - every artifact's content hash, the contiguity of the append-only
+audit sequence, and the cross-row hash chain linking the audit events - so an
+auditor can confirm the export wasn't tampered with between storage and export.
+``render_evidence_html`` produces a zero-build standalone page from that dict.
 
 Honest about what the verification *is*: artifacts are content-addressed
-(``sha256(content_json)``), so we recompute and compare those, and we check the
-per-run audit ``sequence`` is gap-free and strictly increasing. It is not a
-blockchain-style linked hash chain across rows - we say so rather than oversell
-it (see issue #24 on provenance claims).
+(``sha256(content_json)``), so we recompute and compare those; we check the
+per-run audit ``sequence`` is gap-free and strictly increasing; and we recompute
+the linked hash chain in which each audit event commits to the previous event's
+hash, so dropping, reordering, editing, or inserting a row is detectable
+(issue #36). The chain has no external anchor - a wholesale rewrite that
+recomputes every downstream hash consistently would still verify - so we don't
+oversell it as immutable provenance (see issue #24); it is tamper-*evidence*,
+not tamper-proofing.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from foundry.audit.events import AUDIT_CHAIN_GENESIS, audit_event_chain_hash
 from foundry.db.models import (
     ArtifactType,
     FoundryAgentJob,
@@ -107,13 +112,19 @@ def verify_integrity(
     contiguous = sorted(sequences) == list(range(len(sequences)))
     sequence_ok = ordered and unique and contiguous
 
+    chain = _verify_audit_chain(events)
+
     return {
-        "verified": artifacts_ok and sequence_ok,
+        "verified": artifacts_ok and sequence_ok and chain["ok"],
         "method": (
             "Recomputed sha256(content_json) for each artifact and compared to "
             "the stored content hash; checked the per-run audit sequence is "
-            "exactly 0..N-1 (gap-free, unique, strictly increasing). Not a "
-            "cross-row linked hash chain."
+            "exactly 0..N-1 (gap-free, unique, strictly increasing); and "
+            "recomputed the cross-row hash chain in which each audit event "
+            "commits to the previous event's hash, so a dropped, reordered, "
+            "edited or inserted row breaks the chain. Events written before the "
+            "chain column existed (no stored hash) are reported as un-chained "
+            "rather than failing verification."
         ),
         "artifacts": {
             "checked": len(artifact_results),
@@ -128,6 +139,44 @@ def verify_integrity(
             "unique": unique,
             "contiguous": contiguous,
         },
+        "audit_chain": chain,
+    }
+
+
+def _verify_audit_chain(events: list[FoundryAuditEvent]) -> dict[str, Any]:
+    """Recompute the cross-row linked hash chain over a run's audit events.
+
+    Walks the events in ``sequence`` order, recomputing each event's chain hash
+    from the previous event's *stored* hash (so a single tampered row is flagged
+    locally rather than cascading) and comparing to the stored value. Returns:
+
+    - ``present`` - whether a chain exists to check at all. A run with no events,
+      or one whose events predate the chain column (any ``content_hash`` is
+      ``NULL``), has no chain; such a run is reported un-chained and does **not**
+      fail verification, so enabling the chain on an existing DB is safe.
+    - ``ok`` - every present link recomputed to its stored hash (vacuously true
+      when there is no chain to check).
+    - ``checked`` - number of links verified.
+    - ``broken_at`` - the sequence numbers whose stored hash didn't match.
+    """
+    present = bool(events) and all(e.content_hash is not None for e in events)
+    if not present:
+        return {"ok": True, "present": False, "checked": 0, "broken_at": []}
+
+    broken_at: list[int] = []
+    prev = AUDIT_CHAIN_GENESIS
+    for event in sorted(events, key=lambda e: e.sequence):
+        expected = audit_event_chain_hash(prev, event)
+        if expected != event.content_hash:
+            broken_at.append(event.sequence)
+        # Advance on the stored hash so one altered row doesn't cascade into
+        # every later link; a re-hashed forgery still breaks the next link.
+        prev = event.content_hash
+    return {
+        "ok": not broken_at,
+        "present": True,
+        "checked": len(events),
+        "broken_at": broken_at,
     }
 
 
@@ -230,6 +279,7 @@ def build_evidence_pack(
             "actor_id": e.actor_id,
             "input_hash": e.input_hash,
             "output_hash": e.output_hash,
+            "content_hash": e.content_hash,
             "metadata": json.loads(e.metadata_json) if e.metadata_json else None,
             "created_at": _iso(e.created_at),
         }
@@ -517,6 +567,7 @@ def render_evidence_html(pack: dict[str, Any]) -> str:
                     "artifacts_ok": integrity["artifacts"]["ok"],
                     "failed_artifacts": integrity["artifacts"]["failed"],
                     "audit_sequence": integrity["audit_sequence"],
+                    "audit_chain": integrity["audit_chain"],
                 }
             ),
         ),

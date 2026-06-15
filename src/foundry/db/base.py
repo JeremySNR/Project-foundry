@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -18,12 +18,22 @@ class Base(DeclarativeBase):
 
 
 def _assign_audit_sequences(session, flush_context, instances) -> None:
-    """Give new audit events their monotonic per-run sequence numbers.
+    """Give new audit events their per-run sequence *and* chain hash.
 
     The audit trail promises a guaranteed order independent of timestamp ties;
     that only holds if something actually assigns the numbers. Done here, at
     flush time, so every code path that adds an event gets it for free.
+
+    Each new event is also linked into a tamper-evident hash chain: its
+    ``content_hash`` commits to the previous event's hash for the run, so
+    dropping, reordering, or editing any row is detectable on verification
+    (issue #36). The link function lives in ``foundry.audit.events`` so the
+    write side here and the read side in ``compliance.evidence`` share one
+    definition and cannot drift. Imported lazily to avoid an import cycle
+    (``audit.events`` imports the ORM models, which import this module).
     """
+    from foundry.audit.events import AUDIT_CHAIN_GENESIS, audit_event_chain_hash
+
     from .models import FoundryAuditEvent
 
     new_events = [obj for obj in session.new if isinstance(obj, FoundryAuditEvent)]
@@ -33,14 +43,27 @@ def _assign_audit_sequences(session, flush_context, instances) -> None:
     for evt in new_events:
         by_run.setdefault(evt.run_id, []).append(evt)
     for run_id, events in by_run.items():
-        current = session.execute(
-            select(func.max(FoundryAuditEvent.sequence)).where(
-                FoundryAuditEvent.run_id == run_id
-            )
-        ).scalar()
-        next_seq = (current + 1) if current is not None else 0
+        # The current chain tip: the highest-sequence event already persisted for
+        # this run, with its hash. One query gives both the next sequence and the
+        # hash to chain off.
+        tip = session.execute(
+            select(FoundryAuditEvent.sequence, FoundryAuditEvent.content_hash)
+            .where(FoundryAuditEvent.run_id == run_id)
+            .order_by(FoundryAuditEvent.sequence.desc())
+            .limit(1)
+        ).first()
+        if tip is None:
+            next_seq = 0
+            prev_hash = AUDIT_CHAIN_GENESIS
+        else:
+            next_seq = tip.sequence + 1
+            # A legacy tip (written before the chain existed) has no hash; start a
+            # fresh chain from genesis rather than retroactively rewriting history.
+            prev_hash = tip.content_hash or AUDIT_CHAIN_GENESIS
         for evt in events:
             evt.sequence = next_seq
+            evt.content_hash = audit_event_chain_hash(prev_hash, evt)
+            prev_hash = evt.content_hash
             next_seq += 1
 
 

@@ -42,6 +42,46 @@ def content_hash(content: Any) -> str:
     return hashlib.sha256(_canonical(content).encode("utf-8")).hexdigest()
 
 
+# The "previous hash" that seeds the first event in a run's trail. A fixed,
+# documented constant (rather than a magic value) so the genesis link is stable.
+AUDIT_CHAIN_GENESIS = ""
+
+
+def audit_event_chain_hash(prev_hash: str, event: FoundryAuditEvent) -> str:
+    """SHA-256 linking an audit event to the previous event in its run's trail.
+
+    The hash commits to the event's immutable identifying fields *and* the prior
+    event's chain hash, so tampering with, dropping, reordering, or inserting any
+    row breaks the chain from that point on - the tamper-evidence that the
+    per-row artifact hashes and the bare sequence-continuity check cannot give on
+    their own (issue #36 / the integrity-trust dependency in #13/#10).
+
+    This is the single source of truth for the chain: the flush hook in
+    ``db.base`` computes it on write and ``compliance.evidence.verify_integrity``
+    recomputes it on read, so the two cannot drift. ``created_at`` is
+    deliberately excluded - it is assigned by the column default at INSERT, after
+    the before-flush hook that computes this runs, so it is not reliably present
+    here; ``sequence`` already pins order.
+    """
+    payload = {
+        "prev": prev_hash,
+        "id": event.id,
+        "sequence": event.sequence,
+        "event_type": (
+            event.event_type.value
+            if hasattr(event.event_type, "value")
+            else event.event_type
+        ),
+        "actor_type": event.actor_type,
+        "actor_id": event.actor_id,
+        "input_hash": event.input_hash,
+        "output_hash": event.output_hash,
+        "metadata_json": event.metadata_json,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4()}"
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from .events import (
+    AUDIT_CHAIN_GENESIS,
+    audit_event_chain_hash,
     build_artifact,
     build_audit_event,
     build_policy_decision_row,
@@ -12,6 +14,8 @@ from .events import (
 
 __all__ = [
     "content_hash",
+    "audit_event_chain_hash",
+    "AUDIT_CHAIN_GENESIS",
     "new_id",
     "build_artifact",
     "build_audit_event",

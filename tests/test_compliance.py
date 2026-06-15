@@ -158,6 +158,11 @@ def test_integrity_passes_for_untampered_run(session_factory) -> None:
     assert integrity["artifacts"]["failed"] == []
     assert integrity["audit_sequence"]["ok"] is True
     assert integrity["audit_sequence"]["contiguous"] is True
+    # The cross-row hash chain is present and intact for a real run.
+    assert integrity["audit_chain"]["present"] is True
+    assert integrity["audit_chain"]["ok"] is True
+    assert integrity["audit_chain"]["checked"] == 2  # two seeded events
+    assert integrity["audit_chain"]["broken_at"] == []
 
 
 def test_integrity_flags_a_tampered_artifact(session_factory) -> None:
@@ -195,6 +200,96 @@ def test_integrity_flags_a_sequence_gap(session_factory) -> None:
     pack = _build(session_factory, run_id)
     assert pack["integrity"]["audit_sequence"]["contiguous"] is False
     assert pack["integrity"]["verified"] is False
+
+
+def test_chain_flags_a_tampered_event_field(session_factory) -> None:
+    """Edit an event's metadata without rebuilding its hash: chain must break."""
+    run_id = _seed_run(session_factory)
+    with session_factory() as session:
+        # Tamper the *second* event so the sequence stays contiguous and the
+        # artifacts stay valid - only the chain can catch this.
+        evt = (
+            session.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id)
+            .order_by(FoundryAuditEvent.sequence)
+            .all()[1]
+        )
+        evt.metadata_json = json.dumps({"tampered": True})
+        session.commit()
+
+    integrity = _build(session_factory, run_id)["integrity"]
+    assert integrity["audit_sequence"]["ok"] is True  # sequence untouched
+    assert integrity["artifacts"]["ok"] is True  # artifacts untouched
+    assert integrity["audit_chain"]["ok"] is False
+    assert integrity["audit_chain"]["broken_at"] == [1]
+    assert integrity["verified"] is False  # the chain alone fails it
+
+
+def test_chain_flags_a_reordered_event(session_factory) -> None:
+    """Swap two events' sequence numbers: contiguity still holds, chain breaks.
+
+    The swap is done through a temporary out-of-range sequence (with explicit
+    flushes) because the ``(run_id, sequence)`` unique index - the issue #10
+    defense - rejects an in-place swap. The flush hook only (re)chains *new*
+    events, so these updated rows keep the hash they were originally chained
+    with, which is exactly what makes the reorder detectable.
+    """
+    run_id = _seed_run(session_factory)
+    with session_factory() as session:
+        events = (
+            session.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id)
+            .order_by(FoundryAuditEvent.sequence)
+            .all()
+        )
+        events[0].sequence = 999
+        session.flush()
+        events[1].sequence = 0
+        session.flush()
+        events[0].sequence = 1
+        session.commit()
+
+    integrity = _build(session_factory, run_id)["integrity"]
+    # Sequence is still exactly 0..N-1 (gap-free, unique), so that check passes;
+    # only the cross-row chain catches that the rows were reordered.
+    assert integrity["audit_sequence"]["ok"] is True
+    assert integrity["audit_chain"]["ok"] is False
+    assert integrity["verified"] is False
+
+
+def test_chain_detects_a_deleted_event(session_factory) -> None:
+    """Deleting the first event breaks both contiguity and the chain."""
+    run_id = _seed_run(session_factory)
+    with session_factory() as session:
+        first = (
+            session.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id)
+            .order_by(FoundryAuditEvent.sequence)
+            .first()
+        )
+        session.delete(first)
+        session.commit()
+
+    integrity = _build(session_factory, run_id)["integrity"]
+    assert integrity["audit_chain"]["present"] is True
+    assert integrity["audit_chain"]["ok"] is False
+    assert integrity["verified"] is False
+
+
+def test_chain_absent_for_legacy_unhashed_events_does_not_fail(session_factory) -> None:
+    """Rows predating the chain column (NULL hash) read as un-chained, not broken."""
+    run_id = _seed_run(session_factory)
+    with session_factory() as session:
+        for evt in session.query(FoundryAuditEvent).filter_by(run_id=run_id):
+            evt.content_hash = None  # simulate a pre-migration row
+        session.commit()
+
+    integrity = _build(session_factory, run_id)["integrity"]
+    assert integrity["audit_chain"]["present"] is False
+    assert integrity["audit_chain"]["ok"] is True
+    assert integrity["audit_chain"]["checked"] == 0
+    # With artifacts + sequence intact, the run still verifies overall.
+    assert integrity["verified"] is True
 
 
 def test_control_satisfied_only_when_all_evidence_present(session_factory) -> None:
@@ -270,6 +365,7 @@ def test_verify_integrity_empty_run_is_trivially_verified() -> None:
             "unique": True,
             "contiguous": True,
         },
+        "audit_chain": {"ok": True, "present": False, "checked": 0, "broken_at": []},
     }
 
 
