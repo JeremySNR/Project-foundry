@@ -8,13 +8,15 @@ and a review-queue panel (open PRs with review-latency age + a "stale since last
 push" age, each with its own SLA, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
-merge-confidence trend (is each agent improving?), an epic board (multi-repo
+merge-confidence trend (is each agent improving?), a delivery-by-repo table
+(where work ships, stalls, and spends), an epic board (multi-repo
 runs rolled up, issue #35), the run list (with an approval-queue filter) and,
 per run, the full decision timeline (artifacts, audit events, policy decisions,
 agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/approvals``, ``GET /metrics/executions``, ``GET /metrics/reviews``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
-``GET /metrics/agents``, ``GET /metrics/agents/trends``, ``GET /epics`` and
+``GET /metrics/delivery/by-repo``, ``GET /metrics/agents``,
+``GET /metrics/agents/trends``, ``GET /epics`` and
 ``GET /runs/{id}/timeline``; the calls carry the bearer token the user pastes
 once (kept in localStorage, never sent anywhere but this API).
 
@@ -195,6 +197,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="trends"></div>
 <div id="agents"></div>
 <div id="agent-trends"></div>
+<div id="repo-delivery"></div>
 <div id="epics"></div>
 <main>
   <div id="runs"></div>
@@ -691,6 +694,44 @@ async function loadTrends() {
   }
 }
 
+async function loadRepoDelivery() {
+  const el = $("#repo-delivery");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/delivery/by-repo?days=90", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const repos = m.repos || [];
+    if (!repos.length) { el.style.display = "none"; return; }
+    const rows = repos.map((r) => {
+      const cost = r.total_cost_usd == null ? "-" : "$" + r.total_cost_usd;
+      const ttm = r.time_to_merge_seconds || {};
+      return `<tr>
+        <td>${esc(r.repo)}</td>
+        <td class="num">${r.prs_shipped}</td>
+        <td class="num">${r.blocked}</td>
+        <td class="num">${r.runs_finished}</td>
+        <td class="num">${Math.round(r.merge_rate * 100)}%</td>
+        <td class="num">${r.retries_consumed}</td>
+        <td class="num">${dur(ttm.median)}</td>
+        <td class="num">${cost}</td>
+      </tr>`;
+    }).join("");
+    el.innerHTML = `<details><summary>delivery by repo (90d) &mdash; where work ships, stalls, and spends</summary>
+      <table><tr><th>repository</th><th>shipped</th><th>blocked</th><th>finished</th>
+        <th>merge rate</th><th>retries</th><th>median to merge</th><th>spend</th></tr>${rows}</table>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadAgentTrends() {
   const el = $("#agent-trends");
   if (!hasAuth()) {
@@ -780,6 +821,7 @@ function refresh() {
   loadTrends();
   loadAgents();
   loadAgentTrends();
+  loadRepoDelivery();
   loadEpics();
 }
 

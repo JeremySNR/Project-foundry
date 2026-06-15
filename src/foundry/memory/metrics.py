@@ -235,6 +235,101 @@ def delivery_metrics(session, *, since: datetime) -> dict:
     }
 
 
+# Group label for finished runs that never got routed to a repo (NULL
+# ``repo`` - unroutable blocks, needs-clarification, rejected-at-intake). They
+# carry real ROI signal (intake-stage attrition), so they bucket under an
+# explicit sentinel rather than being silently dropped from the per-repo cut.
+UNROUTED_REPO_LABEL = "(unrouted)"
+
+
+def delivery_by_repo(session, *, since: datetime) -> dict:
+    """Delivery outcomes grouped by routed repo - the per-repo cut of
+    :func:`delivery_metrics`.
+
+    Answers "which repos are we shipping to, which stall, and where is the
+    spend going?" - the repo dimension that the org-wide ``delivery_metrics``
+    and the per-provider scorecards don't surface. Read at request time from
+    ``foundry_run_outcomes`` (the same denormalized rows the other metrics
+    read), so it adds no new write path and can be rebuilt by
+    ``foundry-memory backfill``.
+    """
+    rows: list[FoundryRunOutcome] = (
+        session.query(FoundryRunOutcome)
+        .filter(FoundryRunOutcome.completed_at >= since)
+        .all()
+    )
+
+    # Per-repo accumulators. ``cost_seen`` tracks whether *any* row for the repo
+    # reported a cost, so a repo whose runs never reported cost yields
+    # ``total_cost_usd: None`` (never a conjured $0) - same rule as the org-wide
+    # and trend aggregates.
+    repos: dict[str, dict] = {}
+    for row in rows:
+        key = row.repo or UNROUTED_REPO_LABEL
+        agg = repos.get(key)
+        if agg is None:
+            agg = repos[key] = {
+                "outcomes": {},
+                "retries": 0,
+                "escalations": 0,
+                "ci_failures": 0,
+                "total_cost": 0.0,
+                "cost_seen": False,
+                "merge_times": [],
+                "runs_finished": 0,
+            }
+        agg["runs_finished"] += 1
+        agg["outcomes"][row.outcome] = agg["outcomes"].get(row.outcome, 0) + 1
+        agg["retries"] += max(row.jobs_count - 1, 0)
+        agg["escalations"] += row.escalations_count
+        agg["ci_failures"] += row.ci_failures_count
+        if row.cost_usd is not None:
+            agg["total_cost"] += row.cost_usd
+            agg["cost_seen"] = True
+        if row.time_to_merge_seconds is not None:
+            agg["merge_times"].append(row.time_to_merge_seconds)
+
+    out_repos = []
+    for repo, agg in repos.items():
+        merge_times = sorted(agg["merge_times"])
+        runs = agg["runs_finished"]
+        shipped = agg["outcomes"].get("merged", 0)
+        out_repos.append(
+            {
+                "repo": repo,
+                "runs_finished": runs,
+                "outcomes": agg["outcomes"],
+                "prs_shipped": shipped,
+                "blocked": agg["outcomes"].get("blocked", 0),
+                "rejected": agg["outcomes"].get("rejected", 0),
+                "failed": agg["outcomes"].get("failed", 0),
+                "needs_clarification": agg["outcomes"].get("needs_clarification", 0),
+                "merge_rate": round(shipped / runs, 3) if runs else 0.0,
+                "retries_consumed": agg["retries"],
+                "escalations": agg["escalations"],
+                "ci_failures": agg["ci_failures"],
+                "total_cost_usd": (
+                    round(agg["total_cost"], 2) if agg["cost_seen"] else None
+                ),
+                "time_to_merge_seconds": {
+                    "count": len(merge_times),
+                    "median": _percentile(merge_times, 0.5),
+                    "p90": _percentile(merge_times, 0.9),
+                },
+            }
+        )
+
+    # Most-shipping first, then most-active, with a stable name tie-break so the
+    # board ordering is deterministic across requests.
+    out_repos.sort(key=lambda r: (-r["prs_shipped"], -r["runs_finished"], r["repo"]))
+
+    return {
+        "since": since.isoformat(),
+        "runs_finished": len(rows),
+        "repos": out_repos,
+    }
+
+
 def bucket_start(dt: datetime, bucket: str) -> datetime:
     """Snap a completion time to the start of its day/week (UTC, Monday weeks).
 

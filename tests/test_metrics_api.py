@@ -226,6 +226,52 @@ def test_blocked_run_superseded_by_later_merge(client) -> None:
     assert body["blocked_superseded_by_merged_run"] == 1
 
 
+def test_by_repo_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/delivery/by-repo").status_code == 401
+
+
+def test_by_repo_rejects_bad_window(client) -> None:
+    assert (
+        client.get("/metrics/delivery/by-repo?days=0", headers=AUTH).status_code == 422
+    )
+
+
+def test_by_repo_empty_database(client) -> None:
+    body = client.get("/metrics/delivery/by-repo", headers=AUTH).json()
+    assert body["runs_finished"] == 0
+    assert body["repos"] == []
+
+
+def test_by_repo_groups_a_merge_and_a_block(client) -> None:
+    _run_to_merged(client)
+
+    # A second run on the same repo is blocked (PR closed without merging).
+    _post_webhook(
+        client, _ready_payload("issue-b", "LIN-200"), delivery="d-issue-b"
+    )
+    client.post(
+        f"/runs/{_latest_run_id(client)}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+    _post_github(
+        client,
+        _pr_payload("cursor/lin-200-x", number=43, state="closed", merged=False),
+    )
+
+    body = client.get("/metrics/delivery/by-repo?days=30", headers=AUTH).json()
+    assert body["days"] == 30
+    assert body["runs_finished"] == 2
+    repos = {r["repo"]: r for r in body["repos"]}
+    assert "customer-web" in repos
+    web = repos["customer-web"]
+    assert web["runs_finished"] == 2
+    assert web["prs_shipped"] == 1
+    assert web["blocked"] == 1
+    assert web["merge_rate"] == 0.5
+    assert web["time_to_merge_seconds"]["count"] == 1
+
+
 def test_agent_metrics_requires_bearer_token(client) -> None:
     assert client.get("/metrics/agents").status_code == 401
     assert client.get("/metrics/agents?days=0", headers=AUTH).status_code == 422

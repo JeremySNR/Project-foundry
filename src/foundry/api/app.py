@@ -1082,6 +1082,24 @@ def create_app(
                 **delivery_trends(session, since=since, bucket=bucket),
             }
 
+    @app.get("/metrics/delivery/by-repo")
+    def metrics_delivery_by_repo(
+        request: Request, days: int = 90
+    ) -> dict[str, Any]:
+        """Delivery outcomes grouped by routed repo (PRs shipped, blocks, merge
+        rate, spend, time-to-merge per repo) - the repo dimension the org-wide
+        ``/metrics/delivery`` and the per-provider ``/metrics/agents`` can't
+        show. Token-gated and fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import delivery_by_repo
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **delivery_by_repo(session, since=since)}
+
     @app.get("/metrics/agents")
     def metrics_agents(request: Request, days: int = 90) -> dict[str, Any]:
         """Per-provider agent scorecards: merge rate, retries and spend, broken
