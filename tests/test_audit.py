@@ -92,3 +92,51 @@ def test_audit_events_get_monotonic_per_run_sequences() -> None:
         ]
     assert seq_a == [0, 1, 2]  # monotonic per run, across separate commits
     assert seq_b == [0]  # independent counter per run
+
+
+def test_audit_events_are_chained_at_flush_time() -> None:
+    """The flush hook links each event into a per-run hash chain off the prior."""
+    from foundry.audit import (
+        AUDIT_CHAIN_GENESIS,
+        audit_event_chain_hash,
+        build_audit_event,
+    )
+    from foundry.db import create_all, make_engine, make_session_factory
+    from foundry.db.models import AuditEventType, FoundryAuditEvent, FoundryRun
+
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+
+    def _event(run_id: str) -> object:
+        return build_audit_event(
+            run_id=run_id, event_type=AuditEventType.RUN_STARTED, actor_type="foundry"
+        )
+
+    with sf() as session:
+        session.add(
+            FoundryRun(id="run-a", linear_issue_id="a", linear_issue_key="a",
+                       trigger_type="test")
+        )
+        session.add(_event("run-a"))
+        session.commit()
+        session.add(_event("run-a"))  # a later commit must chain off the tip
+        session.commit()
+
+        events = (
+            session.query(FoundryAuditEvent)
+            .filter_by(run_id="run-a")
+            .order_by(FoundryAuditEvent.sequence)
+            .all()
+        )
+        # Every event has a hash, and recomputing the chain off the prior hash
+        # (genesis for the first) reproduces each stored value exactly.
+        prev = AUDIT_CHAIN_GENESIS
+        for evt in events:
+            assert evt.content_hash is not None
+            assert evt.content_hash == audit_event_chain_hash(prev, evt)
+            prev = evt.content_hash
+        # And the second event genuinely commits to the first (not genesis).
+        assert events[1].content_hash != audit_event_chain_hash(
+            AUDIT_CHAIN_GENESIS, events[1]
+        )

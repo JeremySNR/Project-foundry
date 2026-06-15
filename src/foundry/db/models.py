@@ -213,6 +213,11 @@ class FoundryAuditEvent(Base):
     actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     output_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Cross-row tamper-evidence: sha256 linking this event to the previous event
+    # in the run's trail (assigned at flush time in db.base, verified in
+    # compliance.evidence). Nullable so legacy rows written before the chain
+    # existed read back cleanly (issue #36).
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
