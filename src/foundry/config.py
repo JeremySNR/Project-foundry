@@ -203,6 +203,16 @@ class Settings:
     # byte-for-byte).
     execution_sla_seconds: int | None = None
 
+    # Review SLA: how long (seconds) a run may sit at an open PR (PR_OPEN,
+    # awaiting review/CI) before it is flagged as breaching - the review-latency
+    # signal ("PRs sitting unreviewed for N hours"), the review-side complement
+    # to ``approval_sla_seconds`` / ``execution_sla_seconds``. The product
+    # deliberately stops at a reviewed PR, so this is read-only visibility on the
+    # fleet strip and the GET /metrics/reviews queue; it changes no gate and
+    # blocks no run. None (default) = no SLA configured, no breach signal (the
+    # historical behaviour, byte-for-byte).
+    review_sla_seconds: int | None = None
+
     # --- issue tracker (behaviour: yaml) ---
     # "linear" (default), "github_issues" (the issue is the ticket; approvers
     # are then keyed by GitHub login instead of email), or "jira".
@@ -537,6 +547,11 @@ class Settings:
             raise ValueError(
                 "execution_sla_seconds must be >= 1 when set, got "
                 f"{self.execution_sla_seconds} (omit it to disable the SLA signal)"
+            )
+        if self.review_sla_seconds is not None and self.review_sla_seconds < 1:
+            raise ValueError(
+                "review_sla_seconds must be >= 1 when set, got "
+                f"{self.review_sla_seconds} (omit it to disable the SLA signal)"
             )
         # OIDC is all-or-nothing: a partial config that looked enabled but
         # silently verified nothing would be a fail-open auth hole.
@@ -891,6 +906,9 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "execution_sla_seconds" in dashboard:
         value = dashboard["execution_sla_seconds"]
         out["execution_sla_seconds"] = None if value is None else int(value)
+    if "review_sla_seconds" in dashboard:
+        value = dashboard["review_sla_seconds"]
+        out["review_sla_seconds"] = None if value is None else int(value)
 
     notifications = data.get("notifications", {}) or {}
     if "slack_channel" in notifications:
@@ -1062,4 +1080,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
     if "FOUNDRY_EXECUTION_SLA_SECONDS" in env:
         raw = env["FOUNDRY_EXECUTION_SLA_SECONDS"].strip()
         out["execution_sla_seconds"] = None if raw == "" else int(raw)
+    if "FOUNDRY_REVIEW_SLA_SECONDS" in env:
+        raw = env["FOUNDRY_REVIEW_SLA_SECONDS"].strip()
+        out["review_sla_seconds"] = None if raw == "" else int(raw)
     return out

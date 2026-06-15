@@ -516,6 +516,72 @@ def test_fleet_includes_execution_queue_summary() -> None:
     assert body["executions_breaching_sla"] == 0
 
 
+def _run_to_pr_open(client, issue_id="issue-p", key="LIN-700", number=77) -> str:
+    """Drive a run to PR_OPEN: ready ticket -> approve -> agent ships an open PR
+    (not merged), so it parks awaiting review/CI."""
+    _post_webhook(client, _ready_payload(issue_id, key), delivery=f"d-{issue_id}")
+    run_id = _latest_run_id(client)
+    client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+    branch = f"cursor/{key.lower()}-favourites"
+    resp = _post_github(
+        client, _pr_payload(branch, number=number, state="open", merged=False)
+    )
+    assert resp.json()["run_status"] == "pr_open"
+    return run_id
+
+
+def test_reviews_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/reviews").status_code == 401
+    assert (
+        client.get(
+            "/metrics/reviews", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_reviews_empty_database(client) -> None:
+    body = client.get("/metrics/reviews", headers=AUTH).json()
+    assert body["count"] == 0
+    assert body["runs"] == []
+    assert body["oldest_unreviewed_seconds"] is None
+    assert body["sla_breaches"] == 0
+    assert body["sla_seconds"] is None
+
+
+def test_reviews_lists_open_pr(client) -> None:
+    run_id = _run_to_pr_open(client)
+    body = client.get("/metrics/reviews", headers=AUTH).json()
+    assert body["count"] == 1
+    entry = body["runs"][0]
+    assert entry["run_id"] == run_id
+    assert entry["status"] == "pr_open"
+    assert entry["unreviewed_seconds"] >= 0
+    assert entry["sla_breached"] is False  # no SLA configured
+
+
+def test_fleet_includes_review_queue_summary() -> None:
+    client = _client_with(review_sla_seconds=86_400)  # 24h
+    # No PR open yet: the strip's review summary is empty/inert.
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["review_sla_seconds"] == 86_400
+    assert body["reviews_breaching_sla"] == 0
+    assert body["oldest_review_seconds"] is None
+
+    # Ship an open PR; the strip now reports a non-negative oldest review age.
+    _run_to_pr_open(client)
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["prs_open"] == 1
+    assert body["oldest_review_seconds"] is not None
+    assert body["oldest_review_seconds"] >= 0
+    # A just-opened PR hasn't breached a 24h SLA.
+    assert body["reviews_breaching_sla"] == 0
+
+
 def test_final_summary_appears_in_timeline(client) -> None:
     _run_to_merged(client)
     run_id = _latest_run_id(client)
