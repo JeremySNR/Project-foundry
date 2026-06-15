@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from foundry.connectors.notify import ApprovalRequest
+from foundry.connectors.notify import ApprovalProgress, ApprovalRequest
 from foundry.schemas.common import RunStatus
 
 # The button wire contract shared with the inbound parser (``api/slack.py``):
@@ -72,6 +72,9 @@ class SlackNotifier:
         self, issue_id: str, issue_key: str | None, status: RunStatus
     ) -> None:
         self._transport(*_status_message(issue_id, issue_key, status))
+
+    def approval_progress(self, progress: ApprovalProgress) -> None:
+        self._transport(*_approval_progress_message(progress))
 
 
 def _ref(issue_id: str, issue_key: str | None) -> str:
@@ -145,5 +148,27 @@ def _status_message(
     ref = _ref(issue_id, issue_key)
     label = status_label(status)
     text = f"Foundry run {ref}: {label}"
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    return text, blocks
+
+
+def _approval_progress_message(
+    progress: ApprovalProgress,
+) -> tuple[str, list[dict[str, Any]]]:
+    """The mid-flow nudge for the next approver of an N-of-M run (issue #31).
+
+    A short, non-interactive progress message - the original interactive
+    approval message (with its buttons) is already in the channel; this just
+    tells the next approver that one sign-off has landed and another is needed.
+    """
+    ref = _ref(progress.issue_id, progress.issue_key)
+    remaining = progress.remaining
+    plural = "s" if remaining != 1 else ""
+    text = (
+        f":hourglass_flowing_sand: Foundry run {ref}: "
+        f"{progress.collected} of {progress.required} approvals collected "
+        f"(latest: {progress.last_approver}) - "
+        f"{remaining} more distinct sign-off{plural} needed to proceed"
+    )
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
     return text, blocks

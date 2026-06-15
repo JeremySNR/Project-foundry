@@ -19,7 +19,7 @@ import pytest
 from foundry.agents.manual import InMemoryFakeProvider
 from foundry.api.slack import parse_slack_interaction
 from foundry.connectors import InMemoryNotifier, SlackNotifier
-from foundry.connectors.notify import ApprovalRequest
+from foundry.connectors.notify import ApprovalProgress, ApprovalRequest
 from foundry.connectors.transport import TransportError, slack_transport
 from foundry.db import (
     FoundryRun,
@@ -164,6 +164,45 @@ def test_status_message_falls_back_to_issue_id_without_key() -> None:
     [(text, _blocks)] = sent
     assert "issue-r" in text
     assert "Merged" in text
+
+
+def test_approval_progress_message_nudges_next_approver() -> None:
+    """A partial N-of-M sign-off renders a progress nudge telling the next
+    approver how many distinct sign-offs are in and how many remain (issue #31)."""
+    notifier, sent = _recording_notifier()
+    notifier.approval_progress(
+        ApprovalProgress(
+            issue_id="issue-r",
+            issue_key="LIN-123",
+            collected=1,
+            required=2,
+            last_approver="alice@example.com",
+        )
+    )
+    [(text, blocks)] = sent
+    assert "LIN-123" in text
+    assert "1 of 2 approvals collected" in text
+    assert "alice@example.com" in text
+    # remaining == 1 -> singular "sign-off"
+    assert "1 more distinct sign-off needed" in text
+    assert blocks and blocks[0]["type"] == "section"
+
+
+def test_approval_progress_message_pluralises_and_falls_back_to_id() -> None:
+    notifier, sent = _recording_notifier()
+    notifier.approval_progress(
+        ApprovalProgress(
+            issue_id="issue-r",
+            issue_key=None,
+            collected=1,
+            required=3,
+            last_approver="bob@example.com",
+        )
+    )
+    [(text, _blocks)] = sent
+    assert "issue-r" in text  # no key -> fall back to the id
+    assert "1 of 3 approvals collected" in text
+    assert "2 more distinct sign-offs needed" in text  # plural
 
 
 # -- slack_transport wire behaviour --------------------------------------------
@@ -318,9 +357,17 @@ def test_notifier_failure_does_not_break_the_run(session_factory) -> None:
         def status_changed(self, issue_id, issue_key, status):
             raise RuntimeError("slack down")
 
-    orch = FoundryOrchestrator(session_factory, notifier=Boom())
+        def approval_progress(self, progress):
+            raise RuntimeError("slack down")
+
+    orch = FoundryOrchestrator(session_factory, notifier=Boom(), min_approvals=2)
     # Intake still completes and parks the run despite the notifier raising.
     run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+    # A partial N-of-M sign-off fires the progress nudge; a raising notifier
+    # must not break the approval path - the run stays parked, ready for the
+    # next approver.
+    orch.approve(run_id, user="alice@example.com")
     assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
 
 

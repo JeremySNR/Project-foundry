@@ -9,6 +9,7 @@ from foundry.connectors import (
     LinearConnector,
     LinearWriteError,
     format_analysis_comment,
+    format_approval_progress_comment,
     format_cursor_delegation,
     state_for,
 )
@@ -187,3 +188,20 @@ def test_cursor_delegation_mentions_cursor() -> None:
     body = format_cursor_delegation("Implement the favourites feature.")
     assert body.startswith("@Cursor")
     assert "Implement the favourites feature." in body
+
+
+def test_approval_progress_comment_singular_remaining() -> None:
+    body = format_approval_progress_comment(
+        collected=1, required=2, last_approver="alice@example.com"
+    )
+    assert "approval progress" in body.lower()
+    assert "1 of 2 distinct sign-offs collected (latest: alice@example.com)" in body
+    assert "1 more approver required" in body  # singular
+    assert "/foundry approve" in body
+
+
+def test_approval_progress_comment_plural_remaining() -> None:
+    body = format_approval_progress_comment(
+        collected=1, required=3, last_approver="bob@example.com"
+    )
+    assert "2 more approvers required" in body  # plural

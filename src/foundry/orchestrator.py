@@ -28,8 +28,12 @@ from sqlalchemy.exc import IntegrityError
 from foundry.agents.manual import ManualProvider
 from foundry.agents.provider import CodingAgentProvider
 from foundry.connectors.base import IssueTracker
-from foundry.connectors.comments import format_analysis_comment, state_for
-from foundry.connectors.notify import ApprovalRequest, RunNotifier
+from foundry.connectors.comments import (
+    format_analysis_comment,
+    format_approval_progress_comment,
+    state_for,
+)
+from foundry.connectors.notify import ApprovalProgress, ApprovalRequest, RunNotifier
 from foundry.engines.decomposition import EpicDecomposer, HeuristicDecomposer
 from foundry.epics import EpicIntakeResult, compute_epic_rollup
 from foundry.observability import traced
@@ -617,6 +621,53 @@ class FoundryOrchestrator:
                 "notifier approval message failed for issue %s", ticket.issue_id
             )
 
+    def _notify_approval_progress(
+        self,
+        issue_id: str,
+        issue_key: str | None,
+        *,
+        collected: int,
+        required: int,
+        last_approver: str,
+    ) -> None:
+        """Nudge the next approver after a partial N-of-M sign-off (issue #31).
+
+        The first approval prompt tells approvers up front that the run needs
+        several *distinct* sign-offs, but once one lands the run sits parked at
+        ``awaiting_approval (1/2)`` with nothing telling the next approver to
+        act. This posts a short progress nudge to the tracker and the chat
+        surface so a two-person-rule run doesn't go silent between sign-offs.
+
+        Presentation/notification-only and best-effort, exactly like every other
+        notification: it never advances, blocks, or releases a run (the count
+        check above is the gate), and a tracker/chat outage must never break the
+        approval path.
+        """
+        self._notify_comment(
+            issue_id,
+            format_approval_progress_comment(
+                collected=collected,
+                required=required,
+                last_approver=last_approver,
+            ),
+        )
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.approval_progress(
+                ApprovalProgress(
+                    issue_id=issue_id,
+                    issue_key=issue_key,
+                    collected=collected,
+                    required=required,
+                    last_approver=last_approver,
+                )
+            )
+        except Exception:
+            _log.exception(
+                "notifier approval-progress message failed for issue %s", issue_id
+            )
+
     def _notify_comment(self, issue_id: str, body: str) -> None:
         if self._tracker is not None:
             try:
@@ -716,6 +767,7 @@ class FoundryOrchestrator:
             approver_count = len(prior_users) + 1
             min_required = self._min_approvals_for(repo)
             issue_id = run.linear_issue_id
+            issue_key = run.linear_issue_key
             if approver_count >= min_required:
                 run.status = RunStatus.APPROVED
                 run.approved_by = user
@@ -726,12 +778,22 @@ class FoundryOrchestrator:
             else:
                 # Still short of the required sign-offs: record progress on the
                 # run so the timeline/dashboard shows "1 of 2", and leave the run
-                # parked for the next approver. No state-change notification - the
-                # status has not changed - so we don't re-spam the approval prompt.
+                # parked for the next approver. The status has not changed, so we
+                # send no *state-change* notification (which would re-spam the
+                # original prompt); instead we send a dedicated progress nudge so
+                # the next approver is told one sign-off won't release the run,
+                # rather than the run going silent at "(1/2)" (issue #31).
                 run.current_step = (
                     f"awaiting_approval ({approver_count}/{min_required})"
                 )
                 session.commit()
+                self._notify_approval_progress(
+                    issue_id,
+                    issue_key,
+                    collected=approver_count,
+                    required=min_required,
+                    last_approver=user,
+                )
 
     def reject(self, run_id: str, *, user: str) -> None:
         """Terminate a run a human declined (from ``/foundry reject``)."""
