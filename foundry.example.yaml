@@ -244,6 +244,30 @@ auth:
   #     eng-leads: ["engineering"]
   #     security-team: ["security"]
   #     qa-guild: ["qa"]
+  #
+  #   # --- dashboard browser login / SSO (issue #34) ---
+  #   # Lets an operator sign in to /dashboard via your IdP (OAuth2
+  #   # authorization-code + PKCE) instead of pasting an API token. Builds on the
+  #   # bearer config above: the same issuer/jwks verify the id_token (its
+  #   # audience is the client_id below). The session cookie minted on success
+  #   # authenticates the dashboard's READ calls only - it is rejected on the
+  #   # approval endpoint (CSRF-safe), which still needs a bearer/webhook.
+  #   #
+  #   # The four parts below are public (not secrets) and all-or-nothing. Two
+  #   # secrets are env-only and required to actually wire login (startup fails
+  #   # loud if a part is configured but a secret is missing):
+  #   #   FOUNDRY_OIDC_CLIENT_SECRET  - the OAuth client secret
+  #   #   FOUNDRY_SESSION_SECRET      - HMAC key signing the session cookie
+  #   # Env overrides for the parts: FOUNDRY_OIDC_CLIENT_ID /
+  #   # _AUTHORIZATION_ENDPOINT / _TOKEN_ENDPOINT / _REDIRECT_URI / _SCOPES /
+  #   # _SESSION_TTL_SECONDS / _COOKIE_SECURE.
+  #   client_id: "foundry-dashboard"
+  #   authorization_endpoint: "https://login.example.com/authorize"
+  #   token_endpoint: "https://login.example.com/oauth/token"
+  #   redirect_uri: "https://foundry.example.com/dashboard/auth/callback"
+  #   scopes: ["openid", "email"]    # what the login requests from the IdP
+  #   session_ttl_seconds: 28800     # how long a signed-in session lasts (8h)
+  #   cookie_secure: true            # mark cookies Secure; false only for local HTTP
 
 notifications:
   # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status

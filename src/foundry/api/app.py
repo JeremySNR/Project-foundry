@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func
 
 from foundry.compliance import (
@@ -70,16 +70,24 @@ from foundry.policy import LocalPolicyEngine, OpaPolicyEngine, PolicyEngine
 from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
-from .dashboard import DASHBOARD_HTML
+from .dashboard import render_dashboard
 from .dedup import WebhookDeduplicator, webhook_timestamp_fresh
 from .mapping import linear_payload_to_ticket
 from .oidc import (
     OidcAuthError,
+    OidcConfigError,
     OidcVerifier,
     build_verifier,
     groups_from_claims,
     identity_from_claims,
 )
+from .oidc_login import (
+    LOGIN_STATE_COOKIE,
+    SESSION_COOKIE,
+    OidcLogin,
+    OidcLoginError,
+)
+from .sessions import SessionSigner
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
 from .security import (
@@ -174,6 +182,7 @@ def create_app(
     oidc_subject_claim: str = "email",
     oidc_group_claim: str = "groups",
     oidc_group_role_map: Mapping[str, Iterable[str]] | None = None,
+    oidc_login: OidcLogin | None = None,
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
@@ -230,6 +239,13 @@ def create_app(
         group: {ApprovalRole(r) for r in roles}
         for group, roles in (oidc_group_role_map or {}).items()
     }
+    # Browser-side OIDC login (SSO) for the dashboard (issue #34). When wired,
+    # the login routes are live and the signed session cookie authenticates the
+    # dashboard's read calls; left None, the login routes 403 and the dashboard
+    # falls back to the pasted-token UX. The session signer is derived from the
+    # login config so the read path can verify the cookie it mints.
+    app.state.oidc_login = oidc_login
+    app.state.session_signer = oidc_login.signer if oidc_login is not None else None
     app.state.ticket_mapper = ticket_mapper or linear_payload_to_ticket
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
@@ -324,19 +340,103 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/dashboard", include_in_schema=False)
-    def dashboard() -> HTMLResponse:
+    def dashboard(request: Request) -> HTMLResponse:
         """Read-only run dashboard (static page, no build step).
 
         Disabled when no auth is configured - the page is useless without the
         token-gated timeline endpoint, and serving it would advertise the API
         surface for free. Same fail-closed posture as approvals.
+
+        Two booleans are injected into the page: whether the SSO login route is
+        available (to show the "Sign in with SSO" button) and whether *this*
+        request already carries a valid session cookie (so the page knows it is
+        authenticated and need not demand a pasted token).
         """
         if not _auth_configured(app):
             raise HTTPException(
                 status_code=403,
                 detail="dashboard disabled: configure FOUNDRY_API_TOKEN or OIDC auth",
             )
-        return HTMLResponse(DASHBOARD_HTML)
+        return HTMLResponse(
+            render_dashboard(
+                oidc_login=app.state.oidc_login is not None,
+                session=_session_identity(app, request) is not None,
+            )
+        )
+
+    @app.get("/dashboard/login", include_in_schema=False)
+    def dashboard_login() -> RedirectResponse:
+        """Start the OIDC authorization-code login: 302 to the IdP.
+
+        Fail-closed: 403 unless browser SSO login is fully configured.
+        """
+        login: OidcLogin | None = app.state.oidc_login
+        if login is None:
+            raise HTTPException(
+                status_code=403, detail="OIDC browser login is not configured"
+            )
+        authorize_url, state_cookie = login.begin()
+        response = RedirectResponse(authorize_url, status_code=302)
+        # The login-state cookie is scoped to the login routes, short-lived, and
+        # never readable by JS (HttpOnly). SameSite=Lax lets it ride the IdP's
+        # top-level redirect back to the callback.
+        response.set_cookie(
+            LOGIN_STATE_COOKIE,
+            state_cookie,
+            max_age=login.login_ttl_seconds,
+            httponly=True,
+            samesite="lax",
+            secure=login.cookie_secure,
+            path="/dashboard",
+        )
+        return response
+
+    @app.get("/dashboard/auth/callback", include_in_schema=False)
+    def dashboard_callback(
+        request: Request,
+        code: str | None = Query(default=None),
+        state: str | None = Query(default=None),
+        error: str | None = Query(default=None),
+    ) -> RedirectResponse:
+        """Finish the login: verify the IdP response and mint a session cookie."""
+        login: OidcLogin | None = app.state.oidc_login
+        if login is None:
+            raise HTTPException(
+                status_code=403, detail="OIDC browser login is not configured"
+            )
+        # The IdP can redirect back with an error (e.g. the user declined). Drop
+        # the stale login-state cookie and return them to the (unauthenticated)
+        # dashboard rather than surfacing a raw error page.
+        if error:
+            response = RedirectResponse("/dashboard", status_code=302)
+            response.delete_cookie(LOGIN_STATE_COOKIE, path="/dashboard")
+            return response
+        login_cookie = request.cookies.get(LOGIN_STATE_COOKIE)
+        try:
+            session_cookie = login.complete(
+                code=code, state=state, login_cookie=login_cookie
+            )
+        except (OidcLoginError, OidcAuthError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        response = RedirectResponse("/dashboard", status_code=302)
+        response.set_cookie(
+            SESSION_COOKIE,
+            session_cookie,
+            max_age=login.session_ttl_seconds,
+            httponly=True,
+            samesite="lax",
+            secure=login.cookie_secure,
+            path="/",
+        )
+        response.delete_cookie(LOGIN_STATE_COOKIE, path="/dashboard")
+        return response
+
+    @app.get("/dashboard/logout", include_in_schema=False)
+    def dashboard_logout() -> RedirectResponse:
+        """Clear the dashboard session cookie and return to the dashboard."""
+        response = RedirectResponse("/dashboard", status_code=302)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return response
 
     @app.post("/webhooks/linear", status_code=202)
     async def linear_webhook(
@@ -1002,7 +1102,10 @@ def create_app(
         request: Request,
         body: dict[str, Any] = Body(...),
     ) -> dict[str, Any]:
-        claims = _require_api_token(app, request)
+        # allow_session=False: a browser session cookie is auto-sent, so it must
+        # not be able to drive a state-changing approval (CSRF). Approvals need a
+        # bearer token or a signed webhook.
+        claims = _require_api_token(app, request, allow_session=False)
         orch: FoundryOrchestrator = app.state.orchestrator
         text = body.get("text") or body.get("command") or ""
 
@@ -1140,17 +1243,44 @@ def _auth_configured(app: FastAPI) -> bool:
     return bool(app.state.api_token) or app.state.oidc_verifier is not None
 
 
-def _require_api_token(app: FastAPI, request: Request) -> dict[str, Any] | None:
-    """Enforce bearer-token auth on the token-gated API endpoints.
+def _session_identity(app: FastAPI, request: Request) -> str | None:
+    """The verified subject from a dashboard SSO session cookie, or ``None``.
 
-    Accepts **either** the static ``FOUNDRY_API_TOKEN`` (constant-time compare,
-    unchanged) **or** - when OIDC is configured (issue #34) - a valid OIDC JWT.
-    Both may be enabled at once; the static token keeps working byte-for-byte.
+    The cookie is minted only after a full OIDC login (issue #34), so its
+    subject is a cryptographically-verified identity. Returns ``None`` when no
+    signer is configured, the cookie is absent, tampered, expired, or carries no
+    usable subject.
+    """
+    signer = app.state.session_signer
+    if signer is None:
+        return None
+    payload = signer.read(request.cookies.get(SESSION_COOKIE))
+    if payload is None:
+        return None
+    sub = payload.get("sub")
+    return sub if isinstance(sub, str) and sub else None
+
+
+def _require_api_token(
+    app: FastAPI, request: Request, *, allow_session: bool = True
+) -> dict[str, Any] | None:
+    """Enforce auth on the token-gated API endpoints.
+
+    Accepts the static ``FOUNDRY_API_TOKEN`` (constant-time compare, unchanged),
+    or - when OIDC is configured (issue #34) - a valid OIDC JWT bearer token, or
+    - on read endpoints (``allow_session=True``) - a valid dashboard SSO session
+    cookie. Multiple paths may be enabled at once; the static token keeps working
+    byte-for-byte.
 
     Returns the **verified OIDC claims** when the request authenticated via the
-    OIDC path, or ``None`` when it authenticated via the static token. Callers
-    that only gate reads ignore the return; the approval endpoint uses the claims
-    to bind the approver identity/roles to the verified token (issue #34).
+    OIDC bearer path, or ``None`` otherwise (static token or session cookie).
+    Callers that only gate reads ignore the return; the approval endpoint uses
+    the claims to bind the approver identity/roles to the verified token.
+
+    ``allow_session`` is **False** on the approval endpoint: a browser session
+    cookie is sent automatically by the browser, so honouring it for a state
+    changing approval would open a CSRF hole. Approvals therefore require a
+    bearer token (or a signed webhook); the session cookie is read-only.
 
     Fail closed: with no credential configured at all the endpoint is disabled
     outright, because an unauthenticated approval surface defeats the human
@@ -1177,6 +1307,10 @@ def _require_api_token(app: FastAPI, request: Request) -> dict[str, Any] | None:
             return verifier.verify(token)
         except OidcAuthError:
             pass
+    # Browser SSO session cookie - read endpoints only (CSRF-safe), never the
+    # approval surface.
+    if allow_session and _session_identity(app, request) is not None:
+        return None
     raise HTTPException(status_code=401, detail="invalid or missing bearer token")
 
 
@@ -1605,6 +1739,45 @@ def app_from_settings(settings: Settings) -> FastAPI:
         if settings.oidc_enabled
         else None
     )
+    # Browser-side OIDC login (SSO) for the dashboard (issue #34). Built only
+    # when the non-secret parts are configured; the env-only secrets are
+    # required here and fail loud at startup if absent (deploy-time, not a
+    # first-request surprise).
+    oidc_login = None
+    if settings.oidc_login_configured:
+        if not settings.oidc_client_secret:
+            raise OidcConfigError(
+                "OIDC browser login is configured but the client secret "
+                "(FOUNDRY_OIDC_CLIENT_SECRET) is not set"
+            )
+        if not settings.session_secret:
+            raise OidcConfigError(
+                "OIDC browser login is configured but the session signing secret "
+                "(FOUNDRY_SESSION_SECRET) is not set"
+            )
+        # The id_token's audience is the client id (not the API audience), so it
+        # needs its own verifier - sharing the bearer verifier's JWKS cache so
+        # the keyset is fetched once.
+        id_token_verifier = OidcVerifier(
+            issuer=settings.oidc_issuer,
+            audience=settings.oidc_client_id,
+            jwks=oidc_verifier.jwks,
+            algorithms=settings.oidc_algorithms,
+            leeway_seconds=settings.oidc_leeway_seconds,
+        )
+        oidc_login = OidcLogin(
+            client_id=settings.oidc_client_id,
+            client_secret=settings.oidc_client_secret,
+            authorization_endpoint=settings.oidc_authorization_endpoint,
+            token_endpoint=settings.oidc_token_endpoint,
+            redirect_uri=settings.oidc_redirect_uri,
+            verifier=id_token_verifier,
+            signer=SessionSigner(settings.session_secret),
+            subject_claim=settings.oidc_subject_claim,
+            scopes=settings.oidc_scopes,
+            session_ttl_seconds=settings.oidc_session_ttl_seconds,
+            cookie_secure=settings.oidc_cookie_secure,
+        )
     return create_app(
         webhook_secret=settings.linear_webhook_secret,
         session_factory=session_factory,
@@ -1617,6 +1790,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         oidc_group_role_map={
             group: roles for group, roles in settings.oidc_group_role_map
         },
+        oidc_login=oidc_login,
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
         jira_webhook_secret=settings.jira_webhook_secret,

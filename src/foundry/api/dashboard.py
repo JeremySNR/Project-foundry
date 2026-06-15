@@ -53,6 +53,12 @@ DASHBOARD_HTML = """<!doctype html>
     border-radius: 6px; padding: 6px 12px; cursor: pointer;
   }
   button:hover { border-color: var(--muted); }
+  a.btn-link {
+    background: #21262d; border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 6px 12px; text-decoration: none;
+  }
+  a.btn-link:hover { border-color: var(--muted); }
+  #sso-session { color: var(--muted); font-size: 13px; }
   main { display: grid; grid-template-columns: 380px 1fr; gap: 0; min-height: calc(100vh - 57px); }
   #runs { border-right: 1px solid var(--border); overflow-y: auto; }
   .run {
@@ -161,6 +167,9 @@ DASHBOARD_HTML = """<!doctype html>
 <header>
   <h1><span>Foundry</span> run dashboard</h1>
   <div class="spacer"></div>
+  <a id="sso-login" class="btn-link" href="/dashboard/login" style="display:none">Sign in with SSO</a>
+  <span id="sso-session" style="display:none"></span>
+  <a id="sso-logout" class="btn-link" href="/dashboard/logout" style="display:none">Sign out</a>
   <input id="token" type="password" placeholder="API token (stored locally)">
   <button id="save">Connect</button>
 </header>
@@ -175,10 +184,38 @@ DASHBOARD_HTML = """<!doctype html>
   <div id="detail"><div class="empty">Select a run to see its full decision timeline.</div></div>
 </main>
 <script>
+// Injected at serve time: whether SSO login is available, and whether this
+// request already carries a valid session cookie (issue #34).
+window.__FOUNDRY_OIDC_LOGIN__ = %%OIDC_LOGIN%%;
+window.__FOUNDRY_SESSION__ = %%SESSION%%;
+</script>
+<script>
 "use strict";
 const $ = (s) => document.querySelector(s);
 const tokenInput = $("#token");
 tokenInput.value = localStorage.getItem("foundry_token") || "";
+
+// Authenticated when a token is pasted (static/JWT) OR a browser SSO session
+// cookie is present. The cookie is HttpOnly, so the page only learns of it via
+// the injected flag; either way same-origin fetches carry it automatically.
+function hasAuth() {
+  return Boolean(localStorage.getItem("foundry_token")) || Boolean(window.__FOUNDRY_SESSION__);
+}
+
+function initSso() {
+  const loggedIn = Boolean(window.__FOUNDRY_SESSION__);
+  if (window.__FOUNDRY_OIDC_LOGIN__ && !loggedIn) {
+    $("#sso-login").style.display = "";
+  }
+  if (loggedIn) {
+    $("#sso-session").textContent = "Signed in via SSO";
+    $("#sso-session").style.display = "";
+    $("#sso-logout").style.display = "";
+    // A session covers auth already; the pasted-token box is redundant noise.
+    tokenInput.style.display = "none";
+    $("#save").style.display = "none";
+  }
+}
 
 const STATUS_BADGE = {
   complete: "b-green", pr_open: "b-blue", agent_running: "b-purple",
@@ -284,7 +321,7 @@ async function loadTimeline(runId) {
       headers: authHeaders(),
     });
     if (resp.status === 401 || resp.status === 403) {
-      el.innerHTML = '<div class="error">Unauthorised. Paste the API token above and press Connect.</div>';
+      el.innerHTML = '<div class="error">Unauthorised. Sign in with SSO, or paste the API token above and press Connect.</div>';
       return;
     }
     if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -368,8 +405,8 @@ function dur(seconds) {
 
 async function loadFleet() {
   const el = $("#fleet");
-  if (!localStorage.getItem("foundry_token")) {
-    el.style.display = "none";  // no token: skip the call, it can only 401
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
     return;
   }
   try {
@@ -393,8 +430,8 @@ async function loadFleet() {
 
 async function loadMetrics() {
   const el = $("#metrics");
-  if (!localStorage.getItem("foundry_token")) {
-    el.style.display = "none";  // no token: skip the call, it can only 401
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
     return;
   }
   try {
@@ -428,8 +465,8 @@ async function loadMetrics() {
 
 async function loadAgents() {
   const el = $("#agents");
-  if (!localStorage.getItem("foundry_token")) {
-    el.style.display = "none";  // no token: skip the call, it can only 401
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
     return;
   }
   try {
@@ -465,8 +502,8 @@ function fmtPeriod(iso) {
 
 async function loadTrends() {
   const el = $("#trends");
-  if (!localStorage.getItem("foundry_token")) {
-    el.style.display = "none";  // no token: skip the call, it can only 401
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
     return;
   }
   try {
@@ -504,8 +541,8 @@ async function loadTrends() {
 
 async function loadAgentTrends() {
   const el = $("#agent-trends");
-  if (!localStorage.getItem("foundry_token")) {
-    el.style.display = "none";  // no token: skip the call, it can only 401
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
     return;
   }
   try {
@@ -543,8 +580,8 @@ async function loadAgentTrends() {
 
 async function loadEpics() {
   const el = $("#epics");
-  if (!localStorage.getItem("foundry_token")) {
-    el.style.display = "none";  // no token: skip the call, it can only 401
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
     return;
   }
   try {
@@ -597,9 +634,24 @@ $("#save").addEventListener("click", () => {
   $("#detail").innerHTML = '<div class="empty">Select a run to see its full decision timeline.</div>';
 });
 
+initSso();
 refresh();
 setInterval(refresh, 15000);
 </script>
 </body>
 </html>
 """
+
+
+def render_dashboard(*, oidc_login: bool, session: bool) -> str:
+    """The dashboard page with the SSO flags injected (issue #34).
+
+    ``oidc_login`` toggles the "Sign in with SSO" button; ``session`` tells the
+    page it is already authenticated by a session cookie (so it skips the pasted
+    token UX and renders read panels). Both are emitted as JS booleans into a
+    placeholder; nothing user-controlled is interpolated, so there is no
+    injection surface.
+    """
+    return DASHBOARD_HTML.replace(
+        "%%OIDC_LOGIN%%", "true" if oidc_login else "false"
+    ).replace("%%SESSION%%", "true" if session else "false")

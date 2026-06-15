@@ -144,6 +144,27 @@ class Settings:
     oidc_group_claim: str = "groups"
     oidc_group_role_map: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
+    # --- OIDC browser login / SSO for the dashboard (issue #34) ---
+    # Authorization-code-with-PKCE login so a browser user signs in with the IdP
+    # instead of pasting a token. It builds on the bearer OIDC config above: the
+    # same issuer/jwks verify the id_token (audience = client_id). The non-secret
+    # parts (client_id, endpoints, redirect_uri) live in YAML and are
+    # all-or-nothing; the client secret and the session-cookie signing secret are
+    # env-only credentials. Login is wired only when every part - including the
+    # secrets - is present; otherwise the login routes 403 and the dashboard
+    # falls back to the pasted-token UX.
+    oidc_client_id: str | None = None
+    oidc_client_secret: str | None = None  # secret: env only
+    oidc_authorization_endpoint: str | None = None
+    oidc_token_endpoint: str | None = None
+    oidc_redirect_uri: str | None = None
+    oidc_scopes: tuple[str, ...] = ("openid", "email")
+    oidc_session_ttl_seconds: int = 8 * 60 * 60
+    # Mark the login/session cookies Secure (HTTPS-only). Defaults on; set false
+    # only for a local plain-HTTP deployment.
+    oidc_cookie_secure: bool = True
+    session_secret: str | None = None  # secret: env only
+
     # --- webhook replay protection (behaviour: yaml) ---
     # How long a processed delivery id is remembered in foundry_webhook_deliveries
     # for durable, cross-worker dedup. Rows older than this are pruned so the
@@ -463,6 +484,38 @@ class Settings:
                 raise ValueError("oidc.subject_claim must be non-empty")
             if not self.oidc_group_claim:
                 raise ValueError("oidc.group_claim must be non-empty")
+        # Browser-login non-secret parts are all-or-nothing and require the
+        # bearer OIDC config (the same verifier checks the id_token). A partial
+        # config that looked enabled but silently disabled login would be a
+        # confusing half-built feature - fail-closed at load. The client/session
+        # secrets are env-only, so they are validated at app build, not here.
+        login_parts = {
+            "client_id": self.oidc_client_id,
+            "authorization_endpoint": self.oidc_authorization_endpoint,
+            "token_endpoint": self.oidc_token_endpoint,
+            "redirect_uri": self.oidc_redirect_uri,
+        }
+        set_login = [name for name, value in login_parts.items() if value]
+        if set_login:
+            if len(set_login) != len(login_parts):
+                missing = sorted(n for n, v in login_parts.items() if not v)
+                raise ValueError(
+                    "OIDC browser login requires client_id, "
+                    "authorization_endpoint, token_endpoint and redirect_uri "
+                    f"together; missing: {missing}"
+                )
+            if not self.oidc_enabled:
+                raise ValueError(
+                    "OIDC browser login requires the OIDC bearer config "
+                    "(issuer, audience, jwks_uri) to be set as well"
+                )
+            if not self.oidc_scopes:
+                raise ValueError("oidc.scopes must list at least one scope")
+            if self.oidc_session_ttl_seconds <= 0:
+                raise ValueError(
+                    "oidc.session_ttl_seconds must be > 0, got "
+                    f"{self.oidc_session_ttl_seconds}"
+                )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -503,6 +556,22 @@ class Settings:
     def oidc_enabled(self) -> bool:
         """True when OIDC bearer auth is fully configured (all three parts)."""
         return bool(self.oidc_issuer and self.oidc_audience and self.oidc_jwks_uri)
+
+    @property
+    def oidc_login_configured(self) -> bool:
+        """True when the non-secret browser-login parts are all set.
+
+        The env-only secrets (client secret, session secret) are validated at app
+        build, where missing ones fail loud; this property gates whether to even
+        attempt wiring the login routes.
+        """
+        return bool(
+            self.oidc_enabled
+            and self.oidc_client_id
+            and self.oidc_authorization_endpoint
+            and self.oidc_token_endpoint
+            and self.oidc_redirect_uri
+        )
 
 
 def _from_yaml(path: Path) -> dict[str, Any]:
@@ -674,6 +743,20 @@ def _from_yaml(path: Path) -> dict[str, Any]:
             (str(group), tuple(str(r) for r in (roles or [])))
             for group, roles in (oidc["group_role_map"] or {}).items()
         )
+    if "client_id" in oidc:
+        out["oidc_client_id"] = str(oidc["client_id"])
+    if "authorization_endpoint" in oidc:
+        out["oidc_authorization_endpoint"] = str(oidc["authorization_endpoint"])
+    if "token_endpoint" in oidc:
+        out["oidc_token_endpoint"] = str(oidc["token_endpoint"])
+    if "redirect_uri" in oidc:
+        out["oidc_redirect_uri"] = str(oidc["redirect_uri"])
+    if "scopes" in oidc:
+        out["oidc_scopes"] = tuple(str(s) for s in (oidc["scopes"] or []))
+    if "session_ttl_seconds" in oidc:
+        out["oidc_session_ttl_seconds"] = int(oidc["session_ttl_seconds"])
+    if "cookie_secure" in oidc:
+        out["oidc_cookie_secure"] = _bool(oidc["cookie_secure"])
 
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
@@ -746,10 +829,26 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_OIDC_JWKS_URI": "oidc_jwks_uri",
         "FOUNDRY_OIDC_SUBJECT_CLAIM": "oidc_subject_claim",
         "FOUNDRY_OIDC_GROUP_CLAIM": "oidc_group_claim",
+        "FOUNDRY_OIDC_CLIENT_ID": "oidc_client_id",
+        "FOUNDRY_OIDC_CLIENT_SECRET": "oidc_client_secret",
+        "FOUNDRY_OIDC_AUTHORIZATION_ENDPOINT": "oidc_authorization_endpoint",
+        "FOUNDRY_OIDC_TOKEN_ENDPOINT": "oidc_token_endpoint",
+        "FOUNDRY_OIDC_REDIRECT_URI": "oidc_redirect_uri",
+        "FOUNDRY_SESSION_SECRET": "session_secret",
     }
     for env_key, field_name in mapping.items():
         if env_key in env:
             out[field_name] = env[env_key]
+    if "FOUNDRY_OIDC_SCOPES" in env:
+        out["oidc_scopes"] = tuple(
+            part.strip()
+            for part in env["FOUNDRY_OIDC_SCOPES"].split(",")
+            if part.strip()
+        )
+    if "FOUNDRY_OIDC_SESSION_TTL_SECONDS" in env:
+        out["oidc_session_ttl_seconds"] = int(env["FOUNDRY_OIDC_SESSION_TTL_SECONDS"])
+    if "FOUNDRY_OIDC_COOKIE_SECURE" in env:
+        out["oidc_cookie_secure"] = _bool(env["FOUNDRY_OIDC_COOKIE_SECURE"])
     if "FOUNDRY_OIDC_ALGORITHMS" in env:
         out["oidc_algorithms"] = tuple(
             part.strip()
