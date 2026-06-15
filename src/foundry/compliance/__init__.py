@@ -23,16 +23,26 @@ from .evidence import (
     render_evidence_html,
     verify_integrity,
 )
+from .pdf import (
+    PdfRenderingUnavailable,
+    render_archive_pdf,
+    render_epic_evidence_pdf,
+    render_evidence_pdf,
+)
 
 __all__ = [
     "ControlMapping",
     "DEFAULT_CONTROL_MAPPINGS",
     "KNOWN_EVIDENCE_SECTIONS",
+    "PdfRenderingUnavailable",
     "build_epic_evidence_pack",
     "build_evidence_archive",
     "build_evidence_pack",
     "render_archive_html",
+    "render_archive_pdf",
     "render_epic_evidence_html",
+    "render_epic_evidence_pdf",
     "render_evidence_html",
+    "render_evidence_pdf",
     "verify_integrity",
 ]

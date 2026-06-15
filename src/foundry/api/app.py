@@ -32,18 +32,27 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from sqlalchemy import func
 
 from foundry.compliance import (
     DEFAULT_CONTROL_MAPPINGS,
     ControlMapping,
+    PdfRenderingUnavailable,
     build_epic_evidence_pack,
     build_evidence_archive,
     build_evidence_pack,
     render_archive_html,
+    render_archive_pdf,
     render_epic_evidence_html,
+    render_epic_evidence_pdf,
     render_evidence_html,
+    render_evidence_pdf,
 )
 from foundry.config import Settings
 from foundry.connectors.github import GitHubConnector
@@ -107,6 +116,34 @@ TicketMapper = Callable[[dict[str, Any]], RawTicket]
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+_EVIDENCE_FORMATS = ("json", "html", "pdf")
+
+
+def _require_evidence_format(format: str) -> None:
+    if format not in _EVIDENCE_FORMATS:
+        raise HTTPException(
+            status_code=422, detail="format must be 'json', 'html' or 'pdf'"
+        )
+
+
+def _pdf_response(render: Callable[[], bytes], filename: str) -> Response:
+    """Render a PDF export, mapping a missing ``[pdf]`` extra to a clear 503.
+
+    The ``[pdf]`` extra is optional and lazily imported (like ``[oidc]`` /
+    ``[crypto]``); a deployment that hasn't installed it gets an actionable 503
+    rather than an opaque 500.
+    """
+    try:
+        data = render()
+    except PdfRenderingUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def _run_to_dict(run: FoundryRun) -> dict[str, Any]:
@@ -742,14 +779,12 @@ def create_app(
         ``GET /runs/{id}/evidence`` produces), and an aggregate rollup
         (integrity, status breakdown, per-control coverage). A run with no
         children exports cleanly as a degenerate one-run epic. ``?format=html``
-        renders a standalone page; the default is JSON. Token-gated and
+        renders a standalone page and ``?format=pdf`` a downloadable PDF
+        (optional ``[pdf]`` extra); the default is JSON. Token-gated and
         fail-closed like ``/runs/{id}/evidence``.
         """
         _require_api_token(app, request)
-        if format not in ("json", "html"):
-            raise HTTPException(
-                status_code=422, detail="format must be 'json' or 'html'"
-            )
+        _require_evidence_format(format)
         orch: FoundryOrchestrator = app.state.orchestrator
         root_id = orch.epic_root_id(run_id)
         if root_id is None:
@@ -767,6 +802,10 @@ def create_app(
             )
         if format == "html":
             return HTMLResponse(render_epic_evidence_html(pack))
+        if format == "pdf":
+            return _pdf_response(
+                lambda: render_epic_evidence_pdf(pack), f"epic-evidence-{root_id}.pdf"
+            )
         return pack
 
     @app.get("/epics")
@@ -898,14 +937,12 @@ def create_app(
         continuity), and the run's evidence mapped onto configured controls
         (SOC 2 / ISO 27001 / EU AI Act).
 
-        ``?format=html`` renders a standalone page; the default is JSON. Token-
+        ``?format=html`` renders a standalone page and ``?format=pdf`` a
+        downloadable PDF (optional ``[pdf]`` extra); the default is JSON. Token-
         gated like the timeline - the pack contains everything the timeline does.
         """
         _require_api_token(app, request)
-        if format not in ("json", "html"):
-            raise HTTPException(
-                status_code=422, detail="format must be 'json' or 'html'"
-            )
+        _require_evidence_format(format)
         with app.state.session_factory() as session:
             run = session.get(FoundryRun, run_id)
             if run is None:
@@ -915,6 +952,10 @@ def create_app(
             )
         if format == "html":
             return HTMLResponse(render_evidence_html(pack))
+        if format == "pdf":
+            return _pdf_response(
+                lambda: render_evidence_pdf(pack), f"evidence-{run_id}.pdf"
+            )
         return pack
 
     @app.get("/evidence")
@@ -933,14 +974,12 @@ def create_app(
         Bound the window with ISO 8601 ``from``/``to`` (``from`` inclusive,
         ``to`` exclusive; a date-only ``to`` covers the whole day) or with
         ``days`` (the last N days). With nothing supplied it defaults to the
-        last 90 days. ``?format=html`` renders a standalone page; the default
-        is JSON. Token-gated and fail-closed like ``/runs/{id}/evidence``.
+        last 90 days. ``?format=html`` renders a standalone page and
+        ``?format=pdf`` a downloadable PDF (optional ``[pdf]`` extra); the
+        default is JSON. Token-gated and fail-closed like ``/runs/{id}/evidence``.
         """
         _require_api_token(app, request)
-        if format not in ("json", "html"):
-            raise HTTPException(
-                status_code=422, detail="format must be 'json' or 'html'"
-            )
+        _require_evidence_format(format)
         until = (
             _parse_iso_bound(to, inclusive_day_end=True)
             if to
@@ -966,6 +1005,10 @@ def create_app(
             )
         if format == "html":
             return HTMLResponse(render_archive_html(archive))
+        if format == "pdf":
+            return _pdf_response(
+                lambda: render_archive_pdf(archive), "evidence-archive.pdf"
+            )
         return archive
 
     @app.get("/metrics/delivery")

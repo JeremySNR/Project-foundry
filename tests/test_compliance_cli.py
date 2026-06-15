@@ -138,6 +138,17 @@ def test_run_writes_to_output_file(monkeypatch, capsys, db_url, tmp_path) -> Non
     assert pack["run"]["id"] == run_id
 
 
+def test_run_pdf_to_output_file(monkeypatch, capsys, db_url, tmp_path) -> None:
+    pytest.importorskip("fpdf")
+    run_id = _seed_merged_run(db_url)
+    out_path = tmp_path / "pack.pdf"
+    _run_cli(monkeypatch, db_url, "run", run_id, "--format", "pdf", "--output", str(out_path))
+    assert f"Wrote {out_path}" in capsys.readouterr().err
+    data = out_path.read_bytes()
+    assert data.startswith(b"%PDF-")
+    assert b"%%EOF" in data
+
+
 def test_run_not_found_exits_1(monkeypatch, capsys, db_url) -> None:
     _orch(db_url)  # create the schema, but no run with this id
     monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)

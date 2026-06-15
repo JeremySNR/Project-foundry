@@ -1143,8 +1143,18 @@ def test_evidence_unknown_run_404(client) -> None:
 
 def test_evidence_bad_format_422(client) -> None:
     run_id = _start_ready_run(client)
-    resp = client.get(f"/runs/{run_id}/evidence?format=pdf", headers=AUTH)
+    resp = client.get(f"/runs/{run_id}/evidence?format=xml", headers=AUTH)
     assert resp.status_code == 422
+
+
+def test_evidence_pdf_render(client) -> None:
+    pytest.importorskip("fpdf")
+    run_id = _approve_and_dispatch(client)
+    resp = client.get(f"/runs/{run_id}/evidence?format=pdf", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+    assert f"evidence-{run_id}.pdf" in resp.headers["content-disposition"]
+    assert resp.content.startswith(b"%PDF-")
 
 
 def test_evidence_pack_for_driven_run(client) -> None:
@@ -1195,7 +1205,7 @@ def test_evidence_archive_disabled_without_configured_token() -> None:
 
 
 def test_evidence_archive_bad_format_422(client) -> None:
-    assert client.get("/evidence?format=pdf", headers=AUTH).status_code == 422
+    assert client.get("/evidence?format=xml", headers=AUTH).status_code == 422
 
 
 def test_evidence_archive_bad_date_422(client) -> None:
@@ -1250,6 +1260,16 @@ def test_evidence_archive_html_render(client) -> None:
     assert "Compliance evidence archive" in resp.text
 
 
+def test_evidence_archive_pdf_render(client) -> None:
+    pytest.importorskip("fpdf")
+    _approve_and_dispatch(client)
+    resp = client.get("/evidence?days=3650&format=pdf", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+    assert "evidence-archive.pdf" in resp.headers["content-disposition"]
+    assert resp.content.startswith(b"%PDF-")
+
+
 # -- epic (cross-run) evidence export ------------------------------------------
 
 
@@ -1269,7 +1289,7 @@ def test_epic_evidence_unknown_run_404(client) -> None:
 
 def test_epic_evidence_bad_format_422(client) -> None:
     parent, _ = _make_epic(client)
-    resp = client.get(f"/runs/{parent}/epic/evidence?format=pdf", headers=AUTH)
+    resp = client.get(f"/runs/{parent}/epic/evidence?format=xml", headers=AUTH)
     assert resp.status_code == 422
 
 
@@ -1303,6 +1323,16 @@ def test_epic_evidence_html_render(client) -> None:
     assert "text/html" in resp.headers["content-type"]
     assert resp.text.startswith("<!doctype html>")
     assert "Epic evidence pack" in resp.text
+
+
+def test_epic_evidence_pdf_render(client) -> None:
+    pytest.importorskip("fpdf")
+    parent, _ = _make_epic(client)
+    resp = client.get(f"/runs/{parent}/epic/evidence?format=pdf", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+    assert f"epic-evidence-{parent}.pdf" in resp.headers["content-disposition"]
+    assert resp.content.startswith(b"%PDF-")
 
 
 # -- dashboard -----------------------------------------------------------------
