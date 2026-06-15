@@ -14,11 +14,11 @@ merge rate (``smoothed_confidence``) so small samples stay honest (3 of 3 reads
 nothing about any agent.
 
 This module is read-only reporting. ``recommend_provider`` turns the same
-numbers into a *decision* - which agent should ship a given piece of work -
-but it still only reports: it is the selection logic the future policy-gated
-``agent.provider: auto`` dispatch will call, surfaced ahead of that change so
-the decision can be inspected before anything acts on it. Actually dispatching
-on the recommendation remains a deliberately separate, gated change.
+numbers into a *decision* - which agent should ship a given piece of work. It
+stays a pure read (it dispatches nothing), but it is no longer purely
+hypothetical: under ``agent.provider: auto`` (issue #33) the orchestrator now
+calls it at first dispatch to pick the provider, so the same numbers an operator
+inspects via the metrics API / CLI are the ones that actually route work.
 """
 
 from __future__ import annotations
@@ -192,10 +192,10 @@ def recommend_provider(
 ) -> dict:
     """Recommend the agent provider with the best track record for this work.
 
-    The selection logic the future ``agent.provider: auto`` dispatch will call,
-    kept deliberately separate from - and shipped ahead of - that gated change
-    so the *decision* can be inspected (via the metrics API and the CLI) before
-    anything acts on it. Reporting only: nothing here dispatches.
+    The selection logic ``agent.provider: auto`` dispatch calls (issue #33): the
+    orchestrator invokes it at first dispatch to pick the provider, and the same
+    decision is inspectable via the metrics API and the CLI. Pure read - nothing
+    *here* dispatches; the orchestrator acts on the returned ``recommended``.
 
     Mirrors the routing-priors guard rails (``priors.py``) so the two
     delivery-memory signals behave the same way and stay explainable:

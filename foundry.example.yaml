@@ -144,7 +144,21 @@ agent:
   #   cursor_cloud     - Cursor Cloud Agents API (set FOUNDRY_CURSOR_API_TOKEN)
   #   claude_code      - GitHub Actions workflow_dispatch (set FOUNDRY_GITHUB_API_TOKEN)
   #   webhook          - POST the job to your own endpoint (set FOUNDRY_AGENT_WEBHOOK_*)
+  #   auto             - learned dispatch (#33): pick the agent per run from the
+  #                      delivery-memory scorecards (the one with the best
+  #                      majority-merged history for this work-type/repo). Each
+  #                      candidate must be a real, credentialled provider.
   provider: manual
+  # Learned dispatch (only used when provider: auto). Candidates the scorecard
+  # may route between (each built + credential-checked fail-closed at startup);
+  # the fallback agent used when no candidate has a >50%-merged history with at
+  # least auto_min_samples runs yet; and that min-sample floor. All committed
+  # here - the routing decision never comes from request input. The kill switch
+  # is simply not setting provider: auto. A retry always reuses the agent that
+  # opened the PR, never re-routing mid-run.
+  # auto_candidates: [claude_code, cursor_cloud]
+  # auto_fallback: manual
+  # auto_min_samples: 3
 
 tracker:
   # Where tickets live:

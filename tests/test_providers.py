@@ -15,7 +15,7 @@ from foundry.agents import (
     available_providers,
     get_provider,
 )
-from foundry.api.app import build_provider
+from foundry.api.app import build_provider, build_provider_registry
 from foundry.config import Settings
 from foundry.schemas.agent import CodingAgentJobInput
 from foundry.schemas.common import AgentJobStatus
@@ -173,6 +173,53 @@ def test_build_provider_constructs_configured_providers() -> None:
         )
     )
     assert hook.name == "webhook"
+
+
+# -- learned dispatch: provider registry (issue #33) ---------------------------
+
+
+def test_build_provider_registry_single_provider() -> None:
+    """A single configured agent: one provider, a one-entry registry, auto off,
+    itself the sole candidate - so the orchestrator's single-provider path is
+    unchanged."""
+    provider, registry, auto, candidates = build_provider_registry(Settings())
+    assert provider.name == "manual"
+    assert registry == {"manual": provider}
+    assert auto is False
+    assert candidates == ("manual",)
+
+
+def test_build_provider_registry_auto_builds_candidates_and_fallback() -> None:
+    provider, registry, auto, candidates = build_provider_registry(
+        Settings(
+            agent_provider="auto",
+            agent_auto_candidates=("manual", "fake"),
+            agent_auto_fallback="manual",
+        )
+    )
+    assert auto is True
+    assert set(registry) == {"manual", "fake"}
+    assert candidates == ("manual", "fake")
+    # The fallback is the default the orchestrator drops back to.
+    assert provider.name == "manual"
+
+
+def test_build_provider_registry_auto_is_fail_closed_on_missing_credentials() -> None:
+    """A candidate that needs credentials it doesn't have fails loud at build,
+    not silently at first dispatch."""
+    with pytest.raises(ValueError, match="FOUNDRY_CURSOR_API_TOKEN"):
+        build_provider_registry(
+            Settings(
+                agent_provider="auto",
+                agent_auto_candidates=("manual", "cursor_cloud"),
+                agent_auto_fallback="manual",
+            )
+        )
+
+
+def test_build_provider_rejects_auto() -> None:
+    with pytest.raises(ValueError, match="build_provider_registry"):
+        build_provider(Settings(agent_provider="auto"))
 
 
 def test_settings_load_agent_provider_from_yaml_and_env(tmp_path) -> None:

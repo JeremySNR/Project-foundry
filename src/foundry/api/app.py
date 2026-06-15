@@ -1498,8 +1498,8 @@ def _apply_decision(
 # -- deployment entrypoints ---------------------------------------------------
 
 
-def build_provider(settings: Settings, tracker=None):
-    """Resolve the configured coding-agent provider (``agent.provider``).
+def _build_named_provider(name: str, settings: Settings, tracker=None):
+    """Build a single coding-agent provider by name.
 
     Fail-closed: a provider that is selected but missing its credentials is a
     configuration error at startup, not a silent fallback to another agent.
@@ -1518,7 +1518,6 @@ def build_provider(settings: Settings, tracker=None):
         raw_post_transport,
     )
 
-    name = settings.agent_provider
     if name == "manual":
         return ManualProvider()
     if name == "fake":
@@ -1565,6 +1564,52 @@ def build_provider(settings: Settings, tracker=None):
             signing_secret=settings.agent_webhook_secret,
         )
     raise ValueError(f"unknown agent.provider: {name!r}")
+
+
+def build_provider(settings: Settings, tracker=None):
+    """Resolve the single configured coding-agent provider (``agent.provider``).
+
+    For ``agent.provider: auto`` (learned dispatch, issue #33) use
+    :func:`build_provider_registry` instead - there is no one provider then.
+    """
+    if settings.agent_provider == "auto":
+        raise ValueError(
+            "agent.provider=auto has no single provider; use "
+            "build_provider_registry()"
+        )
+    return _build_named_provider(settings.agent_provider, settings, tracker)
+
+
+def build_provider_registry(settings: Settings, tracker=None):
+    """Resolve the dispatchable agent provider(s) from ``agent.provider``.
+
+    Returns ``(default_provider, providers_by_name, auto_dispatch, candidates)``:
+
+    - A single configured agent ⇒ that one provider, a one-entry registry,
+      ``auto_dispatch`` off, and itself as the sole candidate. The orchestrator's
+      single-provider path is then byte-for-byte unchanged.
+    - ``agent.provider: auto`` ⇒ every ``agent.auto_candidates`` agent **and** the
+      ``agent.auto_fallback`` agent built and credential-validated up front
+      (fail-closed, like any provider), the fallback as the default the
+      orchestrator drops back to when no candidate has earned a recommendation,
+      and ``auto_dispatch`` on. The candidate *names* are the built providers'
+      own names, so they line up with the ``provider`` recorded on outcome rows
+      that the scorecard recommendation reads.
+    """
+    if settings.agent_provider != "auto":
+        provider = _build_named_provider(settings.agent_provider, settings, tracker)
+        return provider, {provider.name: provider}, False, (provider.name,)
+
+    registry: dict = {}
+    candidates: list[str] = []
+    for name in settings.agent_auto_candidates:
+        candidate = _build_named_provider(name, settings, tracker)
+        registry[candidate.name] = candidate
+        if candidate.name not in candidates:
+            candidates.append(candidate.name)
+    fallback = _build_named_provider(settings.agent_auto_fallback, settings, tracker)
+    registry.setdefault(fallback.name, fallback)
+    return fallback, registry, True, tuple(candidates)
 
 
 def build_policy_engine(settings: Settings) -> PolicyEngine:
@@ -1687,6 +1732,9 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
     else:
         enricher = StaticContextEnricher(repo_catalog=repo_keywords)
 
+    provider, providers, auto_dispatch, auto_candidates = build_provider_registry(
+        settings, tracker
+    )
     return FoundryOrchestrator(
         session_factory,
         analyzer=analyzer,
@@ -1697,7 +1745,11 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         enricher=enricher,
         issue_tracker=tracker,
         notifier=notifier,
-        provider=build_provider(settings, tracker),
+        provider=provider,
+        providers=providers,
+        auto_dispatch=auto_dispatch,
+        auto_candidates=auto_candidates,
+        auto_min_samples=settings.agent_auto_min_samples,
         policy_engine=build_policy_engine(settings),
         max_files_changed=settings.max_files_changed,
         forbidden_globs=settings.forbidden_globs,

@@ -193,11 +193,22 @@ class Settings:
 
     # --- coding agent (behaviour: yaml; tokens: env) ---
     # Which CodingAgentProvider receives approved work. See foundry.agents.
+    # "auto" turns on learned dispatch (issue #33): the provider is picked per
+    # run by the scorecard recommendation over ``agent_auto_candidates``.
     agent_provider: str = "manual"
     cursor_api_token: str | None = None
     claude_workflow_file: str = "foundry-claude-code.yml"
     agent_webhook_url: str | None = None
     agent_webhook_secret: str | None = None
+    # Learned dispatch (agent.provider: auto, issue #33). The candidate agents
+    # the scorecard may route between (each must be a real, credentialled
+    # provider - built and validated fail-closed at startup); the fallback agent
+    # used when no candidate has a majority-merged history yet; and the
+    # min-sample floor the recommendation must clear before it routes. All
+    # committed YAML - the routing decision never comes from request input.
+    agent_auto_candidates: tuple[str, ...] = ()
+    agent_auto_fallback: str = "manual"
+    agent_auto_min_samples: int = 3
 
     # --- intelligence (behaviour: yaml) ---
     use_openai_analyzer: bool = False
@@ -352,6 +363,26 @@ class Settings:
             raise ValueError(
                 f"max_agent_retries must be >= 0, got {self.max_agent_retries}"
             )
+        # Learned dispatch (issue #33). The candidate/fallback *names* are
+        # validated against the real provider set fail-closed at build time
+        # (build_provider_registry); here we only enforce the shape so a
+        # misconfigured auto deployment fails at load, not first dispatch.
+        if self.agent_auto_min_samples < 1:
+            raise ValueError(
+                "agent.auto_min_samples must be >= 1, got "
+                f"{self.agent_auto_min_samples}"
+            )
+        if self.agent_provider == "auto":
+            if not self.agent_auto_candidates:
+                raise ValueError(
+                    "agent.provider=auto requires a non-empty agent.auto_candidates "
+                    "list (the agents the scorecard may route between)"
+                )
+            if not self.agent_auto_fallback:
+                raise ValueError(
+                    "agent.provider=auto requires agent.auto_fallback (the agent "
+                    "used when no candidate has earned a recommendation yet)"
+                )
         unknown = set(self.retry_on) - {"ci_failed", "changes_requested"}
         if unknown:
             raise ValueError(f"unknown retry_on triggers: {sorted(unknown)}")
@@ -618,6 +649,12 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["agent_provider"] = agent["provider"]
     if "claude_workflow_file" in agent:
         out["claude_workflow_file"] = agent["claude_workflow_file"]
+    if "auto_candidates" in agent:
+        out["agent_auto_candidates"] = tuple(agent["auto_candidates"] or ())
+    if "auto_fallback" in agent:
+        out["agent_auto_fallback"] = agent["auto_fallback"]
+    if "auto_min_samples" in agent:
+        out["agent_auto_min_samples"] = int(agent["auto_min_samples"])
 
     tracker = data.get("tracker", {}) or {}
     if "provider" in tracker:
@@ -807,6 +844,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_SLACK_CHANNEL": "slack_channel",
         "FOUNDRY_API_TOKEN": "api_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
+        "FOUNDRY_AGENT_AUTO_FALLBACK": "agent_auto_fallback",
         "FOUNDRY_TRACKER_PROVIDER": "tracker_provider",
         "FOUNDRY_CURSOR_API_TOKEN": "cursor_api_token",
         "FOUNDRY_AGENT_WEBHOOK_URL": "agent_webhook_url",
@@ -857,6 +895,14 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         )
     if "FOUNDRY_OIDC_LEEWAY_SECONDS" in env:
         out["oidc_leeway_seconds"] = int(env["FOUNDRY_OIDC_LEEWAY_SECONDS"])
+    if "FOUNDRY_AGENT_AUTO_CANDIDATES" in env:
+        out["agent_auto_candidates"] = tuple(
+            part.strip()
+            for part in env["FOUNDRY_AGENT_AUTO_CANDIDATES"].split(",")
+            if part.strip()
+        )
+    if "FOUNDRY_AGENT_AUTO_MIN_SAMPLES" in env:
+        out["agent_auto_min_samples"] = int(env["FOUNDRY_AGENT_AUTO_MIN_SAMPLES"])
     if "FOUNDRY_USE_OPENAI_ANALYZER" in env:
         out["use_openai_analyzer"] = _bool(env["FOUNDRY_USE_OPENAI_ANALYZER"])
     if "FOUNDRY_EPICS_AUTO_DECOMPOSE" in env:

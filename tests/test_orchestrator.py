@@ -1359,7 +1359,9 @@ def test_provider_failure_during_remediation_hands_pr_to_human(session_factory) 
     from foundry.db.models import AuditEventType
 
     # Dispatch the first job successfully, then swap in a provider that fails so
-    # the *remediation* dispatch is the one that raises.
+    # the *remediation* dispatch is the one that raises. Remediation reuses the
+    # original job's provider (issue #33), so the swap is on the registry entry
+    # the original job resolves through, not the unrelated default singleton.
     provider = InMemoryFakeProvider()
     orch = _orch(session_factory, provider=provider)
     run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
@@ -1368,7 +1370,7 @@ def test_provider_failure_during_remediation_hands_pr_to_human(session_factory) 
     provider.run(job.job_id)
     assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
 
-    orch._provider = _RaisingProvider()
+    orch._providers[provider.name] = _RaisingProvider()
     failing = _pr(files_changed=[], ci_status=CIStatus.FAILING, summary="2 failed")
     with pytest.raises(RuntimeError):
         orch.record_pr(run_id, failing)
@@ -1381,6 +1383,178 @@ def test_provider_failure_during_remediation_hands_pr_to_human(session_factory) 
     # The failed remediation is audited and no second job row was created.
     assert _events_of_type(session_factory, run_id, AuditEventType.AGENT_FAILED)
     assert _job_count(session_factory, run_id) == 1
+
+
+# -- learned dispatch (agent.provider: auto, issue #33) -------------------------
+
+
+class _FakeAgentA(InMemoryFakeProvider):
+    name = "agent_a"
+
+
+class _FakeAgentB(InMemoryFakeProvider):
+    name = "agent_b"
+
+
+def _seed_outcome(
+    session_factory,
+    *,
+    provider: str,
+    outcome: str,
+    work_type: str = "feature",
+    repo: str = "customer-web",
+    count: int = 1,
+) -> None:
+    """Insert dispatched outcome rows so recommend_provider has history to read."""
+    import uuid
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 6, 14, 12, 0, tzinfo=timezone.utc)
+    with session_factory() as s:
+        for _ in range(count):
+            rid = f"seed-{uuid.uuid4().hex[:8]}"
+            s.add(
+                FoundryRun(
+                    id=rid,
+                    linear_issue_id=f"i-{rid}",
+                    linear_issue_key=f"ENG-{rid}",
+                    status=RunStatus.COMPLETE,
+                    trigger_type="label",
+                )
+            )
+            s.add(
+                FoundryRunOutcome(
+                    run_id=rid,
+                    linear_issue_id=f"i-{rid}",
+                    issue_key_prefix="ENG",
+                    outcome=outcome,
+                    repo=repo,
+                    provider=provider,
+                    work_type=work_type,
+                    trigger_type="label",
+                    jobs_count=1,
+                    created_at_run=now,
+                    completed_at=now,
+                    recorded_at=now,
+                )
+            )
+        s.commit()
+
+
+def _auto_orch(session_factory, **overrides) -> tuple:
+    """An orchestrator wired for agent.provider: auto over two fake agents.
+
+    Default fallback is agent_b; agent_a is the other candidate. The same
+    instances back both the registry and (for agent_b) the default provider, so
+    a test can drive each agent's fake job lifecycle.
+    """
+    a, b = _FakeAgentA(), _FakeAgentB()
+    kwargs = dict(
+        provider=b,
+        providers={a.name: a, b.name: b},
+        auto_dispatch=True,
+        auto_candidates=[a.name, b.name],
+        auto_min_samples=3,
+    )
+    kwargs.update(overrides)
+    orch = _orch(session_factory, **kwargs)
+    return orch, a, b
+
+
+def _selection_metadata(session_factory, run_id):
+    import json
+
+    from foundry.db.models import AuditEventType
+
+    events = _events_of_type(session_factory, run_id, AuditEventType.AGENT_STARTED)
+    assert len(events) == 1
+    return json.loads(events[0].metadata_json)
+
+
+def test_auto_dispatch_routes_to_recommended_provider(session_factory) -> None:
+    """With agent.provider: auto, a first dispatch routes to the scorecard's
+    pick - the agent with the majority-merged history for this work - and records
+    an explainable selection reason on the AGENT_STARTED event."""
+    # agent_a: 3/3 merged on features in customer-web; agent_b: 0/3.
+    _seed_outcome(session_factory, provider="agent_a", outcome="merged", count=3)
+    _seed_outcome(session_factory, provider="agent_b", outcome="failed", count=3)
+
+    orch, a, _b = _auto_orch(session_factory)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+
+    assert job.provider == "agent_a"
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+    with session_factory() as s:
+        row = s.query(FoundryAgentJob).filter_by(run_id=run_id).one()
+    assert row.provider == "agent_a"
+
+    selection = _selection_metadata(session_factory, run_id)["selection"]
+    assert selection["mode"] == "auto"
+    assert selection["selected_by"] == "scorecard"
+    assert selection["provider"] == "agent_a"
+    assert "agent_a" in selection["reason"]
+
+
+def test_auto_dispatch_falls_back_when_no_recommendation(session_factory) -> None:
+    """With no qualifying history (the min-sample floor / majority-merged gate not
+    met), auto dispatch falls back to the configured default provider rather than
+    routing to an unproven agent - and says so on the trail."""
+    orch, _a, _b = _auto_orch(session_factory)  # empty outcome history
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+
+    assert job.provider == "agent_b"  # the configured fallback/default
+    selection = _selection_metadata(session_factory, run_id)["selection"]
+    assert selection["selected_by"] == "fallback"
+    assert selection["provider"] == "agent_b"
+    assert "not enough evidence" in selection["reason"]
+
+
+def test_single_provider_dispatch_records_no_selection(session_factory) -> None:
+    """The default single-provider path is unchanged: no scorecard query, and no
+    selection metadata on AGENT_STARTED (so existing trails are byte-for-byte
+    identical)."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    orch.dispatch_agent(run_id)
+
+    assert "selection" not in _selection_metadata(session_factory, run_id)
+
+
+def test_remediation_reuses_original_provider_under_auto(session_factory) -> None:
+    """A retry never re-routes mid-run: even if the scorecard would now prefer a
+    different agent, remediation reuses the agent that opened the PR (issue #33)."""
+    _seed_outcome(session_factory, provider="agent_a", outcome="merged", count=3)
+    _seed_outcome(session_factory, provider="agent_b", outcome="failed", count=3)
+
+    orch, a, _b = _auto_orch(session_factory, max_agent_retries=2)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    assert job.provider == "agent_a"
+    a.run(job.job_id)
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    # Flip the recommendation hard towards agent_b before the retry. Remediation
+    # must still reuse agent_a, never re-route to the now-"better" agent.
+    _seed_outcome(session_factory, provider="agent_b", outcome="merged", count=20)
+
+    failing = _pr(files_changed=[], ci_status=CIStatus.FAILING, summary="2 failed")
+    assert orch.record_pr(run_id, failing) is RunStatus.AGENT_RUNNING
+    with session_factory() as s:
+        providers = [
+            j.provider
+            for j in s.query(FoundryAgentJob)
+            .filter_by(run_id=run_id)
+            .order_by(FoundryAgentJob.started_at, FoundryAgentJob.id)
+            .all()
+        ]
+    assert providers == ["agent_a", "agent_a"]
 
 
 # -- custom forbidden_globs config is honoured end-to-end -----------------------

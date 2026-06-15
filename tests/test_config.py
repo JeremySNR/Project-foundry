@@ -570,3 +570,57 @@ def test_opa_provider_without_url_raises() -> None:
 
     with pytest.raises(ValueError, match="policy_opa_url is required"):
         Settings.from_env({"FOUNDRY_POLICY_PROVIDER": "opa"})
+
+
+# -- learned dispatch config (agent.provider: auto, issue #33) ------------------
+
+
+def test_agent_auto_defaults() -> None:
+    s = Settings.from_env({})
+    assert s.agent_auto_candidates == ()
+    assert s.agent_auto_fallback == "manual"
+    assert s.agent_auto_min_samples == 3
+
+
+def test_agent_auto_from_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "agent:\n"
+        "  provider: auto\n"
+        "  auto_candidates: [claude_code, cursor_cloud]\n"
+        "  auto_fallback: claude_code\n"
+        "  auto_min_samples: 5\n"
+    )
+    s = Settings.load(path, env={})
+    assert s.agent_provider == "auto"
+    assert s.agent_auto_candidates == ("claude_code", "cursor_cloud")
+    assert s.agent_auto_fallback == "claude_code"
+    assert s.agent_auto_min_samples == 5
+
+
+def test_agent_auto_env_overrides(tmp_path) -> None:
+    s = Settings.from_env(
+        {
+            "FOUNDRY_AGENT_PROVIDER": "auto",
+            "FOUNDRY_AGENT_AUTO_CANDIDATES": "claude_code, cursor_cloud",
+            "FOUNDRY_AGENT_AUTO_FALLBACK": "cursor_cloud",
+            "FOUNDRY_AGENT_AUTO_MIN_SAMPLES": "4",
+        }
+    )
+    assert s.agent_auto_candidates == ("claude_code", "cursor_cloud")
+    assert s.agent_auto_fallback == "cursor_cloud"
+    assert s.agent_auto_min_samples == 4
+
+
+def test_agent_provider_auto_requires_candidates() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="auto_candidates"):
+        Settings.from_env({"FOUNDRY_AGENT_PROVIDER": "auto"})
+
+
+def test_agent_auto_min_samples_must_be_positive() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="auto_min_samples"):
+        Settings.from_env({"FOUNDRY_AGENT_AUTO_MIN_SAMPLES": "0"})
