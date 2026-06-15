@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from sqlalchemy.exc import IntegrityError
 
@@ -76,6 +76,7 @@ from foundry.policy.engine import (
 from foundry.schemas.agent import CodingAgentJob, CodingAgentJobInput, JobConstraints
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.memory.outcomes import record_outcome
+from foundry.memory.scorecards import DEFAULT_MIN_SAMPLES, recommend_provider
 from foundry.schemas.common import (
     ACTIVE_RUN_STATUSES,
     PR_OBSERVABLE_STATUSES,
@@ -147,6 +148,10 @@ class FoundryOrchestrator:
         decomposer: EpicDecomposer | None = None,
         policy_engine: PolicyEngine | None = None,
         provider: CodingAgentProvider | None = None,
+        providers: Mapping[str, CodingAgentProvider] | None = None,
+        auto_dispatch: bool = False,
+        auto_candidates: Sequence[str] | None = None,
+        auto_min_samples: int = DEFAULT_MIN_SAMPLES,
         issue_tracker: IssueTracker | None = None,
         notifier: RunNotifier | None = None,
         max_files_changed: int = 12,
@@ -169,6 +174,23 @@ class FoundryOrchestrator:
         self._decomposer = decomposer or HeuristicDecomposer()
         self._policy = policy_engine or LocalPolicyEngine()
         self._provider = provider or ManualProvider()
+        # Learned dispatch (issue #33): the orchestrator is provider-*registry*
+        # aware so cost-refresh, cancellation and remediation can reconcile each
+        # run against the agent that *actually* ran it (its recorded
+        # ``job.provider``), not a single configured singleton. The default
+        # provider is always in the registry under its own name, so the
+        # single-provider path is byte-for-byte unchanged: ``_provider_for`` then
+        # resolves exactly the same provider the old ``job.provider == name``
+        # guard did, and returns ``None`` ("not ours") for any other.
+        self._providers: dict[str, CodingAgentProvider] = dict(providers or {})
+        self._providers.setdefault(self._provider.name, self._provider)
+        # When ``auto_dispatch`` is on (``agent.provider: auto``), a *first*
+        # dispatch picks the provider by scorecard over ``auto_candidates``,
+        # falling back to ``_provider`` when no agent has earned a recommendation
+        # yet. Off by default, so nothing changes unless explicitly enabled.
+        self._auto_dispatch = auto_dispatch
+        self._auto_candidates = tuple(auto_candidates or self._providers.keys())
+        self._auto_min_samples = auto_min_samples
         # Optional: when set, Foundry writes progress/state back to the tracker.
         self._tracker = issue_tracker
         # Optional: when set, Foundry posts approval messages + status updates to
@@ -763,15 +785,86 @@ class FoundryOrchestrator:
         self._notify_state(issue_id, RunStatus.EXECUTION_FAILED)
         return RunStatus.EXECUTION_FAILED
 
+    def _provider_for(self, name: str | None) -> CodingAgentProvider | None:
+        """The configured provider that owns a recorded job, or ``None`` if foreign.
+
+        Cost refresh, cancellation and remediation key off the *recorded*
+        ``job.provider`` rather than a single configured provider, so a run is
+        always reconciled against the agent that actually ran it - even under
+        ``agent.provider: auto`` where different runs use different providers. A
+        provider name we no longer have configured is "not ours" (returns
+        ``None``), exactly as the old single-provider guard skipped a foreign
+        ``provider_job_id``.
+        """
+        if name is None:
+            return None
+        return self._providers.get(name)
+
+    def _select_dispatch_provider(
+        self, session, *, analysis: TicketAnalysis, context: ContextBundle
+    ) -> tuple[CodingAgentProvider, dict | None]:
+        """Pick the provider for a *first* dispatch (issue #33).
+
+        Default (``agent.provider`` is a single agent, ``auto_dispatch`` off):
+        the configured provider, with no selection metadata - byte-for-byte the
+        previous behaviour, and no scorecard query at all.
+
+        With ``agent.provider: auto`` on: the scorecard-recommended provider over
+        the configured ``auto_candidates`` for this run's work-type/repo, honouring
+        the same min-sample floor and majority-merged gate ``recommend_provider``
+        already enforces. When no agent has earned a recommendation yet, it falls
+        back to the configured default provider - so a fresh deployment with no
+        history behaves predictably, and the kill switch is simply *not* setting
+        ``provider: auto``. The decision is returned as an explainable ``selection``
+        dict recorded on the ``AGENT_STARTED`` event, mirroring how repo routing
+        records its reason string - so a human can always see *why* this agent ran.
+        """
+        if not self._auto_dispatch:
+            return self._provider, None
+        work_type = analysis.work_type.value if analysis else None
+        repo = (
+            context.best_repository.repo
+            if context and context.best_repository
+            else None
+        )
+        rec = recommend_provider(
+            session,
+            work_type=work_type,
+            repo=repo,
+            candidates=list(self._auto_candidates),
+            min_samples=self._auto_min_samples,
+        )
+        chosen = rec["recommended"]
+        provider = self._providers.get(chosen) if chosen else None
+        if provider is not None:
+            selection = {
+                "mode": "auto",
+                "selected_by": "scorecard",
+                "provider": provider.name,
+                "scope": rec["scope"],
+                "reason": rec["reason"],
+            }
+            return provider, selection
+        # No eligible agent yet (thin/losing history): fall back to the default.
+        selection = {
+            "mode": "auto",
+            "selected_by": "fallback",
+            "provider": self._provider.name,
+            "scope": rec["scope"],
+            "reason": rec["reason"],
+        }
+        return self._provider, selection
+
     def _cancel_active_job(self, session, run_id: str, *, user: str) -> None:
         """Cancel the run's in-flight provider job when a human ends the run.
 
         Only the latest job is cancellable, and only while it is still
-        ``CREATED``/``RUNNING`` and was launched by the *currently configured*
-        provider (mirrors :meth:`_refresh_job_costs`: a foreign ``provider_job_id``
-        is not ours to cancel). Failure-isolated exactly like tracker write-back -
-        a provider whose cancel call raises still leaves the run blocked, with the
-        failure recorded on the ``AGENT_CANCELLED`` audit event for the trail.
+        ``CREATED``/``RUNNING`` and was launched by a *configured* provider
+        (resolved by its recorded ``job.provider``; mirrors
+        :meth:`_refresh_job_costs`: a foreign ``provider_job_id`` is not ours to
+        cancel). Failure-isolated exactly like tracker write-back - a provider
+        whose cancel call raises still leaves the run blocked, with the failure
+        recorded on the ``AGENT_CANCELLED`` audit event for the trail.
         """
         job = (
             session.query(FoundryAgentJob)
@@ -784,12 +877,13 @@ class FoundryOrchestrator:
             AgentJobStatus.RUNNING,
         ):
             return
-        if not job.provider_job_id or job.provider != self._provider.name:
+        provider = self._provider_for(job.provider)
+        if not job.provider_job_id or provider is None:
             return
 
         error: str | None = None
         try:
-            self._provider.cancel_job(job.provider_job_id)
+            provider.cancel_job(job.provider_job_id)
         except Exception as exc:  # never let cancellation break the termination
             error = str(exc) or exc.__class__.__name__
             _log.exception(
@@ -830,10 +924,11 @@ class FoundryOrchestrator:
         Best-effort cancel it (failure-isolated like :meth:`_cancel_active_job`)
         and reflect the outcome on the freshly-recorded ``job_row`` so the trail
         is honest about what ran and what we did about it."""
-        if job.provider != self._provider.name or not job.job_id:
+        provider = self._provider_for(job.provider)
+        if provider is None or not job.job_id:
             return
         try:
-            self._provider.cancel_job(job.job_id)
+            provider.cancel_job(job.job_id)
             job_row.status = AgentJobStatus.CANCELLED
             job_row.completed_at = datetime.now(timezone.utc)
         except Exception as exc:  # never let cancellation break the commit
@@ -1088,6 +1183,13 @@ class FoundryOrchestrator:
                 )
 
             job_input = self._build_job_input(run_id, ticket, plan, context)
+            # Choose the agent for this first dispatch (issue #33): the configured
+            # provider by default, or the scorecard pick under agent.provider:
+            # auto. A pure read, inside the gate transaction; nothing dispatches
+            # here.
+            provider, selection = self._select_dispatch_provider(
+                session, analysis=analysis, context=context
+            )
             issue_id = run.linear_issue_id
             # Commit the allow decision now; the provider call in phase 2 is a
             # side effect that must not be able to erase the recorded gate row.
@@ -1097,7 +1199,10 @@ class FoundryOrchestrator:
         # A dispatch that never even starts the agent ends the run (failed runs
         # are re-triggerable by a fresh intake).
         job = self._dispatch_to_provider(
-            run_id, job_input, failure_status=RunStatus.EXECUTION_FAILED
+            run_id,
+            job_input,
+            provider=provider,
+            failure_status=RunStatus.EXECUTION_FAILED,
         )
 
         # -- phase 3: record the running job ---------------------------------
@@ -1114,12 +1219,17 @@ class FoundryOrchestrator:
                 started_at=datetime.now(timezone.utc),
             )
             session.add(job_row)
+            started_metadata = {"provider": job.provider, "job_id": job.job_id}
+            if selection is not None:
+                # Learned dispatch (issue #33): record *why* this agent ran so the
+                # routing is auditable, like repo routing's reason string.
+                started_metadata["selection"] = selection
             session.add(
                 build_audit_event(
                     run_id=run_id,
                     event_type=AuditEventType.AGENT_STARTED,
                     actor_type="foundry",
-                    metadata={"provider": job.provider, "job_id": job.job_id},
+                    metadata=started_metadata,
                 )
             )
             # A human stop()/reject() can win the row lock between phase 1's
@@ -1163,6 +1273,7 @@ class FoundryOrchestrator:
         run_id: str,
         job_input: CodingAgentJobInput,
         *,
+        provider: CodingAgentProvider,
         failure_status: RunStatus,
     ) -> CodingAgentJob:
         """Call the provider, recording an ``AGENT_FAILED`` event if it raises.
@@ -1172,10 +1283,12 @@ class FoundryOrchestrator:
         the run to a definite status, instead of rolling back the surrounding
         transaction and stranding the run with a recorded gate decision but no
         agent and no failure event (issue #13). The original exception is
-        re-raised so callers see the failure unchanged.
+        re-raised so callers see the failure unchanged. ``provider`` is the agent
+        selected for this dispatch (issue #33) - the configured one by default,
+        or the scorecard pick under ``agent.provider: auto``.
         """
         try:
-            return self._provider.create_job(job_input)
+            return provider.create_job(job_input)
         except Exception as exc:
             self._record_dispatch_failure(run_id, failure_status, reason=str(exc))
             raise
@@ -1376,12 +1489,23 @@ class FoundryOrchestrator:
 
             # The first job was the original dispatch; everything after is a
             # remediation attempt.
-            prior_jobs = (
+            run_jobs = (
                 session.query(FoundryAgentJob)
                 .filter(FoundryAgentJob.run_id == run_id)
-                .count()
+                .order_by(
+                    FoundryAgentJob.started_at.is_(None).desc(),
+                    FoundryAgentJob.started_at,
+                    FoundryAgentJob.id,
+                )
+                .all()
             )
-            attempt = prior_jobs  # attempt N = N-th re-dispatch
+            attempt = len(run_jobs)  # attempt N = N-th re-dispatch
+            # A retry reuses the agent that opened the PR (issue #33): we never
+            # re-route a run mid-flight. Resolve the original (earliest) job's
+            # provider from the registry; if it is no longer configured, fall
+            # back to the default so remediation can still proceed.
+            original_provider = run_jobs[0].provider if run_jobs else None
+            provider = self._provider_for(original_provider) or self._provider
 
             # Refresh provider-reported spend before the budget check so the
             # decision is made on the freshest numbers we can get. Jobs whose
@@ -1465,7 +1589,10 @@ class FoundryOrchestrator:
         # The PR already exists, so a failed re-dispatch hands the PR back to a
         # human (REVIEW_REQUIRED) rather than ending the run.
         job = self._dispatch_to_provider(
-            run_id, job_input, failure_status=RunStatus.REVIEW_REQUIRED
+            run_id,
+            job_input,
+            provider=provider,
+            failure_status=RunStatus.REVIEW_REQUIRED,
         )
 
         with self._sf() as session:
@@ -1552,10 +1679,11 @@ class FoundryOrchestrator:
         errors must never break the governance path that called this.
         """
         for job in session.query(FoundryAgentJob).filter_by(run_id=run_id):
-            if not job.provider_job_id or job.provider != self._provider.name:
+            provider = self._provider_for(job.provider)
+            if not job.provider_job_id or provider is None:
                 continue
             try:
-                status = self._provider.get_job_status(job.provider_job_id)
+                status = provider.get_job_status(job.provider_job_id)
             except Exception:
                 _log.debug("cost refresh failed for job %s", job.id, exc_info=True)
                 continue
