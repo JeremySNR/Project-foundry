@@ -43,6 +43,8 @@ CLIENT_ID = "foundry-dashboard"
 AUTH_EP = "https://idp.example.com/authorize"
 TOKEN_EP = "https://idp.example.com/token"
 REDIRECT = "https://foundry.example.com/dashboard/auth/callback"
+END_SESSION_EP = "https://idp.example.com/logout"
+POST_LOGOUT = "https://foundry.example.com/dashboard"
 KID = "key-1"
 
 
@@ -282,11 +284,59 @@ def test_complete_rejects_token_without_subject():
 
 
 # --------------------------------------------------------------------------- #
+# RP-Initiated Logout (federated logout) - end_session_url unit tests
+# --------------------------------------------------------------------------- #
+
+
+def test_end_session_url_none_when_not_configured():
+    priv, jwks = _keypair()
+    login, _ = _make_login(priv, jwks)
+    assert login.end_session_url() is None
+
+
+def test_end_session_url_carries_client_id_in_lieu_of_id_token_hint():
+    priv, jwks = _keypair()
+    login, _ = _make_login(priv, jwks, end_session_endpoint=END_SESSION_EP)
+    url = login.end_session_url()
+    assert url.startswith(END_SESSION_EP + "?")
+    q = parse_qs(urlparse(url).query)
+    assert q["client_id"] == [CLIENT_ID]
+    # No id_token is stored client-side, so none is sent (client_id identifies us).
+    assert "id_token_hint" not in q
+    assert "post_logout_redirect_uri" not in q
+
+
+def test_end_session_url_includes_post_logout_redirect_uri():
+    priv, jwks = _keypair()
+    login, _ = _make_login(
+        priv,
+        jwks,
+        end_session_endpoint=END_SESSION_EP,
+        post_logout_redirect_uri=POST_LOGOUT,
+    )
+    q = parse_qs(urlparse(login.end_session_url()).query)
+    assert q["client_id"] == [CLIENT_ID]
+    assert q["post_logout_redirect_uri"] == [POST_LOGOUT]
+
+
+def test_end_session_url_appends_to_existing_query():
+    priv, jwks = _keypair()
+    login, _ = _make_login(
+        priv, jwks, end_session_endpoint=END_SESSION_EP + "?ui_locales=en"
+    )
+    url = login.end_session_url()
+    assert "?ui_locales=en&" in url
+    q = parse_qs(urlparse(url).query)
+    assert q["ui_locales"] == ["en"]
+    assert q["client_id"] == [CLIENT_ID]
+
+
+# --------------------------------------------------------------------------- #
 # API integration (TestClient drives the real routes + cookie jar)
 # --------------------------------------------------------------------------- #
 
 
-def _client(*, with_login=True, api_token=None):
+def _client(*, with_login=True, api_token=None, login_kwargs=None):
     engine = make_engine("sqlite+pysqlite:///:memory:")
     create_all(engine)
     sf = make_session_factory(engine)
@@ -298,7 +348,7 @@ def _client(*, with_login=True, api_token=None):
     login = None
     holder: dict = {"sub": "alice@example.com"}
     if with_login:
-        login, holder = _make_login(priv, jwks)
+        login, holder = _make_login(priv, jwks, **(login_kwargs or {}))
     client = TestClient(
         create_app(
             webhook_secret="s",
@@ -366,6 +416,29 @@ def test_logout_clears_session_cookie():
     assert client.get("/metrics/delivery").status_code == 200
     resp = client.get("/dashboard/logout", follow_redirects=False)
     assert resp.status_code == 302
+    # Default (no end_session_endpoint): returns to the local dashboard.
+    assert resp.headers["location"] == "/dashboard"
+    assert client.get("/metrics/delivery").status_code == 401
+
+
+def test_logout_redirects_to_idp_when_federated_logout_configured():
+    client, holder = _client(
+        login_kwargs={
+            "end_session_endpoint": END_SESSION_EP,
+            "post_logout_redirect_uri": POST_LOGOUT,
+        }
+    )
+    _drive_login(client, holder)
+    assert client.get("/metrics/delivery").status_code == 200
+    resp = client.get("/dashboard/logout", follow_redirects=False)
+    assert resp.status_code == 302
+    # Redirected on to the IdP to terminate the SSO session, not just /dashboard.
+    location = resp.headers["location"]
+    assert location.startswith(END_SESSION_EP)
+    q = parse_qs(urlparse(location).query)
+    assert q["client_id"] == [CLIENT_ID]
+    assert q["post_logout_redirect_uri"] == [POST_LOGOUT]
+    # The local session cookie is cleared regardless of the federated redirect.
     assert client.get("/metrics/delivery").status_code == 401
 
 
@@ -486,6 +559,63 @@ def test_login_config_from_yaml(tmp_path):
     assert s.oidc_scopes == ("openid", "email", "profile")
     assert s.oidc_session_ttl_seconds == 3600
     assert s.oidc_cookie_secure is False
+
+
+def test_federated_logout_config_from_env():
+    s = Settings.load(
+        env={
+            **_BEARER_ENV,
+            **_LOGIN_ENV,
+            "FOUNDRY_OIDC_END_SESSION_ENDPOINT": END_SESSION_EP,
+            "FOUNDRY_OIDC_POST_LOGOUT_REDIRECT_URI": POST_LOGOUT,
+        }
+    )
+    assert s.oidc_end_session_endpoint == END_SESSION_EP
+    assert s.oidc_post_logout_redirect_uri == POST_LOGOUT
+
+
+def test_federated_logout_config_from_yaml(tmp_path):
+    cfg = tmp_path / "foundry.yaml"
+    cfg.write_text(
+        "auth:\n"
+        "  oidc:\n"
+        f"    issuer: {ISSUER}\n"
+        f"    audience: {AUDIENCE}\n"
+        "    jwks_uri: https://idp.example.com/jwks\n"
+        f"    client_id: {CLIENT_ID}\n"
+        f"    authorization_endpoint: {AUTH_EP}\n"
+        f"    token_endpoint: {TOKEN_EP}\n"
+        f"    redirect_uri: {REDIRECT}\n"
+        f"    end_session_endpoint: {END_SESSION_EP}\n"
+        f"    post_logout_redirect_uri: {POST_LOGOUT}\n"
+    )
+    s = Settings.load(cfg)
+    assert s.oidc_end_session_endpoint == END_SESSION_EP
+    assert s.oidc_post_logout_redirect_uri == POST_LOGOUT
+
+
+def test_end_session_without_login_config_rejected():
+    with pytest.raises(ValueError, match="RP-initiated logout"):
+        Settings.load(
+            env={**_BEARER_ENV, "FOUNDRY_OIDC_END_SESSION_ENDPOINT": END_SESSION_EP}
+        )
+
+
+def test_post_logout_without_end_session_rejected():
+    with pytest.raises(ValueError, match="post_logout_redirect_uri"):
+        Settings.load(
+            env={
+                **_BEARER_ENV,
+                **_LOGIN_ENV,
+                "FOUNDRY_OIDC_POST_LOGOUT_REDIRECT_URI": POST_LOGOUT,
+            }
+        )
+
+
+def test_default_has_no_federated_logout():
+    s = Settings.load()
+    assert s.oidc_end_session_endpoint is None
+    assert s.oidc_post_logout_redirect_uri is None
 
 
 def test_app_from_settings_fails_loud_without_secrets(tmp_path):

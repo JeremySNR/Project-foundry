@@ -73,6 +73,14 @@ Foundry fails closed by design, but you still need to deploy it sensibly:
   cookie a browser sends automatically can never be tricked (CSRF) into driving
   an approval — approvals still require a bearer token or a signed webhook. Keep
   `FOUNDRY_SESSION_SECRET` secret and rotate it to invalidate all live sessions.
+  Optionally configure **RP-Initiated (federated) logout** (`auth.oidc`
+  `end_session_endpoint`, + an optional IdP-registered `post_logout_redirect_uri`):
+  `/dashboard/logout` then ends the IdP SSO session too, not just the local
+  Foundry cookie — without it, logging out of Foundry leaves the IdP session
+  live, so a shared/kiosk workstation silently re-authenticates on the next
+  visit. The logout URL carries `client_id` (in lieu of an `id_token_hint`, so no
+  id_token is stored client-side) and is built only from committed config, so it
+  is not an open-redirect surface. The local session cookie is cleared either way.
 - Terminate TLS in front of the API; webhook signatures authenticate payloads,
   not transport.
 - Keep the approver → roles mapping in reviewed, committed YAML.

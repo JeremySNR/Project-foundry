@@ -113,6 +113,11 @@ class OidcLogin:
     session_ttl_seconds: int = _DEFAULT_SESSION_TTL
     login_ttl_seconds: int = _DEFAULT_LOGIN_TTL
     cookie_secure: bool = True
+    # RP-Initiated Logout 1.0: the IdP's end-session endpoint and (optionally)
+    # where it returns the browser afterwards. Both None => no federated logout
+    # (the logout route just clears the local cookie). See ``end_session_url``.
+    end_session_endpoint: str | None = None
+    post_logout_redirect_uri: str | None = None
     exchange: TokenExchanger = field(default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -197,6 +202,27 @@ class OidcLogin:
         if identity is None:
             raise OidcLoginError("id_token has no usable subject claim")
         return self.signer.mint({"sub": identity}, ttl_seconds=self.session_ttl_seconds)
+
+    def end_session_url(self) -> str | None:
+        """The IdP RP-initiated logout URL, or ``None`` if not configured.
+
+        Per OpenID Connect RP-Initiated Logout 1.0, ``client_id`` is sent in lieu
+        of an ``id_token_hint`` so the OP can identify this RP (and so we don't
+        have to stash the id_token in the signed session cookie - keeping the
+        cookie's contents, and the login path, byte-for-byte unchanged). The
+        optional ``post_logout_redirect_uri`` (which the OP must have registered)
+        is where the browser is returned after the IdP session is terminated.
+
+        The URL is built entirely from committed config - no request/user input
+        reaches it - so it is not an open-redirect surface.
+        """
+        if not self.end_session_endpoint:
+            return None
+        params = {"client_id": self.client_id}
+        if self.post_logout_redirect_uri:
+            params["post_logout_redirect_uri"] = self.post_logout_redirect_uri
+        sep = "&" if "?" in self.end_session_endpoint else "?"
+        return self.end_session_endpoint + sep + urllib.parse.urlencode(params)
 
 
 __all__ = [
