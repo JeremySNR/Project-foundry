@@ -118,6 +118,13 @@ def _activities_with_db() -> tuple[FoundryActivities, object]:
 
 
 async def test_workflow_happy_path_with_signals(env) -> None:
+    # Ends at pr_open: once the PR is observed the workflow keeps watching for
+    # further pushes (pr_open is PR-observable) and only settles at pr_open when
+    # the PR window goes quiet - which needs the time-skipping server to
+    # fast-forward the multi-day _PR_TIMEOUT. Against a real server that wait is
+    # real, so this case skips there; the approve -> dispatch -> PR -> terminal
+    # path is proven on the real server by the multi-PR-to-merge case below.
+    _require_time_skipping(env)
     activities = _activities()
     with ThreadPoolExecutor(max_workers=4) as executor:
         async with Worker(

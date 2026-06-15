@@ -144,6 +144,11 @@ jobs:
   temporal:
     name: Temporal workflow (real server)
     runs-on: ubuntu-latest
+    # Bound the job: the real server doesn't skip time, so a test that slipped
+    # into a multi-day durable wait would otherwise hang for the runner's full
+    # default budget. The real-server E2E (image pull + auto-setup + ~4 prompt
+    # tests) completes well inside this.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
