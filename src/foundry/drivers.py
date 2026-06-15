@@ -96,8 +96,12 @@ class InlineDriver:
             try:
                 self._orch.dispatch_agent(run_id)
             except OrchestratorError:
-                # A policy block (e.g. human-only work) already set the run to
-                # blocked; that is the outcome, not an error to surface here.
+                # dispatch_agent raises when the run is not (yet) dispatchable.
+                # Two benign cases: a policy block (e.g. human-only work) already
+                # set the run to blocked, or - under an N-of-M approval matrix
+                # (issue #31) - this sign-off has not yet met the required count,
+                # so the run is still WAITING_APPROVAL for the next approver.
+                # Neither is an error to surface here.
                 pass
         elif decision == REJECT:
             self._orch.reject(run_id, user=user)

@@ -266,6 +266,18 @@ class Settings:
     # approval gate stays a one-way ratchet towards stricter (invariant #1). Role
     # names are validated against the ApprovalRole vocabulary at load.
     repo_required_roles: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Minimum number of *distinct* human approvers a run needs before it leaves
+    # WAITING_APPROVAL for APPROVED - the "two-person rule" / N-of-M approval
+    # matrix (issue #31). Default 1 = the historical single-approval lifecycle,
+    # byte-for-byte. Enforced in the orchestrator lifecycle (approvals accumulate
+    # and the run only advances once the count is met), like the orchestrator-only
+    # forbidden-path block, so there is no policy-engine/Rego lock-step concern.
+    min_approvals: int = 1
+    # repo name -> minimum approver count for runs routed to that repo, on top of
+    # the global ``min_approvals`` floor. Strictly additive: the effective minimum
+    # is max(min_approvals, per-repo value), so a repo can only ever demand *more*
+    # sign-offs, never fewer (invariant #1).
+    repo_min_approvals: tuple[tuple[str, int], ...] = ()
 
     # --- remediation / feedback loop (behaviour: yaml) ---
     # When CI fails or a reviewer requests changes, Foundry can re-dispatch the
@@ -520,6 +532,18 @@ class Settings:
                         f"policy.repo_required_roles repo {repo!r} lists unknown "
                         f"approval roles {bad}; valid roles are {sorted(valid_roles)}"
                     )
+        # N-of-M approval counts must be at least one sign-off (issue #31). A
+        # value below 1 would be a gate weakening - never silently allowed.
+        if self.min_approvals < 1:
+            raise ValueError(
+                f"policy.min_approvals must be >= 1, got {self.min_approvals}"
+            )
+        for repo, count in self.repo_min_approvals:
+            if count < 1:
+                raise ValueError(
+                    f"policy.repo_min_approvals repo {repo!r} must be >= 1, "
+                    f"got {count}"
+                )
         # Role names in the IdP-group map must be real ApprovalRoles, validated at
         # load time so a typo is a deploy-time error, not a silently-empty grant.
         if self.oidc_group_role_map:
@@ -609,6 +633,11 @@ class Settings:
     def repo_required_roles_map(self) -> dict[str, tuple[str, ...]]:
         """repo name -> extra approval roles required for runs routed there."""
         return {repo: roles for repo, roles in self.repo_required_roles}
+
+    @property
+    def repo_min_approvals_map(self) -> dict[str, int]:
+        """repo name -> minimum distinct approver count for runs routed there."""
+        return {repo: count for repo, count in self.repo_min_approvals}
 
     @property
     def oidc_enabled(self) -> bool:
@@ -716,6 +745,13 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["repo_required_roles"] = tuple(
             (str(repo), tuple(str(role) for role in roles))
             for repo, roles in (policy["repo_required_roles"] or {}).items()
+        )
+    if "min_approvals" in policy:
+        out["min_approvals"] = int(policy["min_approvals"])
+    if "repo_min_approvals" in policy:
+        out["repo_min_approvals"] = tuple(
+            (str(repo), int(count))
+            for repo, count in (policy["repo_min_approvals"] or {}).items()
         )
 
     remediation = data.get("remediation", {}) or {}

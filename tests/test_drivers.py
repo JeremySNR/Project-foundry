@@ -45,6 +45,25 @@ def test_start_then_approve_dispatches(driver_and_orch) -> None:
     assert orch.get_run(run_id).status is RunStatus.AGENT_RUNNING
 
 
+def test_two_person_rule_needs_a_second_approver(driver_and_orch) -> None:
+    """Under an N-of-M approval matrix (issue #31) the first approval through the
+    driver does not dispatch: dispatch_agent raises (run still WAITING_APPROVAL)
+    and is swallowed, so the run waits for the second distinct approver, who
+    drives it through to dispatch."""
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+    orch = FoundryOrchestrator(sf, provider=InMemoryFakeProvider(), min_approvals=2)
+    driver = InlineDriver(orch)
+    run_id = driver.start(_ready_ticket(), trigger_type="label")
+
+    driver.submit_decision(run_id, decision="approve", user="alice@example.com")
+    assert orch.get_run(run_id).status is RunStatus.WAITING_APPROVAL
+
+    driver.submit_decision(run_id, decision="approve", user="bob@example.com")
+    assert orch.get_run(run_id).status is RunStatus.AGENT_RUNNING
+
+
 def test_approve_human_only_work_ends_blocked_not_raised(driver_and_orch) -> None:
     driver, orch = driver_and_orch
     ticket = _ready_ticket(
