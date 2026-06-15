@@ -53,15 +53,19 @@ def _token(
     exp_delta: int = 3600,
     nbf_delta: int | None = None,
     key=None,
+    sub: str = "alice@example.com",
+    extra: dict | None = None,
 ) -> str:
     now = int(time.time())
     claims = {
-        "sub": "alice@example.com",
+        "sub": sub,
         "iss": issuer,
         "aud": audience,
         "iat": now,
         "exp": now + exp_delta,
     }
+    if extra:
+        claims.update(extra)
     if nbf_delta is not None:
         claims["nbf"] = now + nbf_delta
     return jwt.encode(claims, key or priv, algorithm=alg, headers={"kid": kid})
@@ -346,3 +350,316 @@ def test_dashboard_served_when_only_oidc_configured():
     resp = client.get("/dashboard")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
+
+
+# --------------------------------------------------------------------------- #
+# Claim-extraction helpers (pure, issue #34)
+# --------------------------------------------------------------------------- #
+
+from foundry.api.oidc import (  # noqa: E402
+    groups_from_claims,
+    identity_from_claims,
+)
+
+
+def test_identity_prefers_subject_claim_then_sub():
+    # subject_claim present -> used.
+    assert identity_from_claims({"email": "a@x", "sub": "u-1"}, "email") == "a@x"
+    # subject_claim absent -> falls back to the standard 'sub'.
+    assert identity_from_claims({"sub": "u-1"}, "email") == "u-1"
+    # neither present (or blank) -> None, so the caller refuses to bind.
+    assert identity_from_claims({"email": "   "}, "email") is None
+    assert identity_from_claims({}, "email") is None
+
+
+def test_groups_tolerates_list_and_space_delimited_string():
+    assert groups_from_claims({"groups": ["a", "b"]}, "groups") == frozenset({"a", "b"})
+    assert groups_from_claims({"groups": "a b c"}, "groups") == frozenset({"a", "b", "c"})
+    # Missing / wrong-typed claim -> fail-closed empty set, never an error.
+    assert groups_from_claims({}, "groups") == frozenset()
+    assert groups_from_claims({"groups": 42}, "groups") == frozenset()
+
+
+# --------------------------------------------------------------------------- #
+# Config (IdP-group -> role map, issue #34)
+# --------------------------------------------------------------------------- #
+
+
+def test_group_role_map_rejects_unknown_role_at_load(tmp_path):
+    cfg = tmp_path / "foundry.yaml"
+    cfg.write_text(
+        "auth:\n"
+        "  oidc:\n"
+        f"    issuer: {ISSUER}\n"
+        f"    audience: {AUDIENCE}\n"
+        "    jwks_uri: https://idp.example.com/jwks\n"
+        "    group_role_map:\n"
+        "      eng-leads: [engineering, wizard]\n"  # 'wizard' is not a role
+    )
+    with pytest.raises(ValueError, match="unknown approval roles"):
+        Settings.load(cfg)
+
+
+def test_group_role_map_and_claims_from_config(tmp_path):
+    cfg = tmp_path / "foundry.yaml"
+    cfg.write_text(
+        "auth:\n"
+        "  oidc:\n"
+        f"    issuer: {ISSUER}\n"
+        f"    audience: {AUDIENCE}\n"
+        "    jwks_uri: https://idp.example.com/jwks\n"
+        "    subject_claim: email\n"
+        "    group_claim: roles\n"
+        "    group_role_map:\n"
+        "      eng-leads: [engineering]\n"
+        "      sec-team: [security, qa]\n"
+    )
+    s = Settings.load(cfg)
+    assert s.oidc_group_claim == "roles"
+    assert s.group_role_map == {
+        "eng-leads": ("engineering",),
+        "sec-team": ("security", "qa"),
+    }
+
+
+def test_claim_names_from_env():
+    s = Settings.load(
+        env={
+            "FOUNDRY_OIDC_ISSUER": ISSUER,
+            "FOUNDRY_OIDC_AUDIENCE": AUDIENCE,
+            "FOUNDRY_OIDC_JWKS_URI": "https://idp.example.com/jwks",
+            "FOUNDRY_OIDC_SUBJECT_CLAIM": "preferred_username",
+            "FOUNDRY_OIDC_GROUP_CLAIM": "roles",
+        }
+    )
+    assert s.oidc_subject_claim == "preferred_username"
+    assert s.oidc_group_claim == "roles"
+
+
+def test_defaults_for_claims_and_empty_map():
+    s = Settings.load()
+    assert s.oidc_subject_claim == "email"
+    assert s.oidc_group_claim == "groups"
+    assert s.oidc_group_role_map == ()
+    assert s.group_role_map == {}
+
+
+# --------------------------------------------------------------------------- #
+# REST approval bound to the verified OIDC token (issue #34)
+# --------------------------------------------------------------------------- #
+
+from foundry.api.security import compute_signature  # noqa: E402
+
+WEBHOOK_SECRET = "wh-secret"
+READY_DESC = (
+    "Customers want to favourite items.\n\n"
+    "Acceptance Criteria:\n"
+    "- A favourites button exists\n"
+    "- Favourites persist across sessions\n"
+)
+
+
+def _approval_client(
+    *,
+    approvers=None,
+    group_role_map=None,
+    subject_claim="email",
+    group_claim="groups",
+    api_token=None,
+):
+    """An app with OIDC auth + Linear webhook intake wired for approval tests.
+
+    Returns ``(client, priv)`` where ``priv`` is the RSA key whose public half
+    the app's verifier trusts, so the test can mint tokens it will accept.
+    """
+    engine = make_engine("sqlite+pysqlite:///:memory:")
+    create_all(engine)
+    sf = make_session_factory(engine)
+    orch = FoundryOrchestrator(sf, provider=InMemoryFakeProvider())
+    priv, jwks = _keypair()
+    client = TestClient(
+        create_app(
+            webhook_secret=WEBHOOK_SECRET,
+            session_factory=sf,
+            orchestrator=orch,
+            approvers=approvers or {},
+            api_token=api_token,
+            oidc_verifier=_verifier(jwks),
+            oidc_subject_claim=subject_claim,
+            oidc_group_claim=group_claim,
+            oidc_group_role_map=group_role_map or {},
+        )
+    )
+    return client, priv
+
+
+def _ready_payload(issue_id="issue-r", key="LIN-1", *, infra=False) -> dict:
+    if infra:
+        title = "Update the terraform deployment config"
+        desc = "Acceptance Criteria:\n- terraform plan runs clean\n- it applies\n"
+    else:
+        title = "Add customer favourites"
+        desc = READY_DESC
+    return {
+        "data": {
+            "id": issue_id,
+            "issueId": issue_id,
+            "identifier": key,
+            "title": title,
+            "description": desc,
+            "labels": [{"name": "foundry:candidate"}, {"name": "repo:customer-web"}],
+            "actor": {"name": "po@example.com"},
+        }
+    }
+
+
+def _start_run(client, payload, *, delivery="d-1") -> str:
+    body = json.dumps(payload).encode("utf-8")
+    sig = "sha256=" + compute_signature(WEBHOOK_SECRET, body)
+    resp = client.post(
+        "/webhooks/linear",
+        content=body,
+        headers={"Linear-Delivery": delivery, "Linear-Signature": sig},
+    )
+    assert resp.json()["run"]["status"] == "waiting_approval", resp.json()
+    return resp.json()["run"]["id"]
+
+
+def test_oidc_approval_binds_actor_to_verified_subject():
+    """The approver identity is the verified email claim, not the body 'user'."""
+    client, priv = _approval_client(approvers={"alice@example.com": []})
+    run_id = _start_run(client, _ready_payload())
+    token = _token(priv, sub="alice@example.com", extra={"email": "alice@example.com"})
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"text": "/foundry approve"},  # no body 'user' at all
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["run"]["approved_by"] == "alice@example.com"
+
+
+def test_oidc_approval_refuses_body_user_mismatch():
+    client, priv = _approval_client(approvers={"alice@example.com": ["engineering"]})
+    run_id = _start_run(client, _ready_payload())
+    token = _token(priv, extra={"email": "alice@example.com"})
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "mallory@example.com", "text": "/foundry approve"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+    assert "does not match" in resp.json()["detail"]
+    assert client.get(
+        f"/runs/{run_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()["status"] == "waiting_approval"
+
+
+def test_oidc_group_grants_role_and_authorises_unlisted_user():
+    """A verified member of a mapped IdP group gets the role and may approve a
+    run requiring it - even though they are NOT in the static approvers list."""
+    client, priv = _approval_client(
+        approvers={},  # carol is not listed here
+        group_role_map={"eng-leads": ["engineering"]},
+    )
+    run_id = _start_run(client, _ready_payload(infra=True))
+    token = _token(
+        priv,
+        sub="carol@example.com",
+        extra={"email": "carol@example.com", "groups": ["eng-leads"]},
+    )
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"text": "/foundry approve"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["run"]["status"] == "agent_running"
+    assert resp.json()["run"]["approved_by"] == "carol@example.com"
+
+
+def test_oidc_group_role_insufficient_for_sensitive_run_is_refused():
+    """A mapped group that grants the wrong role can't satisfy a run's required
+    approval: the gate still refuses (issue #18 / invariant #1 unchanged)."""
+    client, priv = _approval_client(
+        approvers={},
+        group_role_map={"qa-team": ["qa"]},  # qa != engineering
+    )
+    run_id = _start_run(client, _ready_payload(infra=True))
+    token = _token(
+        priv,
+        sub="quinn@example.com",
+        extra={"email": "quinn@example.com", "groups": ["qa-team"]},
+    )
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"text": "/foundry approve"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+    assert "approval refused" in resp.json()["detail"]
+    assert client.get(
+        f"/runs/{run_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()["status"] == "waiting_approval"
+
+
+def test_oidc_user_without_standing_is_not_authorised():
+    """A verified token whose subject is neither a configured approver nor in any
+    mapped group cannot approve at all."""
+    client, priv = _approval_client(
+        approvers={"alice@example.com": []},
+        group_role_map={"eng-leads": ["engineering"]},
+    )
+    run_id = _start_run(client, _ready_payload())
+    token = _token(
+        priv,
+        sub="dave@example.com",
+        extra={"email": "dave@example.com", "groups": ["randoms"]},
+    )
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"text": "/foundry approve"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+    assert "not authorised" in resp.json()["detail"]
+
+
+def test_oidc_token_without_subject_claim_refused():
+    """A verified token carrying neither the configured subject claim nor a
+    usable 'sub' cannot bind an approver identity -> 401."""
+    client, priv = _approval_client(
+        approvers={"alice@example.com": []}, subject_claim="email"
+    )
+    run_id = _start_run(client, _ready_payload())
+    token = _token(priv, sub="", extra={})  # blank sub, no email
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"text": "/foundry approve"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 401
+    assert "subject claim" in resp.json()["detail"]
+
+
+def test_static_token_path_ignores_group_map():
+    """With a static token (no verified claims), behaviour is unchanged: the
+    actor is the body 'user' and roles come from committed approvers - the
+    IdP-group map plays no part."""
+    client, _ = _approval_client(
+        approvers={"lead@example.com": ["engineering"]},
+        api_token="static-tok",
+        group_role_map={"eng-leads": ["engineering"]},
+    )
+    run_id = _start_run(client, _ready_payload(infra=True))
+    # Static-token caller approves as the body 'user', satisfied by config roles.
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers={"Authorization": "Bearer static-tok"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["run"]["status"] == "agent_running"
+    assert resp.json()["run"]["approved_by"] == "lead@example.com"

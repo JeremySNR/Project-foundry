@@ -41,10 +41,22 @@ Foundry fails closed by design, but you still need to deploy it sensibly:
   algorithm allow-list defaults to **RS256 only** — keep it asymmetric so a
   token can never be accepted by presenting the public JWKS key as an HMAC
   secret (`alg:none` / HS-confusion are refused). All three OIDC settings are
-  required together; a partial config fails closed at startup. This is
-  authentication only: approver **roles** are still taken from committed config,
-  never from a token claim, so an OIDC-authenticated caller cannot self-assert
-  an approver role.
+  required together; a partial config fails closed at startup.
+- **OIDC approver binding + IdP-group → role mapping (optional).** When a REST
+  approval is authenticated via OIDC, the approver **identity** is taken from
+  the *verified* token (`auth.oidc.subject_claim`, default `email`, falling back
+  to `sub`), **not** the request body — so a token holder cannot approve as
+  someone else; a body `user` that disagrees with the verified subject is
+  refused. The approver's **roles** are the committed `approval.approvers` grant
+  for that verified identity, unioned with the roles the verified
+  `auth.oidc.group_claim` maps to through the committed
+  `auth.oidc.group_role_map`. Crucially, the group→role *mapping* lives in
+  reviewed, committed YAML; only the cryptographically-signed identity/group
+  *claims* come from the token. A caller still cannot self-assert a role — the
+  map is config — and the policy gate's role requirements are unchanged, so a
+  group that grants the wrong role still cannot approve sensitive work. The
+  static-token path is unchanged: identity is the body `user`, roles come from
+  `approval.approvers`, and the IdP-group map plays no part.
 - Terminate TLS in front of the API; webhook signatures authenticate payloads,
   not transport.
 - Keep the approver → roles mapping in reviewed, committed YAML.

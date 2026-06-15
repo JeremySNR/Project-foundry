@@ -169,6 +169,36 @@ class OidcVerifier:
         return dict(claims)
 
 
+def identity_from_claims(claims: Mapping[str, Any], subject_claim: str) -> str | None:
+    """The approver identity from verified claims (issue #34).
+
+    Prefers the configured ``subject_claim`` (typically ``email``); falls back to
+    the standard ``sub`` claim when that is absent so a token without an email
+    claim can still bind to a stable, verified subject. Returns ``None`` when
+    neither is a non-empty string - the caller then refuses to bind an identity.
+    """
+    for key in (subject_claim, "sub"):
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def groups_from_claims(claims: Mapping[str, Any], group_claim: str) -> frozenset[str]:
+    """The IdP groups from verified claims, tolerant of the two common shapes.
+
+    IdPs encode group membership either as a JSON array (``["a", "b"]``) or as a
+    single space-delimited string (``"a b"``). Anything else (missing claim,
+    wrong type) yields no groups - a fail-closed empty set, never an error.
+    """
+    value = claims.get(group_claim)
+    if isinstance(value, str):
+        return frozenset(part for part in value.split() if part)
+    if isinstance(value, (list, tuple)):
+        return frozenset(str(part) for part in value if str(part))
+    return frozenset()
+
+
 def _live_jwks_fetcher(jwks_uri: str) -> JwksFetcher:
     """A network ``fetch`` for the JWKS, built on httpx (the live transport)."""
 

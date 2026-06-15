@@ -73,7 +73,13 @@ from foundry.schemas.ticket import RawTicket
 from .dashboard import DASHBOARD_HTML
 from .dedup import WebhookDeduplicator, webhook_timestamp_fresh
 from .mapping import linear_payload_to_ticket
-from .oidc import OidcAuthError, OidcVerifier, build_verifier
+from .oidc import (
+    OidcAuthError,
+    OidcVerifier,
+    build_verifier,
+    groups_from_claims,
+    identity_from_claims,
+)
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
 from .security import (
@@ -165,6 +171,9 @@ def create_app(
     approvers: Mapping[str, Iterable[str]] | None = None,
     api_token: str | None = None,
     oidc_verifier: OidcVerifier | None = None,
+    oidc_subject_claim: str = "email",
+    oidc_group_claim: str = "groups",
+    oidc_group_role_map: Mapping[str, Iterable[str]] | None = None,
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
@@ -210,6 +219,17 @@ def create_app(
     # Optional, additive OIDC bearer auth (issue #34). When set, token-gated
     # endpoints accept a valid OIDC JWT in addition to the static api_token.
     app.state.oidc_verifier = oidc_verifier
+    # IdP-group -> approver-role mapping (issue #34). When an approval is
+    # authenticated via OIDC, the actor identity is the verified subject claim
+    # (not the request body) and roles are the committed grant for that identity
+    # unioned with the roles mapped from the verified group claim. All committed
+    # config, never request payload (invariant #5).
+    app.state.oidc_subject_claim = oidc_subject_claim
+    app.state.oidc_group_claim = oidc_group_claim
+    app.state.oidc_group_role_map = {
+        group: {ApprovalRole(r) for r in roles}
+        for group, roles in (oidc_group_role_map or {}).items()
+    }
     app.state.ticket_mapper = ticket_mapper or linear_payload_to_ticket
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
@@ -278,9 +298,23 @@ def create_app(
         response.headers["X-RateLimit-Remaining"] = str(result.remaining)
         return response
 
-    def _submit_decision(run_id: str, *, command: str, user: str) -> None:
-        """Drive an approve/reject/stop decision with config-derived roles."""
-        roles = app.state.approvers.get(user, set())
+    def _submit_decision(
+        run_id: str,
+        *,
+        command: str,
+        user: str,
+        roles: set[ApprovalRole] | None = None,
+    ) -> None:
+        """Drive an approve/reject/stop decision.
+
+        Roles are config-derived (``roles=None`` => the committed ``approvers``
+        grant for ``user``) unless the caller passes an explicit set - the OIDC
+        path supplies roles resolved from the *verified* token (committed config
+        keyed by verified identity, plus the IdP-group map). Either way roles
+        come from committed config, never a request payload (invariant #5).
+        """
+        if roles is None:
+            roles = set(app.state.approvers.get(user, set()))
         app.state.driver.submit_decision(
             run_id, decision=command, user=user, roles=set(roles)
         )
@@ -968,18 +1002,46 @@ def create_app(
         request: Request,
         body: dict[str, Any] = Body(...),
     ) -> dict[str, Any]:
-        _require_api_token(app, request)
+        claims = _require_api_token(app, request)
         orch: FoundryOrchestrator = app.state.orchestrator
-        user = body.get("user")
         text = body.get("text") or body.get("command") or ""
-        if not user:
-            raise HTTPException(status_code=400, detail="missing user")
+
+        # Roles are config, never request payload. On the OIDC path the actor
+        # *identity* is also taken from the verified token, not the body, so a
+        # token holder can't approve as someone else (issue #34); on the static
+        # path the identity is the body ``user`` as before.
+        roles: set[ApprovalRole] | None = None
+        if claims is not None:
+            user, roles = _resolve_oidc_approver(app, claims)
+            if user is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "OIDC token has no usable subject claim "
+                        f"('{app.state.oidc_subject_claim}' or 'sub')"
+                    ),
+                )
+            body_user = body.get("user")
+            if body_user and body_user != user:
+                raise HTTPException(
+                    status_code=403,
+                    detail="body 'user' does not match the verified token subject",
+                )
+        else:
+            user = body.get("user")
+            if not user:
+                raise HTTPException(status_code=400, detail="missing user")
 
         command = parse_command(text) or parse_command(f"/foundry {text}")
         if command is None:
             raise HTTPException(status_code=400, detail="unrecognised command")
 
-        if not is_authorised_approver(user, set(app.state.approvers)):
+        # Authorised to approve when in the committed approvers list OR (OIDC
+        # path) a verified member of an IdP group the committed map grants roles.
+        authorised = is_authorised_approver(user, set(app.state.approvers)) or bool(
+            roles
+        )
+        if not authorised:
             raise HTTPException(status_code=403, detail="user not authorised to approve")
 
         if command.command not in {"approve", "reject", "stop"}:
@@ -991,9 +1053,8 @@ def create_app(
         if orch.get_run(run_id) is None:
             raise HTTPException(status_code=404, detail="run not found")
 
-        # Roles deliberately ignored from the body: they are configuration.
         try:
-            _submit_decision(run_id, command=command.command, user=user)
+            _submit_decision(run_id, command=command.command, user=user, roles=roles)
         except OrchestratorError as exc:
             msg = str(exc)
             # Authorisation refusals (policy block at dispatch, or the approver
@@ -1079,12 +1140,17 @@ def _auth_configured(app: FastAPI) -> bool:
     return bool(app.state.api_token) or app.state.oidc_verifier is not None
 
 
-def _require_api_token(app: FastAPI, request: Request) -> None:
+def _require_api_token(app: FastAPI, request: Request) -> dict[str, Any] | None:
     """Enforce bearer-token auth on the token-gated API endpoints.
 
     Accepts **either** the static ``FOUNDRY_API_TOKEN`` (constant-time compare,
     unchanged) **or** - when OIDC is configured (issue #34) - a valid OIDC JWT.
     Both may be enabled at once; the static token keeps working byte-for-byte.
+
+    Returns the **verified OIDC claims** when the request authenticated via the
+    OIDC path, or ``None`` when it authenticated via the static token. Callers
+    that only gate reads ignore the return; the approval endpoint uses the claims
+    to bind the approver identity/roles to the verified token (issue #34).
 
     Fail closed: with no credential configured at all the endpoint is disabled
     outright, because an unauthenticated approval surface defeats the human
@@ -1101,18 +1167,39 @@ def _require_api_token(app: FastAPI, request: Request) -> None:
             ),
         )
     provided = request.headers.get("authorization", "")
-    # Static token path - unchanged, constant-time.
+    # Static token path - unchanged, constant-time. No verified claims.
     if expected and hmac.compare_digest(provided, f"Bearer {expected}"):
-        return
+        return None
     # OIDC path - verify the bearer JWT against the configured IdP.
     if verifier is not None and provided.startswith("Bearer "):
         token = provided[len("Bearer ") :]
         try:
-            verifier.verify(token)
-            return
+            return verifier.verify(token)
         except OidcAuthError:
             pass
     raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+
+def _resolve_oidc_approver(
+    app: FastAPI, claims: Mapping[str, Any]
+) -> tuple[str | None, set[ApprovalRole]]:
+    """Bind an approver identity + roles to verified OIDC claims (issue #34).
+
+    Identity is the verified subject claim (never the request body). Roles are
+    the committed ``approvers`` grant for that identity unioned with the roles
+    the verified group claim maps to via the committed ``oidc_group_role_map``.
+    Both sources are committed config; only the identity/group *claims* come from
+    the cryptographically-verified token (invariant #5). Returns ``(None, set())``
+    when the token carries no usable subject claim.
+    """
+    identity = identity_from_claims(claims, app.state.oidc_subject_claim)
+    if identity is None:
+        return None, set()
+    roles: set[ApprovalRole] = set(app.state.approvers.get(identity, set()))
+    groups = groups_from_claims(claims, app.state.oidc_group_claim)
+    for group in groups:
+        roles |= app.state.oidc_group_role_map.get(group, set())
+    return identity, roles
 
 
 def _actor_identity(payload: dict[str, Any]) -> str | None:
@@ -1525,6 +1612,11 @@ def app_from_settings(settings: Settings) -> FastAPI:
         approvers={email: roles for email, roles in settings.approvers},
         api_token=settings.api_token,
         oidc_verifier=oidc_verifier,
+        oidc_subject_claim=settings.oidc_subject_claim,
+        oidc_group_claim=settings.oidc_group_claim,
+        oidc_group_role_map={
+            group: roles for group, roles in settings.oidc_group_role_map
+        },
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
         jira_webhook_secret=settings.jira_webhook_secret,
