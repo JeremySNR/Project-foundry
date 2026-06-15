@@ -59,6 +59,12 @@ decomposition:
   model: gpt-5.5
 
 policy:
+  # Not sure where to start? Foundry ships a vetted starter library of policy
+  # presets (issue #31). `foundry-policy presets` lists them (baseline / soc2 /
+  # change-management); `foundry-policy show <name>` prints one to copy in here;
+  # `foundry-policy explain <name>` shows the gate knobs it resolves to. The
+  # presets use only the knobs below - they are a head start, not a new mechanism.
+  #
   # Policy backend: "local" (in-process Python engine, the default) or "opa"
   # (delegate to an OPA server running src/foundry/policy/foundry.rego). Both
   # enforce identical rules - lock-step is machine-verified over shared vectors

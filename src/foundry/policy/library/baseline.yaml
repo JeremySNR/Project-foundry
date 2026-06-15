@@ -1,0 +1,68 @@
+# Foundry starter policy preset: BASELINE
+# =========================================
+# A conservative, broadly-applicable safe floor. It does not assume any specific
+# compliance regime - it just makes Foundry's built-in protections explicit and
+# adds the two caps every deployment should set (retries and per-run spend).
+#
+# Copy the sections you want into your own foundry.yaml (or point FOUNDRY_CONFIG
+# at a file based on this). Secrets still come from the environment, never here.
+#
+# Every value below is equal to or stricter than the built-in defaults, so
+# adopting it can only tighten the gate, never loosen it.
+
+policy:
+  # Provider is the in-process Python engine by default; both backends enforce
+  # the same rules (held in lock-step by the policy parity tests). Set to "opa"
+  # with an opa_url to delegate to an OPA server running foundry.rego.
+  provider: local
+
+  # Minimum routing confidence (0-100) before a ticket may be dispatched. Below
+  # this the gate refuses: Foundry would rather park a run than work the wrong
+  # repo. 70 is the built-in default.
+  repo_confidence_threshold: 70
+
+  # Reject changes that sprawl across too many files - a large blast radius is a
+  # review-quality and risk signal. 12 is the built-in default.
+  max_files_changed: 12
+
+  # Paths the agent may never modify (the sticky forbidden-path block - matching
+  # any of these marks the run BLOCKED and is never retried). These restate the
+  # built-in defaults so they are visible and easy to extend: infrastructure,
+  # database migrations, dotenv files and anything under a secrets/ tree, matched
+  # at the repo root AND at any nested depth (the **/ siblings).
+  forbidden_globs:
+    - "infra/**"
+    - "**/infra/**"
+    - "migrations/**"
+    - "**/migrations/**"
+    - "**/.env*"
+    - "**/secrets/**"
+
+remediation:
+  # Cap autonomous re-dispatch after CI failures / change requests. Two attempts
+  # is the built-in default - enough to recover from a flaky failure without
+  # letting a run churn indefinitely.
+  max_agent_retries: 2
+  retry_on:
+    - ci_failed
+    - changes_requested
+
+budget:
+  # A hard per-run spend cap (USD). The built-in default is no cap; set one so a
+  # misbehaving run cannot run up unbounded agent cost. Tune to your providers.
+  max_cost_per_run: 10.0
+  # Fallback per-dispatch cost estimate for providers that do not report spend
+  # (claude_code / webhook / manual), so the cap can still bind for them.
+  estimated_cost_per_dispatch: 1.0
+
+approval:
+  # Foundry requires at least one recorded human approval for every autonomous
+  # action (the human-in-the-loop promise as a policy rule). List the people who
+  # may approve here - role grants are configured per user and are never asserted
+  # by the API caller. A user with no roles can approve ordinary work but cannot
+  # satisfy a sensitive-area or per-repo role requirement.
+  #
+  # Replace these with your real approvers before adopting.
+  approvers:
+    - email: "you@example.com"
+      roles: ["engineering"]
