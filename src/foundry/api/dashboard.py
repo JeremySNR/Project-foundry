@@ -99,7 +99,7 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #fleet, #metrics, #agents, #trends, #agent-trends, #epics {
+  #fleet, #metrics, #agents, #trends, #agent-trends, #epics, #queue {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
@@ -161,6 +161,15 @@ DASHBOARD_HTML = """<!doctype html>
     border-color: var(--accent); color: var(--accent);
   }
   .queue-filter .count { color: var(--muted); }
+  #queue summary { color: var(--text); cursor: pointer; }
+  #queue .run {
+    padding: 6px 0; border-bottom: 1px dashed var(--border); cursor: pointer;
+  }
+  #queue .run:last-child { border-bottom: none; }
+  #queue .run:hover .key { color: var(--accent); }
+  #queue .run.breach { border-left: 3px solid var(--red); padding-left: 8px; }
+  #queue .age { margin-left: 8px; font-variant-numeric: tabular-nums; }
+  #queue .age.bad { color: var(--red); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -174,6 +183,7 @@ DASHBOARD_HTML = """<!doctype html>
   <button id="save">Connect</button>
 </header>
 <div id="fleet"></div>
+<div id="queue"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -414,15 +424,57 @@ async function loadFleet() {
     if (!resp.ok) { el.style.display = "none"; return; }
     const f = await resp.json();
     const spend = f.active_cost_usd == null ? "-" : "$" + f.active_cost_usd;
+    // Oldest wait + SLA breaches turn the bare "awaiting a human" count into an
+    // actionable queue signal (issue #37). Both are omitted when nothing waits.
+    const oldest = f.awaiting_human
+      ? `<span class="stat"><b>${dur(f.oldest_wait_seconds)}</b> oldest wait</span>`
+      : "";
+    const breaching = f.approvals_breaching_sla
+      ? `<span class="stat bad"><b>${f.approvals_breaching_sla}</b> over SLA</span>`
+      : "";
     el.innerHTML = `
       <span class="label">Fleet now</span>
       <span class="stat"><b>${f.runs_active}</b> in flight</span>
       <span class="stat"><b>${f.agents_running}</b> agents running</span>
       <span class="stat ${f.awaiting_human ? "bad" : ""}"><b>${f.awaiting_human}</b> awaiting a human</span>
+      ${oldest}
+      ${breaching}
       <span class="stat"><b>${f.prs_open}</b> PRs open</span>
       <span class="stat"><b>${spend}</b> spend in flight</span>
       <span class="stat"><b>${f.total_runs}</b> total runs</span>`;
     el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
+async function loadApprovals() {
+  const el = $("#queue");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/approvals", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const q = await resp.json();
+    const runs = q.runs || [];
+    if (!runs.length) { el.style.display = "none"; return; }  // empty queue: hide
+    const rows = runs.map((r) => `
+      <div class="run ${r.sla_breached ? "breach" : ""}" data-id="${esc(r.run_id)}" title="open timeline">
+        <span class="key">${esc(r.linear_issue_key)}</span>${badge(r.status)}
+        <span class="age ${r.sla_breached ? "bad" : ""}">${dur(r.waiting_seconds)} waiting</span>
+        <div class="meta">${esc(r.run_id)} &middot; ${esc(r.risk_level || "unclassified")} risk
+          &middot; ${esc(r.current_step || "-")}</div>
+      </div>`).join("");
+    const sla = q.sla_seconds
+      ? ` &middot; ${q.sla_breaches} of ${q.count} over the ${dur(q.sla_seconds)} SLA`
+      : "";
+    el.innerHTML = `<details open><summary>approval queue &mdash; ${q.count} parked on a human, oldest first${sla}</summary>${rows}</details>`;
+    el.style.display = "block";
+    el.querySelectorAll(".run[data-id]").forEach((node) => {
+      node.addEventListener("click", () => loadTimeline(node.dataset.id));
+    });
   } catch (err) {
     el.style.display = "none";
   }
@@ -621,6 +673,7 @@ async function loadEpics() {
 function refresh() {
   loadRuns();
   loadFleet();
+  loadApprovals();
   loadMetrics();
   loadTrends();
   loadAgents();

@@ -186,6 +186,14 @@ class Settings:
     rate_limit_webhook_per_minute: int = 120
     rate_limit_api_per_minute: int = 60
 
+    # --- dashboard / fleet (behaviour: yaml) ---
+    # Approval-queue SLA: how long (seconds) a run may sit parked on a human
+    # before it is flagged as breaching. Surfaced read-only on the fleet strip
+    # and the GET /metrics/approvals queue; it changes no gate and blocks no
+    # run. None (default) = no SLA configured, no breach signal (the historical
+    # behaviour, byte-for-byte).
+    approval_sla_seconds: int | None = None
+
     # --- issue tracker (behaviour: yaml) ---
     # "linear" (default), "github_issues" (the issue is the ticket; approvers
     # are then keyed by GitHub login instead of email), or "jira".
@@ -510,6 +518,11 @@ class Settings:
             raise ValueError(
                 "rate_limit_api_per_minute must be >= 1, got "
                 f"{self.rate_limit_api_per_minute} (use rate_limit_enabled: false to disable)"
+            )
+        if self.approval_sla_seconds is not None and self.approval_sla_seconds < 1:
+            raise ValueError(
+                "approval_sla_seconds must be >= 1 when set, got "
+                f"{self.approval_sla_seconds} (omit it to disable the SLA signal)"
             )
         # OIDC is all-or-nothing: a partial config that looked enabled but
         # silently verified nothing would be a fail-open auth hole.
@@ -857,6 +870,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "api_per_minute" in rate_limit:
         out["rate_limit_api_per_minute"] = int(rate_limit["api_per_minute"])
 
+    dashboard = data.get("dashboard", {}) or {}
+    if "approval_sla_seconds" in dashboard:
+        value = dashboard["approval_sla_seconds"]
+        out["approval_sla_seconds"] = None if value is None else int(value)
+
     notifications = data.get("notifications", {}) or {}
     if "slack_channel" in notifications:
         out["slack_channel"] = notifications["slack_channel"]
@@ -1021,4 +1039,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         )
     if "FOUNDRY_RATE_LIMIT_API_PER_MINUTE" in env:
         out["rate_limit_api_per_minute"] = int(env["FOUNDRY_RATE_LIMIT_API_PER_MINUTE"])
+    if "FOUNDRY_APPROVAL_SLA_SECONDS" in env:
+        raw = env["FOUNDRY_APPROVAL_SLA_SECONDS"].strip()
+        out["approval_sla_seconds"] = None if raw == "" else int(raw)
     return out

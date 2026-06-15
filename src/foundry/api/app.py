@@ -239,6 +239,7 @@ def create_app(
     rate_limit_webhook_per_minute: int = 120,
     rate_limit_api_per_minute: int = 60,
     auto_decompose_epics: bool = False,
+    approval_sla_seconds: int | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -307,6 +308,9 @@ def create_app(
     # TTL-pruned) - it replaces the old per-process set that was lost on
     # restart and unbounded. Replay-age validation is opt-in: only providers
     # that actually carry a timestamp (Linear's webhookTimestamp) can use it.
+    # Approval-queue SLA for the fleet strip + GET /metrics/approvals (issue
+    # #37). None = no SLA configured (no breach signal); read-only, blocks no run.
+    app.state.approval_sla_seconds = approval_sla_seconds
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.deduplicator = WebhookDeduplicator(
         session_factory,
@@ -1137,7 +1141,23 @@ def create_app(
 
         _require_api_token(app, request)
         with app.state.session_factory() as session:
-            return fleet_status(session)
+            return fleet_status(session, sla_seconds=app.state.approval_sla_seconds)
+
+    @app.get("/metrics/approvals")
+    def metrics_approvals(request: Request) -> dict[str, Any]:
+        """The human-approval queue with per-run wait age - the drill-down
+        behind the fleet strip's ``awaiting_human`` count. Every run parked on a
+        person, oldest first, each with how long it has been waiting and (when an
+        SLA is configured) whether it has breached. Token-gated and fail-closed
+        like the other metrics endpoints; read-only, changes no gate.
+        """
+        from foundry.memory.metrics import approval_queue
+
+        _require_api_token(app, request)
+        with app.state.session_factory() as session:
+            return approval_queue(
+                session, sla_seconds=app.state.approval_sla_seconds
+            )
 
     @app.post("/runs/{run_id}/approval")
     def approval(
@@ -1906,6 +1926,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         rate_limit_webhook_per_minute=settings.rate_limit_webhook_per_minute,
         rate_limit_api_per_minute=settings.rate_limit_api_per_minute,
         auto_decompose_epics=settings.epics_auto_decompose,
+        approval_sla_seconds=settings.approval_sla_seconds,
     )
 
 

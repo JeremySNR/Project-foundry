@@ -273,6 +273,30 @@ def test_rate_limit_invalid_values_rejected() -> None:
         Settings.from_env({"FOUNDRY_RATE_LIMIT_WEBHOOK_PER_MINUTE": "0"})
 
 
+def test_approval_sla_defaults_off() -> None:
+    assert Settings.from_env({}).approval_sla_seconds is None
+
+
+def test_approval_sla_from_yaml_and_env(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("dashboard:\n  approval_sla_seconds: 14400\n")
+    s = Settings.load(path, env={})
+    assert s.approval_sla_seconds == 14400
+    # Env overrides YAML (operational knob).
+    s2 = Settings.load(path, env={"FOUNDRY_APPROVAL_SLA_SECONDS": "3600"})
+    assert s2.approval_sla_seconds == 3600
+    # Empty env string disables it (back to no SLA).
+    s3 = Settings.load(path, env={"FOUNDRY_APPROVAL_SLA_SECONDS": ""})
+    assert s3.approval_sla_seconds is None
+
+
+def test_approval_sla_rejects_below_one() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        Settings.from_env({"FOUNDRY_APPROVAL_SLA_SECONDS": "0"})
+
+
 def test_slack_notifications_from_env_and_yaml(tmp_path) -> None:
     # Bot token is env-only; the channel may come from YAML or env (env wins).
     s = Settings.from_env(

@@ -265,6 +265,18 @@ rate_limit:
   webhook_per_minute: 120  # provider deliveries can be bursty
   api_per_minute: 60       # approvals, run reads, metrics
 
+dashboard:
+  # Approval-queue SLA: how long (seconds) a run may sit parked on a human before
+  # the fleet strip and GET /metrics/approvals flag it as breaching. This is a
+  # read-only operational signal only - it changes no policy gate and blocks no
+  # run; it just turns the "awaiting a human" count into "and 2 are over the SLA".
+  # Omit it (the default) for no SLA: the oldest-wait age is still shown, but
+  # nothing is flagged as breaching. Env override: FOUNDRY_APPROVAL_SLA_SECONDS
+  # (empty string disables it). The clock is dated from when the human was first
+  # asked (the APPROVAL_REQUESTED / RISK_ESCALATED audit event), so an N-of-M
+  # partial sign-off does not reset it.
+  approval_sla_seconds: 14400  # 4h
+
 auth:
   # OIDC bearer auth for the token-gated API + dashboard (issue #34). OPTIONAL
   # and additive: when configured, a valid OIDC JWT from your IdP is accepted on
