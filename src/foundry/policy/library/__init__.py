@@ -31,6 +31,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from importlib import resources
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -189,12 +190,253 @@ def effective_policy_summary(settings: "Settings") -> dict[str, Any]:
     }
 
 
+def resolve_settings(ref: str, *, env: Mapping[str, str] | None = None) -> "Settings":
+    """Load a :class:`Settings` from either a preset name or a YAML file path.
+
+    The ``foundry-policy check --against`` argument accepts both: a vetted
+    baseline by name (``soc2``) or a path to another config file (e.g. a
+    second deployment's ``foundry.yaml``). A name is tried first; anything else
+    is treated as a path.
+
+    A non-existent path raises rather than silently loading defaults -
+    ``Settings.load`` ignores a missing path (so a typo'd baseline would compare
+    against the built-in defaults and quietly "pass"), which is exactly the
+    misleading outcome a compliance check must not produce. ``env`` defaults to
+    an empty mapping so a baseline reflects the file/preset itself, not ambient
+    ``FOUNDRY_*`` overrides in the calling process.
+    """
+    if ref in available_preset_names():
+        return load_preset_settings(ref, env=env)
+    from foundry.config import Settings
+
+    path = Path(ref)
+    if not path.exists():
+        available = ", ".join(available_preset_names())
+        raise ValueError(
+            f"baseline {ref!r} is neither a known preset nor an existing file; "
+            f"available presets: {available}"
+        )
+    return Settings.load(path, env=env or {})
+
+
+@dataclass(frozen=True)
+class PolicyCheckFinding:
+    """One control's verdict when checking a config against a baseline.
+
+    ``ok`` is True when the subject config is *at least as strict* as the
+    baseline for this knob; ``detail`` is a human-readable one-liner naming the
+    values (and, for collection knobs, exactly which repos/paths/globs fall
+    short).
+    """
+
+    knob: str
+    ok: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class PolicyComparison:
+    """The result of :func:`compare_policy_strictness` - one finding per knob."""
+
+    findings: tuple[PolicyCheckFinding, ...]
+
+    @property
+    def ok(self) -> bool:
+        """True only when the subject is at least as strict on *every* knob."""
+        return all(finding.ok for finding in self.findings)
+
+    @property
+    def weaknesses(self) -> tuple[PolicyCheckFinding, ...]:
+        """The controls where the subject config is weaker than the baseline."""
+        return tuple(finding for finding in self.findings if not finding.ok)
+
+
+def _missing(required: "tuple[str, ...]", have: set[str]) -> list[str]:
+    """Baseline-required items not present in ``have`` (order-preserving)."""
+    return [item for item in required if item not in have]
+
+
+def compare_policy_strictness(
+    subject: "Settings", baseline: "Settings"
+) -> PolicyComparison:
+    """Check whether ``subject`` is at least as strict as ``baseline`` per knob.
+
+    This is the verification counterpart to :func:`effective_policy_summary`:
+    ``explain`` shows what a config resolves to; this answers *"does my config
+    meet (or exceed) this control baseline?"*. It is **pure and read-only** - it
+    compares two already-loaded :class:`Settings` and changes nothing - so it
+    touches no gate, ``engine.py`` or ``foundry.rego`` (invariant #2 does not
+    apply).
+
+    Strictness is defined per knob, always in the direction the gate enforces:
+
+    - **higher is stricter** - ``repo_confidence_threshold``, ``min_approvals``
+      (and the per-repo effective ``max(global, per-repo)`` minimum);
+    - **lower is stricter** - ``max_files_changed``, ``max_agent_retries``,
+      ``max_cost_per_run`` (``None`` = no cap = *weakest*);
+    - **superset is stricter** - ``forbidden_globs`` and the per-repo /
+      per-path required-role and forbidden-glob maps: the subject must protect /
+      require everything the baseline does (it may add more).
+
+    The comparison only ever looks at *configured* knobs - risk-derived approval
+    roles apply identically to both sides, so they are not part of the diff.
+    """
+    findings: list[PolicyCheckFinding] = []
+
+    # --- scalar knobs ---------------------------------------------------- #
+    s_thr, b_thr = subject.repo_confidence_threshold, baseline.repo_confidence_threshold
+    findings.append(
+        PolicyCheckFinding(
+            "repo_confidence_threshold",
+            s_thr >= b_thr,
+            f"{s_thr} (baseline requires >= {b_thr})",
+        )
+    )
+
+    s_files, b_files = subject.max_files_changed, baseline.max_files_changed
+    findings.append(
+        PolicyCheckFinding(
+            "max_files_changed",
+            s_files <= b_files,
+            f"{s_files} (baseline requires <= {b_files})",
+        )
+    )
+
+    s_min, b_min = subject.min_approvals, baseline.min_approvals
+    findings.append(
+        PolicyCheckFinding(
+            "min_approvals",
+            s_min >= b_min,
+            f"{s_min} (baseline requires >= {b_min})",
+        )
+    )
+
+    s_ret, b_ret = subject.max_agent_retries, baseline.max_agent_retries
+    findings.append(
+        PolicyCheckFinding(
+            "max_agent_retries",
+            s_ret <= b_ret,
+            f"{s_ret} (baseline requires <= {b_ret})",
+        )
+    )
+
+    s_cap, b_cap = subject.max_cost_per_run, baseline.max_cost_per_run
+    s_cap_str = f"${s_cap}" if s_cap is not None else "none"
+    if b_cap is None:
+        # Baseline imposes no cap, so any subject cap (or none) satisfies it.
+        cap_ok, cap_detail = True, f"{s_cap_str} (baseline sets no cap)"
+    else:
+        # None on the subject means *no* cap, which is weaker than any cap.
+        cap_ok = s_cap is not None and s_cap <= b_cap
+        cap_detail = f"{s_cap_str} (baseline requires <= ${b_cap})"
+    findings.append(PolicyCheckFinding("max_cost_per_run", cap_ok, cap_detail))
+
+    # --- forbidden globs (superset) ------------------------------------- #
+    subject_globs = set(subject.forbidden_globs)
+    missing_globs = _missing(tuple(baseline.forbidden_globs), subject_globs)
+    findings.append(
+        PolicyCheckFinding(
+            "forbidden_globs",
+            not missing_globs,
+            f"missing {missing_globs}"
+            if missing_globs
+            else f"covers all {len(set(baseline.forbidden_globs))} baseline path(s)",
+        )
+    )
+
+    # --- per-repo forbidden globs (superset, accounting for the global set) #
+    s_repo_forbidden = subject.repo_forbidden_map
+    repo_glob_gaps: list[str] = []
+    for repo, globs in baseline.repo_forbidden_map.items():
+        # The orchestrator protects a repo with the global globs PLUS its
+        # per-repo extras, so compare against that merged effective set.
+        effective = subject_globs | set(s_repo_forbidden.get(repo, ()))
+        gap = _missing(globs, effective)
+        if gap:
+            repo_glob_gaps.append(f"{repo}: {gap}")
+    findings.append(
+        PolicyCheckFinding(
+            "repo_forbidden_globs",
+            not repo_glob_gaps,
+            "; ".join(repo_glob_gaps)
+            if repo_glob_gaps
+            else _none_or_covered(baseline.repo_forbidden_map),
+        )
+    )
+
+    # --- per-repo required roles (superset) ----------------------------- #
+    s_repo_roles = subject.repo_required_roles_map
+    repo_role_gaps: list[str] = []
+    for repo, roles in baseline.repo_required_roles_map.items():
+        gap = _missing(roles, set(s_repo_roles.get(repo, ())))
+        if gap:
+            repo_role_gaps.append(f"{repo}: {gap}")
+    findings.append(
+        PolicyCheckFinding(
+            "repo_required_roles",
+            not repo_role_gaps,
+            "; ".join(repo_role_gaps)
+            if repo_role_gaps
+            else _none_or_covered(baseline.repo_required_roles_map),
+        )
+    )
+
+    # --- per-repo minimum approvers (effective max(global, per-repo)) ---- #
+    s_repo_min = subject.repo_min_approvals_map
+    b_repo_min = baseline.repo_min_approvals_map
+    repo_min_gaps: list[str] = []
+    for repo in b_repo_min:
+        s_eff = max(s_min, s_repo_min.get(repo, 0))
+        b_eff = max(b_min, b_repo_min[repo])
+        if s_eff < b_eff:
+            repo_min_gaps.append(f"{repo}: {s_eff} < {b_eff}")
+    findings.append(
+        PolicyCheckFinding(
+            "repo_min_approvals",
+            not repo_min_gaps,
+            "; ".join(repo_min_gaps)
+            if repo_min_gaps
+            else _none_or_covered(b_repo_min),
+        )
+    )
+
+    # --- per-path required roles (superset, keyed on the exact glob) ----- #
+    s_path_roles = subject.path_required_roles_map
+    path_role_gaps: list[str] = []
+    for glob, roles in baseline.path_required_roles_map.items():
+        gap = _missing(roles, set(s_path_roles.get(glob, ())))
+        if gap:
+            path_role_gaps.append(f"{glob}: {gap}")
+    findings.append(
+        PolicyCheckFinding(
+            "path_required_roles",
+            not path_role_gaps,
+            "; ".join(path_role_gaps)
+            if path_role_gaps
+            else _none_or_covered(baseline.path_required_roles_map),
+        )
+    )
+
+    return PolicyComparison(findings=tuple(findings))
+
+
+def _none_or_covered(baseline_map: Mapping[str, Any]) -> str:
+    """Detail text for a collection knob with no shortfall."""
+    if not baseline_map:
+        return "baseline requires none"
+    return f"covers all {len(baseline_map)} baseline entr(y/ies)"
+
+
 __all__ = [
     "PolicyPreset",
+    "PolicyCheckFinding",
+    "PolicyComparison",
     "available_preset_names",
     "get_preset",
     "list_presets",
     "load_preset_yaml",
     "load_preset_settings",
+    "resolve_settings",
     "effective_policy_summary",
+    "compare_policy_strictness",
 ]
