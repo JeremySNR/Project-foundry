@@ -1,13 +1,26 @@
 """End-to-end Temporal workflow test.
 
-Runs the real workflow under Temporal's time-skipping test environment when it
-is available. In sandboxes where the test-server binary cannot be fetched, the
-whole module skips - the pure decision logic and activity glue are covered
-elsewhere (test_workflow_decisions.py, test_temporal_activities.py).
+Runs the real workflow against a Temporal server in one of two modes:
+
+- **Time-skipping test server** (the default): ``WorkflowEnvironment``'s
+  in-memory harness, fetched on demand. It can fast-forward past the workflow's
+  multi-day durable waits, so it covers the approval/PR *timeout* paths. In
+  sandboxes where the test-server binary cannot be fetched, the whole module
+  skips - the pure decision logic and activity glue are covered elsewhere
+  (test_workflow_decisions.py, test_temporal_activities.py).
+
+- **Real server** (set ``FOUNDRY_TEMPORAL_TEST_ADDRESS``, e.g. ``localhost:7233``):
+  connects to an actual ``temporalio/auto-setup`` server - the Postgres-backed
+  production binary shipped in docker-compose's ``temporal`` profile - so the
+  durability claim is proven against the real backend, not just the in-memory
+  harness (issue #37). A real server does *not* skip time, so the two timeout
+  cases (which would otherwise wait days) skip in this mode; every signal-driven
+  case runs unchanged. CI boots the profile and points this var at it.
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -47,12 +60,45 @@ READY_TICKET = {
 
 @pytest_asyncio.fixture
 async def env():
+    address = os.getenv("FOUNDRY_TEMPORAL_TEST_ADDRESS")
+    if address:
+        # Real-server mode: connect to the running Temporal server (the
+        # docker-compose `temporal` profile in CI) rather than the in-memory
+        # time-skipping harness. ``from_client`` reports ``supports_time_skipping
+        # = False`` so the timeout cases skip themselves (a real server would
+        # genuinely wait days). The caller owns the server lifecycle, so
+        # ``shutdown()`` here only closes the client wrapper.
+        from temporalio.client import Client
+
+        client = await Client.connect(address)
+        environment = WorkflowEnvironment.from_client(client)
+        try:
+            yield environment
+        finally:
+            await environment.shutdown()
+        return
     try:
         environment = await WorkflowEnvironment.start_time_skipping()
     except Exception as exc:  # pragma: no cover - environment-dependent
         pytest.skip(f"Temporal test server unavailable: {exc}")
     yield environment
     await environment.shutdown()
+
+
+def _require_time_skipping(env) -> None:
+    """Skip a timeout case that needs the time-skipping harness.
+
+    The approval/PR windows are measured in days (``workflow._APPROVAL_TIMEOUT``
+    / ``_PR_TIMEOUT``); only the time-skipping server can fast-forward past them
+    in a test. Against a real server (``FOUNDRY_TEMPORAL_TEST_ADDRESS``) these
+    would block for the full window, so they are skipped there - the real-server
+    job proves the signal-driven paths, the time-skipping job proves the waits.
+    """
+    if not env.supports_time_skipping:
+        pytest.skip(
+            "approval/PR-window timeout test needs the time-skipping server; "
+            "against a real server it would wait days"
+        )
 
 
 def _activities() -> FoundryActivities:
@@ -72,6 +118,13 @@ def _activities_with_db() -> tuple[FoundryActivities, object]:
 
 
 async def test_workflow_happy_path_with_signals(env) -> None:
+    # Ends at pr_open: once the PR is observed the workflow keeps watching for
+    # further pushes (pr_open is PR-observable) and only settles at pr_open when
+    # the PR window goes quiet - which needs the time-skipping server to
+    # fast-forward the multi-day _PR_TIMEOUT. Against a real server that wait is
+    # real, so this case skips there; the approve -> dispatch -> PR -> terminal
+    # path is proven on the real server by the multi-PR-to-merge case below.
+    _require_time_skipping(env)
     activities = _activities()
     with ThreadPoolExecutor(max_workers=4) as executor:
         async with Worker(
@@ -146,6 +199,7 @@ async def test_workflow_approval_timeout_blocks_cleanly(env) -> None:
     # No decision is ever sent: the time-skipping env fast-forwards past the
     # approval window. The workflow must end the run cleanly (blocked), not fail
     # and strand it at waiting_approval (issue #15, problem 1).
+    _require_time_skipping(env)
     activities = _activities()
     with ThreadPoolExecutor(max_workers=4) as executor:
         async with Worker(
@@ -168,6 +222,7 @@ async def test_workflow_approval_timeout_blocks_cleanly(env) -> None:
 async def test_workflow_pr_timeout_fails_cleanly(env) -> None:
     # Approved and dispatched, but the agent never opens a PR: the PR window
     # elapses and the run ends as execution_failed, not stranded at agent_running.
+    _require_time_skipping(env)
     activities = _activities()
     with ThreadPoolExecutor(max_workers=4) as executor:
         async with Worker(

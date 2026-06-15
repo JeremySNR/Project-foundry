@@ -141,6 +141,63 @@ jobs:
           fi
           echo "/healthz OK"
 
+  temporal:
+    name: Temporal workflow (real server)
+    runs-on: ubuntu-latest
+    # Bound the job: the real server doesn't skip time, so a test that slipped
+    # into a multi-day durable wait would otherwise hang for the runner's full
+    # default budget. The real-server E2E (image pull + auto-setup + ~4 prompt
+    # tests) completes well inside this.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,workflow]"
+
+      # Boot the *real* durable-execution backend exactly as shipped: the
+      # temporalio/auto-setup server (Postgres-backed) from docker-compose's
+      # `temporal` profile. `up -d temporal` also starts its `db` dependency
+      # (waited on via the compose healthcheck); temporal-ui stays down. This
+      # proves the workflow against the production server binary, not just the
+      # in-memory time-skipping harness the offline `test` job uses (issue #37).
+      - name: Start the Temporal profile (docker compose)
+        run: docker compose --profile temporal up -d temporal
+
+      # The frontend accepts connections slightly before the `default`
+      # namespace is registered; block until a DescribeNamespace succeeds so the
+      # E2E doesn't flake on a cold start.
+      - name: Wait for Temporal to be ready
+        env:
+          FOUNDRY_TEMPORAL_TEST_ADDRESS: localhost:7233
+        run: python scripts/wait_for_temporal.py
+
+      # FOUNDRY_TEMPORAL_TEST_ADDRESS flips test_temporal_workflow.py into
+      # real-server mode (Client.connect instead of start_time_skipping). The
+      # signal-driven cases run against the real server; the two multi-day
+      # timeout cases skip themselves there (a real server doesn't skip time).
+      - name: Run the workflow E2E against the real server
+        env:
+          FOUNDRY_TEMPORAL_TEST_ADDRESS: localhost:7233
+        run: pytest -q tests/test_temporal_workflow.py
+
+      - name: Temporal + Postgres logs (on failure)
+        if: failure()
+        run: docker compose --profile temporal logs --no-color temporal db
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile temporal down -v
+
   policy:
     name: OPA policy tests
     runs-on: ubuntu-latest
