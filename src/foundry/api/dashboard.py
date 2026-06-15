@@ -9,13 +9,15 @@ push" age, each with its own SLA, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
-(where work ships, stalls, and spends), an epic board (multi-repo
+(where work ships, stalls, and spends) with a per-repo trend sparkline strip
+(is each repo speeding up or stalling?), an epic board (multi-repo
 runs rolled up, issue #35), the run list (with an approval-queue filter) and,
 per run, the full decision timeline (artifacts, audit events, policy decisions,
 agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/approvals``, ``GET /metrics/executions``, ``GET /metrics/reviews``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
-``GET /metrics/delivery/by-repo``, ``GET /metrics/agents``,
+``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
+``GET /metrics/agents``,
 ``GET /metrics/agents/trends``, ``GET /epics`` and
 ``GET /runs/{id}/timeline``; the calls carry the bearer token the user pastes
 once (kept in localStorage, never sent anywhere but this API).
@@ -148,6 +150,18 @@ DASHBOARD_HTML = """<!doctype html>
   #agent-trends .spark i.empty {
     height: 2px; background: var(--border);
   }
+  #repo-trends .prov {
+    display: flex; align-items: center; gap: 12px; padding: 4px 0;
+  }
+  #repo-trends .prov .name { min-width: 220px; }
+  #repo-trends .spark {
+    display: inline-flex; align-items: flex-end; gap: 2px; height: 24px;
+  }
+  #repo-trends .spark i {
+    display: inline-block; width: 6px; min-height: 1px;
+    background: var(--green); border-radius: 1px;
+  }
+  #repo-trends .spark i.empty { height: 2px; background: var(--border); }
   #epics summary { color: var(--text); cursor: pointer; }
   .epic { padding: 8px 0; border-bottom: 1px dashed var(--border); }
   .epic:last-child { border-bottom: none; }
@@ -198,6 +212,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="agents"></div>
 <div id="agent-trends"></div>
 <div id="repo-delivery"></div>
+<div id="repo-trends"></div>
 <div id="epics"></div>
 <main>
   <div id="runs"></div>
@@ -732,6 +747,50 @@ async function loadRepoDelivery() {
   }
 }
 
+async function loadRepoTrends() {
+  const el = $("#repo-trends");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/delivery/by-repo/trends?days=90&bucket=week", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const repos = m.repos || [];
+    if (!repos.length) { el.style.display = "none"; return; }
+    // Scale every repo's bars to one shared max so the sparklines are
+    // comparable across repos, not each normalised to its own peak.
+    const maxShipped = Math.max(1, ...repos.flatMap(
+      (r) => (r.series || []).map((c) => c.prs_shipped)));
+    const rows = repos.map((r) => {
+      const bars = (r.series || []).map((c) => {
+        const when = fmtPeriod(c.period_start);
+        if (!c.runs_finished) {
+          return `<i class="empty" title="${esc(when)}: no runs"></i>`;
+        }
+        const h = Math.max(2, Math.round((c.prs_shipped / maxShipped) * 24));
+        const cost = c.total_cost_usd == null ? "" : `, $${c.total_cost_usd}`;
+        return `<i style="height:${h}px" title="${esc(when)}: ${c.prs_shipped} shipped of ${c.runs_finished} finished${cost}"></i>`;
+      }).join("");
+      const cost = r.total_cost_usd == null ? "-" : "$" + r.total_cost_usd;
+      return `<div class="prov">
+        <span class="name">${esc(r.repo)}
+          <span class="kv">${r.prs_shipped} of ${r.runs_finished} &middot; ${Math.round(r.merge_rate * 100)}% &middot; ${cost}</span></span>
+        <span class="spark">${bars}</span></div>`;
+    }).join("");
+    el.innerHTML = `<details><summary>delivery by repo, trend &mdash; PRs shipped by week (90d), is each repo speeding up or stalling?</summary>
+      ${rows}
+      <div class="kv">each bar = one week; height = PRs shipped (shared scale across repos)</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadAgentTrends() {
   const el = $("#agent-trends");
   if (!hasAuth()) {
@@ -822,6 +881,7 @@ function refresh() {
   loadAgents();
   loadAgentTrends();
   loadRepoDelivery();
+  loadRepoTrends();
   loadEpics();
 }
 

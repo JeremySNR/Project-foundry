@@ -347,6 +347,65 @@ def bucket_start(dt: datetime, bucket: str) -> datetime:
     return midnight
 
 
+def _empty_delivery_period() -> dict:
+    """A fresh per-period accumulator for the delivery-trend aggregations.
+
+    ``_cost`` / ``_cost_seen`` are private: a period where no run reported cost
+    must render ``total_cost_usd: None`` (never a conjured $0), matching
+    :func:`delivery_metrics`. :func:`_render_delivery_period` strips them.
+    """
+    return {
+        "runs_finished": 0,
+        "prs_shipped": 0,
+        "blocked": 0,
+        "retries_consumed": 0,
+        "_cost": 0.0,
+        "_cost_seen": False,
+    }
+
+
+def _accumulate_delivery_period(agg: dict, row: FoundryRunOutcome) -> None:
+    """Fold one finished-run outcome into a period accumulator."""
+    agg["runs_finished"] += 1
+    agg["retries_consumed"] += max(row.jobs_count - 1, 0)
+    if row.outcome == "merged":
+        agg["prs_shipped"] += 1
+    elif row.outcome == "blocked":
+        agg["blocked"] += 1
+    if row.cost_usd is not None:
+        agg["_cost"] += row.cost_usd
+        agg["_cost_seen"] = True
+
+
+def _render_delivery_period(period_start: datetime, agg: dict | None) -> dict:
+    """Render a period accumulator to its public shape (``None`` agg = an empty,
+    zero-filled bucket so a sparkline reads as a continuous series)."""
+    agg = agg or _empty_delivery_period()
+    return {
+        "period_start": period_start.isoformat(),
+        "runs_finished": agg["runs_finished"],
+        "prs_shipped": agg["prs_shipped"],
+        "blocked": agg["blocked"],
+        "retries_consumed": agg["retries_consumed"],
+        "total_cost_usd": round(agg["_cost"], 2) if agg["_cost_seen"] else None,
+    }
+
+
+def _delivery_axis(populated: list[datetime], bucket: str) -> list[datetime]:
+    """The shared, gap-filled time axis spanning the first to the last populated
+    period. Stops at the latest data, not wall-clock now, so the series is a pure
+    function of the rows."""
+    if not populated:
+        return []
+    step = timedelta(days=1 if bucket == "day" else 7)
+    axis: list[datetime] = []
+    cursor, last = min(populated), max(populated)
+    while cursor <= last:
+        axis.append(cursor)
+        cursor += step
+    return axis
+
+
 def delivery_trends(session, *, since: datetime, bucket: str = "week") -> dict:
     """Delivery outcomes bucketed over time — the "is throughput trending up
     or down?" view the single-window :func:`delivery_metrics` can't answer.
@@ -371,67 +430,97 @@ def delivery_trends(session, *, since: datetime, bucket: str = "week") -> dict:
         if row.completed_at is None:
             continue
         start = bucket_start(row.completed_at, bucket)
-        period = periods.setdefault(
-            start,
-            {
-                "runs_finished": 0,
-                "prs_shipped": 0,
-                "blocked": 0,
-                "retries_consumed": 0,
-                "_cost": 0.0,
-                "_cost_seen": False,
-            },
+        _accumulate_delivery_period(
+            periods.setdefault(start, _empty_delivery_period()), row
         )
-        period["runs_finished"] += 1
-        period["retries_consumed"] += max(row.jobs_count - 1, 0)
-        if row.outcome == "merged":
-            period["prs_shipped"] += 1
-        elif row.outcome == "blocked":
-            period["blocked"] += 1
-        if row.cost_usd is not None:
-            period["_cost"] += row.cost_usd
-            period["_cost_seen"] = True
 
-    step = timedelta(days=1 if bucket == "day" else 7)
-    series: list[dict] = []
-    if periods:
-        # Fill every bucket between the first and last *populated* period so a
-        # sparkline reads as a continuous series. We stop at the latest data,
-        # not wall-clock now, so the series is a pure function of the rows.
-        cursor = min(periods)
-        last = max(periods)
-        while cursor <= last:
-            agg = periods.get(cursor)
-            if agg is None:
-                series.append(
-                    {
-                        "period_start": cursor.isoformat(),
-                        "runs_finished": 0,
-                        "prs_shipped": 0,
-                        "blocked": 0,
-                        "retries_consumed": 0,
-                        "total_cost_usd": None,
-                    }
-                )
-            else:
-                series.append(
-                    {
-                        "period_start": cursor.isoformat(),
-                        "runs_finished": agg["runs_finished"],
-                        "prs_shipped": agg["prs_shipped"],
-                        "blocked": agg["blocked"],
-                        "retries_consumed": agg["retries_consumed"],
-                        "total_cost_usd": round(agg["_cost"], 2)
-                        if agg["_cost_seen"]
-                        else None,
-                    }
-                )
-            cursor += step
+    axis = _delivery_axis(list(periods), bucket)
+    return {
+        "since": since.isoformat(),
+        "bucket": bucket,
+        "periods": [_render_delivery_period(start, periods.get(start)) for start in axis],
+    }
+
+
+def delivery_by_repo_trends(session, *, since: datetime, bucket: str = "week") -> dict:
+    """Per-repo delivery outcomes bucketed over time — the repo dimension of
+    :func:`delivery_trends`, the way :func:`delivery_by_repo` is to
+    :func:`delivery_metrics`.
+
+    Answers "is *this repo* shipping more or stalling over time?" — which the
+    org-wide :func:`delivery_trends` (one series across every repo) and the
+    point-in-time :func:`delivery_by_repo` (one window total per repo, no
+    direction of travel) can't show on their own. Pure read over
+    ``foundry_run_outcomes`` (the same finished-run rows the other delivery cuts
+    read), so it adds no new write path and rebuilds with ``foundry-memory
+    backfill``.
+
+    Every repo's ``series`` is aligned to one shared time axis spanning the
+    first to the last *populated* period (across all repos), zero-filled so the
+    per-repo sparklines line up column-for-column — the same shape
+    :func:`~foundry.memory.scorecards.agent_scorecard_trends` uses. Each repo
+    also carries its window totals so a caller can label the trend without a
+    second query. Unrouted runs (NULL ``repo``) bucket under the
+    :data:`UNROUTED_REPO_LABEL` sentinel, as in :func:`delivery_by_repo`.
+    """
+    if bucket not in TREND_BUCKETS:
+        raise ValueError(f"bucket must be one of {TREND_BUCKETS}, got {bucket!r}")
+
+    rows: list[FoundryRunOutcome] = (
+        session.query(FoundryRunOutcome)
+        .filter(FoundryRunOutcome.completed_at >= since)
+        .all()
+    )
+
+    # repo -> period_start -> accumulator, plus a per-repo window total.
+    per_period: dict[str, dict[datetime, dict]] = {}
+    totals: dict[str, dict] = {}
+    for row in rows:
+        if row.completed_at is None:
+            continue
+        key = row.repo or UNROUTED_REPO_LABEL
+        start = bucket_start(row.completed_at, bucket)
+        _accumulate_delivery_period(
+            per_period.setdefault(key, {}).setdefault(start, _empty_delivery_period()),
+            row,
+        )
+        _accumulate_delivery_period(totals.setdefault(key, _empty_delivery_period()), row)
+
+    # One shared axis across every repo so the per-repo series align.
+    populated = [start for periods in per_period.values() for start in periods]
+    axis = _delivery_axis(populated, bucket)
+
+    out_repos = []
+    for repo, total in totals.items():
+        runs = total["runs_finished"]
+        shipped = total["prs_shipped"]
+        periods = per_period[repo]
+        out_repos.append(
+            {
+                "repo": repo,
+                "runs_finished": runs,
+                "prs_shipped": shipped,
+                "blocked": total["blocked"],
+                "merge_rate": round(shipped / runs, 3) if runs else 0.0,
+                "retries_consumed": total["retries_consumed"],
+                "total_cost_usd": (
+                    round(total["_cost"], 2) if total["_cost_seen"] else None
+                ),
+                "series": [
+                    _render_delivery_period(start, periods.get(start)) for start in axis
+                ],
+            }
+        )
+
+    # Most-shipping first, then most-active, with a stable name tie-break - the
+    # same ordering as delivery_by_repo so the two repo cuts read consistently.
+    out_repos.sort(key=lambda r: (-r["prs_shipped"], -r["runs_finished"], r["repo"]))
 
     return {
         "since": since.isoformat(),
         "bucket": bucket,
-        "periods": series,
+        "periods": [start.isoformat() for start in axis],
+        "repos": out_repos,
     }
 
 
