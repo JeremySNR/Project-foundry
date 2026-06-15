@@ -869,6 +869,12 @@ def test_dashboard_talks_to_epics_endpoint() -> None:
     assert 'fetch("epics"' in DASHBOARD_HTML
 
 
+def test_dashboard_talks_to_agent_trends_endpoint() -> None:
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/agents/trends' in DASHBOARD_HTML
+
+
 # -- Enricher wiring via build_orchestrator ------------------------------------
 
 

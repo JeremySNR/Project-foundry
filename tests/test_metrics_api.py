@@ -253,6 +253,43 @@ def test_agent_metrics_scores_the_dispatched_provider(client) -> None:
     assert {r["repo"] for r in card["by_repo"]} == {"customer-web"}
 
 
+def test_agent_trends_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/agents/trends").status_code == 401
+
+
+def test_agent_trends_rejects_bad_window_and_bucket(client) -> None:
+    assert client.get("/metrics/agents/trends?days=0", headers=AUTH).status_code == 422
+    assert (
+        client.get("/metrics/agents/trends?bucket=month", headers=AUTH).status_code
+        == 422
+    )
+
+
+def test_agent_trends_empty_database(client) -> None:
+    body = client.get("/metrics/agents/trends", headers=AUTH).json()
+    assert body["days"] == 90
+    assert body["bucket"] == "week"
+    assert body["min_samples"] == 3
+    assert body["providers"] == []
+    assert body["periods"] == []
+
+
+def test_agent_trends_reports_the_dispatched_provider(client) -> None:
+    _run_to_merged(client)
+    body = client.get("/metrics/agents/trends?days=30&bucket=day", headers=AUTH).json()
+    assert body["days"] == 30
+    assert body["bucket"] == "day"
+    providers = body["providers"]
+    assert len(providers) == 1
+    card = providers[0]
+    # The in-memory fake provider shipped the merge.
+    assert card["provider"] == "fake"
+    assert card["runs"] == 1 and card["merged"] == 1
+    # One run -> one populated period, aligned to the shared axis.
+    assert [c["period_start"] for c in card["series"]] == body["periods"]
+    assert sum(c["merged"] for c in card["series"]) == 1
+
+
 def test_agent_recommendation_requires_bearer_token(client) -> None:
     assert client.get("/metrics/agents/recommendation").status_code == 401
     assert (

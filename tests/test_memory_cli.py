@@ -183,3 +183,41 @@ def test_show_scorecards_empty_database(monkeypatch, capsys, db_url) -> None:
     create_all(engine)
     _run_cli(monkeypatch, db_url, "show-scorecards")
     assert "No dispatched outcomes" in capsys.readouterr().out
+
+
+def test_show_scorecard_trends_prints_provider(monkeypatch, capsys, db_url) -> None:
+    _seed_merged_run(db_url, wipe_memory=False)
+    _run_cli(monkeypatch, db_url, "show-scorecard-trends")
+    out = capsys.readouterr().out
+    assert "fake" in out
+    assert "1/1 merged overall" in out
+    # The week-bucket label and a populated period are both present.
+    assert "week of" in out
+
+
+def test_show_scorecard_trends_day_bucket(monkeypatch, capsys, db_url) -> None:
+    _seed_merged_run(db_url, wipe_memory=False)
+    _run_cli(monkeypatch, db_url, "show-scorecard-trends", "--bucket", "day")
+    out = capsys.readouterr().out
+    assert "fake" in out
+    assert "by day" in out
+
+
+def test_show_scorecard_trends_empty_database(monkeypatch, capsys, db_url) -> None:
+    engine = make_engine(db_url)
+    create_all(engine)
+    _run_cli(monkeypatch, db_url, "show-scorecard-trends")
+    assert "No dispatched outcomes" in capsys.readouterr().out
+
+
+def test_show_scorecard_trends_rejects_bad_window(monkeypatch, db_url) -> None:
+    engine = make_engine(db_url)
+    create_all(engine)
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr(
+        "sys.argv", ["foundry-memory", "show-scorecard-trends", "--days", "0"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2

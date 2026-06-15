@@ -919,6 +919,33 @@ def create_app(
                 ),
             }
 
+    @app.get("/metrics/agents/trends")
+    def metrics_agents_trends(
+        request: Request, days: int = 90, bucket: str = "week"
+    ) -> dict[str, Any]:
+        """Per-provider scorecards bucketed over time - is each agent getting
+        better or worse on our work, not just its flat all-time average. The
+        temporal cut of ``/metrics/agents`` (a snapshot); reporting only.
+        Token-gated and fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS
+        from foundry.memory.scorecards import agent_scorecard_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **agent_scorecard_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/fleet")
     def metrics_fleet(request: Request) -> dict[str, Any]:
         """Live fleet snapshot: every run's *current* state across the org -
