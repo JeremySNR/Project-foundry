@@ -118,6 +118,37 @@ def test_approval_message_matches_fixture() -> None:
     assert captured["body"] == expected
 
 
+def test_approval_message_surfaces_n_of_m_count() -> None:
+    """A run needing >1 distinct approver advertises the count in the message, so
+    a Slack approver knows one sign-off won't release the run (issue #31)."""
+    notifier, sent = _recording_notifier()
+    notifier.approval_requested(
+        ApprovalRequest(
+            issue_id="issue-r",
+            issue_key="LIN-123",
+            title="Touch the ledger",
+            work_type="feature",
+            risk="high",
+            agent_mode="draft_pr",
+            repo="payments-service",
+            required_approvals=("security",),
+            min_approvals=2,
+        )
+    )
+    [(_text, blocks)] = sent
+    rendered = json.dumps(blocks)
+    assert "Approvers required:" in rendered
+    assert "2 distinct sign-offs" in rendered
+
+
+def test_approval_message_omits_count_for_single_approval() -> None:
+    """The default single-approval message is unchanged - no count field."""
+    notifier, sent = _recording_notifier()
+    notifier.approval_requested(SAMPLE_REQUEST)  # min_approvals defaults to 1
+    [(_text, blocks)] = sent
+    assert "Approvers required:" not in json.dumps(blocks)
+
+
 def test_status_message_renders_label() -> None:
     notifier, sent = _recording_notifier()
     notifier.status_changed("issue-r", "LIN-123", RunStatus.PR_OPEN)
@@ -206,6 +237,31 @@ def test_intake_posts_approval_message(session_factory) -> None:
     assert req.acceptance_criteria  # carried through from the analysis
     # A run parked for approval is not also announced as a status change.
     assert notifier.statuses == []
+
+
+def test_intake_threads_effective_min_approvals_into_message(session_factory) -> None:
+    """The orchestrator surfaces the effective N-of-M count (global raised by any
+    per-repo override) in the approval message it posts (issue #31)."""
+    notifier = InMemoryNotifier()
+    orch = FoundryOrchestrator(
+        session_factory,
+        notifier=notifier,
+        min_approvals=1,
+        repo_min_approvals={"customer-web": 2},
+    )
+    orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    assert len(notifier.approvals) == 1
+    assert notifier.approvals[0].min_approvals == 2
+
+
+def test_intake_message_min_approvals_defaults_to_one(session_factory) -> None:
+    """With no N-of-M config the message carries the historical count of 1."""
+    notifier = InMemoryNotifier()
+    orch = FoundryOrchestrator(session_factory, notifier=notifier)
+    orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    assert notifier.approvals[0].min_approvals == 1
 
 
 def test_intake_unready_notifies_parked(session_factory) -> None:

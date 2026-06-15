@@ -182,6 +182,10 @@ live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   forbidden-path block, **no policy-engine/Rego rule**, so invariant #2 doesn't
   apply — and is strictly additive (default 1 = the historical single-approval
   path; a per-repo value only ever raises the floor via `max`, never lowers it).
+  When the effective count is >1 the intake **approval prompt** (tracker comment +
+  Slack message) surfaces it ("Approvers required: N distinct sign-offs"), so the
+  first approver is told up front that one sign-off won't release the run rather
+  than discovering it as a still-parked run; default 1 renders no such line.
   A **starter policy library** has landed too (`policy/library/`,
   `foundry-policy` CLI, issue #31): vetted `baseline`/`soc2`/`change-management`
   presets a buyer copies into `foundry.yaml` — built only from existing knobs,
