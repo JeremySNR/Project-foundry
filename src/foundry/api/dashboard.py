@@ -3,11 +3,13 @@
 Read-only visibility over the audit data that already exists: a live fleet
 strip (runs in flight / approval queue / spend in flight, from the current run
 states), the delivery metrics strip, a delivery-trend-over-time table, the
-agent scorecards, an epic board (multi-repo runs rolled up, issue #35), the run
+agent scorecards, a per-agent merge-confidence trend (is each agent improving?),
+an epic board (multi-repo runs rolled up, issue #35), the run
 list (with an approval-queue filter) and, per run, the full decision timeline
 (artifacts, audit events, policy decisions, agent jobs). All data comes from
 ``GET /runs``, ``GET /metrics/fleet``, ``GET /metrics/delivery``,
-``GET /metrics/delivery/trends``, ``GET /metrics/agents``, ``GET /epics`` and
+``GET /metrics/delivery/trends``, ``GET /metrics/agents``,
+``GET /metrics/agents/trends``, ``GET /epics`` and
 ``GET /runs/{id}/timeline``; the calls carry the bearer token the user pastes
 once (kept in localStorage, never sent anywhere but this API).
 
@@ -91,7 +93,7 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #fleet, #metrics, #agents, #trends, #epics {
+  #fleet, #metrics, #agents, #trends, #agent-trends, #epics {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
@@ -110,13 +112,29 @@ DASHBOARD_HTML = """<!doctype html>
     color: var(--muted);
   }
   #metrics th, #agents th, #trends th { color: var(--text); }
-  #agents summary, #trends summary { color: var(--text); cursor: pointer; }
+  #agents summary, #trends summary, #agent-trends summary {
+    color: var(--text); cursor: pointer;
+  }
   #trends td.num { text-align: right; font-variant-numeric: tabular-nums; }
   #trends .bar {
     display: inline-block; height: 8px; background: var(--green);
     border-radius: 2px; vertical-align: middle; min-width: 1px;
   }
   #trends .bar.blocked { background: var(--red); }
+  #agent-trends .prov {
+    display: flex; align-items: center; gap: 12px; padding: 4px 0;
+  }
+  #agent-trends .prov .name { min-width: 220px; }
+  #agent-trends .spark {
+    display: inline-flex; align-items: flex-end; gap: 2px; height: 24px;
+  }
+  #agent-trends .spark i {
+    display: inline-block; width: 6px; min-height: 1px;
+    background: var(--green); border-radius: 1px;
+  }
+  #agent-trends .spark i.empty {
+    height: 2px; background: var(--border);
+  }
   #epics summary { color: var(--text); cursor: pointer; }
   .epic { padding: 8px 0; border-bottom: 1px dashed var(--border); }
   .epic:last-child { border-bottom: none; }
@@ -150,6 +168,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
+<div id="agent-trends"></div>
 <div id="epics"></div>
 <main>
   <div id="runs"></div>
@@ -483,6 +502,45 @@ async function loadTrends() {
   }
 }
 
+async function loadAgentTrends() {
+  const el = $("#agent-trends");
+  if (!localStorage.getItem("foundry_token")) {
+    el.style.display = "none";  // no token: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/agents/trends?days=90&bucket=week", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const providers = m.providers || [];
+    if (!providers.length) { el.style.display = "none"; return; }
+    const rows = providers.map((p) => {
+      const bars = (p.series || []).map((c) => {
+        const when = fmtPeriod(c.period_start);
+        if (!c.runs) {
+          return `<i class="empty" title="${esc(when)}: no runs"></i>`;
+        }
+        const h = Math.max(2, Math.round((c.smoothed_success / 100) * 24));
+        return `<i style="height:${h}px" title="${esc(when)}: ${c.merged} of ${c.runs} merged (conf ${c.smoothed_success})"></i>`;
+      }).join("");
+      const thin = p.meets_min_samples ? "" : " *";
+      return `<div class="prov">
+        <span class="name">${esc(p.provider)}${thin}
+          <span class="kv">${p.merged} of ${p.runs} &middot; conf ${p.smoothed_success}</span></span>
+        <span class="spark">${bars}</span></div>`;
+    }).join("");
+    el.innerHTML = `<details><summary>agent trend &mdash; merge confidence by week (90d), is each agent improving?</summary>
+      ${rows}
+      <div class="kv">each bar = one week; height = smoothed merge rate &middot; * below the ${m.min_samples}-run minimum</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadEpics() {
   const el = $("#epics");
   if (!localStorage.getItem("foundry_token")) {
@@ -529,6 +587,7 @@ function refresh() {
   loadMetrics();
   loadTrends();
   loadAgents();
+  loadAgentTrends();
   loadEpics();
 }
 

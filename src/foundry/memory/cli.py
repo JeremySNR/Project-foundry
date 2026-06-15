@@ -5,6 +5,7 @@ Usage::
     foundry-memory backfill [--recompute]
     foundry-memory show-priors
     foundry-memory show-scorecards
+    foundry-memory show-scorecard-trends [--bucket week|day] [--days D]
     foundry-memory recommend-agent [--work-type T] [--repo R] [--candidates a,b]
                                    [--min-samples N] [--days D]
 
@@ -12,7 +13,9 @@ Usage::
 ``foundry_run_outcomes`` table existed (or that a fail-soft hook missed);
 ``--recompute`` re-derives every terminal run from the audit trail.
 ``show-priors`` prints the mined routing priors; ``show-scorecards`` prints
-per-provider agent performance; ``recommend-agent`` turns those scorecards into
+per-provider agent performance; ``show-scorecard-trends`` prints that same
+per-provider merge rate bucketed over time (is an agent improving or sliding?);
+``recommend-agent`` turns those scorecards into
 a single, explainable provider recommendation for a piece of work (the
 decision-support read behind the future ``agent.provider: auto`` - reporting
 only). Settings come from ``FOUNDRY_CONFIG`` and the usual environment variable
@@ -48,6 +51,23 @@ def main() -> None:
         "show-scorecards", help="Print per-provider agent scorecards."
     )
 
+    trends_p = sub.add_parser(
+        "show-scorecard-trends",
+        help="Print per-provider merge rate bucketed over time.",
+    )
+    trends_p.add_argument(
+        "--bucket",
+        default="week",
+        choices=("day", "week"),
+        help="Time bucket for the trend (default: week).",
+    )
+    trends_p.add_argument(
+        "--days",
+        type=int,
+        default=90,
+        help="Only consider outcomes from the last N days (default: 90).",
+    )
+
     rec_p = sub.add_parser(
         "recommend-agent",
         help="Recommend the agent provider with the best track record for given work.",
@@ -81,6 +101,8 @@ def main() -> None:
         _run_show_priors()
     elif args.command == "show-scorecards":
         _run_show_scorecards()
+    elif args.command == "show-scorecard-trends":
+        _run_show_scorecard_trends(args)
     elif args.command == "recommend-agent":
         _run_recommend(args)
 
@@ -177,6 +199,51 @@ def _run_show_scorecards() -> None:
                 f"    @ {(repo['repo'] or '-'):<38} "
                 f"{repo['merged']}/{repo['runs']} merged  conf {repo['smoothed_success']}"
             )
+
+
+def _run_show_scorecard_trends(args: argparse.Namespace) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from foundry.memory.scorecards import agent_scorecard_trends
+
+    if args.days < 1:
+        print("error: --days must be >= 1", file=sys.stderr)
+        sys.exit(2)
+    since = datetime.now(timezone.utc) - timedelta(days=args.days)
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = agent_scorecard_trends(session, since=since, bucket=args.bucket)
+
+    providers = report["providers"]
+    if not providers:
+        print(
+            "No dispatched outcomes recorded yet - "
+            "run 'foundry-memory backfill' first."
+        )
+        return
+
+    # Compact per-period view: the smoothed merge rate for each period, so the
+    # direction of travel is readable in the terminal ('-' = no run that period).
+    periods = report["periods"]
+    label = "week of" if args.bucket == "week" else "day"
+    print(f"Per-provider merge confidence by {args.bucket} (last {args.days}d):\n")
+    for card in providers:
+        flag = "" if card["meets_min_samples"] else "  (below min samples)"
+        print(
+            f"{card['provider']}: {card['merged']}/{card['runs']} merged overall "
+            f"(conf {card['smoothed_success']}){flag}"
+        )
+        for period_iso, cell in zip(periods, card["series"]):
+            day = period_iso[:10]
+            if cell["runs"]:
+                print(
+                    f"    {label} {day}  conf {cell['smoothed_success']:>3}  "
+                    f"({cell['merged']}/{cell['runs']} merged)"
+                )
+            else:
+                print(f"    {label} {day}  conf   -  (no runs)")
+        print()
 
 
 def _run_recommend(args: argparse.Namespace) -> None:

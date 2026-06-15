@@ -156,7 +156,7 @@ def delivery_metrics(session, *, since: datetime) -> dict:
     }
 
 
-def _bucket_start(dt: datetime, bucket: str) -> datetime:
+def bucket_start(dt: datetime, bucket: str) -> datetime:
     """Snap a completion time to the start of its day/week (UTC, Monday weeks).
 
     Rows are stored as timezone-aware UTC, but SQLite hands them back naive;
@@ -196,7 +196,7 @@ def delivery_trends(session, *, since: datetime, bucket: str = "week") -> dict:
     for row in rows:
         if row.completed_at is None:
             continue
-        start = _bucket_start(row.completed_at, bucket)
+        start = bucket_start(row.completed_at, bucket)
         period = periods.setdefault(
             start,
             {

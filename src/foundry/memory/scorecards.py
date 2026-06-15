@@ -23,11 +23,12 @@ on the recommendation remains a deliberately separate, gated change.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import case, func
 
 from foundry.db.models import FoundryRunOutcome
+from foundry.memory.metrics import TREND_BUCKETS, bucket_start
 from foundry.memory.priors import smoothed_confidence
 
 # Default before a provider's history is considered substantial enough to
@@ -310,4 +311,126 @@ def recommend_provider(
         "recommended": recommended,
         "reason": reason,
         "ranked": ranked,
+    }
+
+
+def _trend_cell(period_start: datetime, cell: _Cell | None) -> dict:
+    """One period in a provider's trend series.
+
+    A period the provider had no dispatched run in reports zeros with
+    ``success_rate``/``smoothed_success``/``total_cost_usd`` left ``None`` -
+    never a conjured 0.5/50 from an empty Beta prior or a $0 from missing cost,
+    mirroring how :func:`metrics.delivery_trends` fills empty periods.
+    """
+    if cell is None or cell.runs == 0:
+        return {
+            "period_start": period_start.isoformat(),
+            "runs": 0,
+            "merged": 0,
+            "success_rate": None,
+            "smoothed_success": None,
+            "retries_consumed": 0,
+            "total_cost_usd": None,
+        }
+    stat = cell.stat(min_samples=0)
+    return {
+        "period_start": period_start.isoformat(),
+        "runs": stat["runs"],
+        "merged": stat["merged"],
+        "success_rate": stat["success_rate"],
+        "smoothed_success": stat["smoothed_success"],
+        "retries_consumed": stat["retries_consumed"],
+        "total_cost_usd": stat["total_cost_usd"],
+    }
+
+
+def agent_scorecard_trends(
+    session,
+    *,
+    since: datetime,
+    bucket: str = "week",
+    min_samples: int = DEFAULT_MIN_SAMPLES,
+) -> dict:
+    """Per-provider scorecards bucketed over time - "is this agent improving?".
+
+    The temporal cut of :func:`agent_scorecards`: where that reports one
+    merge rate per provider over the whole window (a snapshot), this breaks
+    each provider's dispatched outcomes into ``day``/``week`` periods so the
+    direction of travel is visible - a flat 70% all-time hides whether an agent
+    climbed 50%->90% (route more to it) or slid 90%->50% (pull back). Reporting
+    only, like the rest of this module; nothing dispatches.
+
+    Pure read over ``foundry_run_outcomes`` (dispatched rows only, i.e.
+    ``provider IS NOT NULL``). Every provider's ``series`` is aligned to one
+    shared time axis spanning the first to the last *populated* period (across
+    all providers), zero-filled so the sparklines line up and read as
+    continuous series. The axis stops at the latest data, not wall-clock now, so
+    the result is a pure function of the rows. Each provider also carries its
+    window totals (the same shape :func:`agent_scorecards` uses) so a caller can
+    label the trend without a second query. ``min_samples`` only annotates the
+    window total's ``meets_min_samples`` flag; nothing is hidden.
+    """
+    if bucket not in TREND_BUCKETS:
+        raise ValueError(f"bucket must be one of {TREND_BUCKETS}, got {bucket!r}")
+
+    rows: list[FoundryRunOutcome] = (
+        session.query(FoundryRunOutcome)
+        .filter(
+            FoundryRunOutcome.provider.isnot(None),
+            FoundryRunOutcome.completed_at >= since,
+        )
+        .all()
+    )
+
+    # provider -> period_start -> _Cell, plus a per-provider window total.
+    per_period: dict[str, dict[datetime, _Cell]] = {}
+    totals: dict[str, _Cell] = {}
+    for row in rows:
+        if row.completed_at is None:
+            continue
+        start = bucket_start(row.completed_at, bucket)
+        merged = 1 if row.outcome == "merged" else 0
+        cost_count = 1 if row.cost_usd is not None else 0
+        per_period.setdefault(row.provider, {}).setdefault(start, _Cell()).add(
+            1, merged, row.jobs_count, row.cost_usd, cost_count
+        )
+        totals.setdefault(row.provider, _Cell()).add(
+            1, merged, row.jobs_count, row.cost_usd, cost_count
+        )
+
+    # One shared axis: every bucket between the first and last populated period
+    # across all providers, so each provider's series lines up column-for-column.
+    populated = [start for periods in per_period.values() for start in periods]
+    axis: list[datetime] = []
+    if populated:
+        step = timedelta(days=1 if bucket == "day" else 7)
+        cursor, last = min(populated), max(populated)
+        while cursor <= last:
+            axis.append(cursor)
+            cursor += step
+
+    providers = []
+    # Most-used provider first; ties broken by name for determinism (matches
+    # agent_scorecards).
+    for provider, total in sorted(totals.items(), key=lambda kv: (-kv[1].runs, kv[0])):
+        periods = per_period[provider]
+        window = total.stat(min_samples=min_samples)
+        providers.append(
+            {
+                "provider": provider,
+                "runs": window["runs"],
+                "merged": window["merged"],
+                "success_rate": window["success_rate"],
+                "smoothed_success": window["smoothed_success"],
+                "meets_min_samples": window["meets_min_samples"],
+                "series": [_trend_cell(start, periods.get(start)) for start in axis],
+            }
+        )
+
+    return {
+        "since": since.isoformat(),
+        "bucket": bucket,
+        "min_samples": min_samples,
+        "periods": [start.isoformat() for start in axis],
+        "providers": providers,
     }
