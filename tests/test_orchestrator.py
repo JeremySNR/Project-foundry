@@ -1921,3 +1921,149 @@ def test_per_repo_required_role_surfaces_in_tracker_comment(session_factory) -> 
     comment = tracker.comments["i-1"][0]
     assert "Required approval:" in comment
     assert "security" in comment
+
+
+# --- N-of-M approval matrix (the "two-person rule", issue #31) ---------------
+
+
+def _run(session_factory, run_id: str) -> FoundryRun:
+    with session_factory() as s:
+        return s.get(FoundryRun, run_id)
+
+
+def test_min_approvals_needs_two_distinct_approvers(session_factory) -> None:
+    """With ``min_approvals=2`` a single sign-off is not enough: the run stays
+    at WAITING_APPROVAL (recording progress) until a *second* distinct human
+    approves, only then advancing to APPROVED and becoming dispatchable."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider, min_approvals=2)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    # First approval is recorded but does not advance the run.
+    orch.approve(run_id, user="alice@example.com")
+    run = _run(session_factory, run_id)
+    assert run.status is RunStatus.WAITING_APPROVAL
+    assert run.approved_by is None
+    assert run.current_step == "awaiting_approval (1/2)"
+
+    # Second, distinct approval meets the threshold.
+    orch.approve(run_id, user="bob@example.com")
+    run = _run(session_factory, run_id)
+    assert run.status is RunStatus.APPROVED
+    assert run.approved_by == "bob@example.com"
+
+    orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+
+def test_min_approvals_rejects_duplicate_approver(session_factory) -> None:
+    """The same person approving twice does not satisfy a two-person rule: the
+    second attempt is refused so the distinct-approver count stays honest."""
+    orch = _orch(session_factory, provider=InMemoryFakeProvider(), min_approvals=2)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    orch.approve(run_id, user="alice@example.com")
+    with pytest.raises(OrchestratorError, match="already approved"):
+        orch.approve(run_id, user="alice@example.com")
+    # Still one approver short; the run has not advanced.
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+    assert _run(session_factory, run_id).current_step == "awaiting_approval (1/2)"
+
+
+def test_min_approvals_default_one_is_unchanged(session_factory) -> None:
+    """Default ``min_approvals=1`` is the historical single-approval lifecycle:
+    one sign-off advances the run straight to APPROVED."""
+    orch = _orch(session_factory, provider=InMemoryFakeProvider())
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_per_repo_min_approvals_raises_the_floor(session_factory) -> None:
+    """A per-repo override demands more sign-offs than the global floor for runs
+    routed to that repo (max of the two)."""
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        min_approvals=1,
+        repo_min_approvals={"customer-web": 2},
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="alice@example.com")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+    orch.approve(run_id, user="bob@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_per_repo_min_approvals_scoped_to_its_repo(session_factory) -> None:
+    """A per-repo override on a *different* repo does not raise the bar here: a
+    run routed to customer-web still advances on a single approval."""
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        repo_min_approvals={"payments-service": 3},
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_per_repo_min_approvals_never_lowers_global_floor(session_factory) -> None:
+    """A per-repo value below the global floor cannot weaken it: the effective
+    minimum is the max, so the global floor still binds (invariant #1)."""
+    orch = _orch(
+        session_factory,
+        provider=InMemoryFakeProvider(),
+        min_approvals=2,
+        repo_min_approvals={"customer-web": 1},
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="alice@example.com")
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+    orch.approve(run_id, user="bob@example.com")
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_min_approvals_unions_roles_across_approvers(session_factory) -> None:
+    """N-of-M composes with required roles: each distinct approver must hold the
+    required role, and the run dispatches once enough have signed (the granted
+    roles reaching the gate are the union across approvers)."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        min_approvals=2,
+        repo_required_roles={"customer-web": ("security",)},
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    orch.approve(
+        run_id, user="sec1@example.com", granted_roles={ApprovalRole.SECURITY}
+    )
+    assert _status(session_factory, run_id) is RunStatus.WAITING_APPROVAL
+    orch.approve(
+        run_id, user="sec2@example.com", granted_roles={ApprovalRole.SECURITY}
+    )
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+    orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+
+def test_min_approvals_records_each_signoff_in_audit(session_factory) -> None:
+    """Every sign-off in an N-of-M run is its own recorded approval artifact, so
+    the audit trail shows who approved, not just that the threshold was met."""
+    orch = _orch(session_factory, provider=InMemoryFakeProvider(), min_approvals=2)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="alice@example.com")
+    orch.approve(run_id, user="bob@example.com")
+    with session_factory() as s:
+        records = (
+            s.query(FoundryArtifact)
+            .filter(
+                FoundryArtifact.run_id == run_id,
+                FoundryArtifact.artifact_type == ArtifactType.APPROVAL_RECORD,
+            )
+            .all()
+        )
+    assert len(records) == 2

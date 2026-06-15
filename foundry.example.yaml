@@ -108,6 +108,20 @@ policy:
   # repo_required_roles:
   #   payments-service: ["security"]
   #   platform-monorepo: ["engineering", "security"]
+  # N-of-M approval matrix (issue #31, the "two-person rule"). Minimum number of
+  # *distinct* human approvers a run needs before it leaves WAITING_APPROVAL for
+  # APPROVED. Default 1 = the historical single-approval lifecycle. Approvals
+  # accumulate (each is its own audited sign-off, a duplicate from the same
+  # person is refused) and the run only advances once the count is met - it is
+  # enforced in the orchestrator lifecycle, like the forbidden-path block, so it
+  # adds no policy-engine/Rego rule. Each approver must independently hold any
+  # required roles (above), so N-of-M composes with the role requirements.
+  # min_approvals: 2
+  # Per-repo override: the effective minimum for a run routed to the named repo
+  # is max(min_approvals, this value), so a repo can only ever demand *more*
+  # sign-offs than the global floor, never fewer (a one-way ratchet to stricter).
+  # repo_min_approvals:
+  #   payments-service: 3
   # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)
   # risk pass never flagged the area, the run escalates to human review.
   # Override per area; unlisted areas keep the built-in defaults.

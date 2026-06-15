@@ -158,6 +158,8 @@ class FoundryOrchestrator:
         forbidden_globs: tuple[str, ...] | list[str] | None = None,
         repo_forbidden_globs: Mapping[str, tuple[str, ...]] | None = None,
         repo_required_roles: Mapping[str, tuple[str, ...]] | None = None,
+        min_approvals: int = 1,
+        repo_min_approvals: Mapping[str, int] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         max_agent_retries: int = 2,
         retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
@@ -216,6 +218,18 @@ class FoundryOrchestrator:
         self._repo_required_roles = {
             repo: [ApprovalRole(r) for r in roles]
             for repo, roles in (repo_required_roles or {}).items()
+        }
+        # Minimum distinct human approvers per run (issue #31, N-of-M approval
+        # matrix / "two-person rule"). Default 1 = the historical single-approval
+        # lifecycle, byte-for-byte. A run accumulates approvals and only advances
+        # to APPROVED once the effective minimum is met; a per-repo override can
+        # only raise the bar (``max`` of the two), never lower it (invariant #1).
+        # Enforced here in the lifecycle - like the orchestrator-only
+        # forbidden-path block - not in the policy gate, so there is no
+        # Python/Rego lock-step concern (invariant #2 does not apply).
+        self._min_approvals = max(1, min_approvals)
+        self._repo_min_approvals = {
+            repo: count for repo, count in (repo_min_approvals or {}).items()
         }
         if sensitive_path_globs is None:
             from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
@@ -614,6 +628,7 @@ class FoundryOrchestrator:
             # trail and shows tracker users an approve->blocked whiplash (issue
             # #18). Refuse up front, before anything is written, so the timeline
             # never shows an approval for work that was actually denied.
+            repo = self._run_repo(session, run_id)
             risk = self._load(session, run_id, ArtifactType.RISK_ASSESSMENT)
             required = required_approvals(
                 PolicyRisk(
@@ -624,7 +639,7 @@ class FoundryOrchestrator:
                 # approver lacking them here, before recording, just as for the
                 # risk-derived roles - so a per-repo rule never surfaces as an
                 # approve->blocked whiplash at dispatch.
-                self._repo_required_roles_for(self._run_repo(session, run_id)),
+                self._repo_required_roles_for(repo),
             )
             missing = [role for role in required if role not in granted_roles]
             if missing:
@@ -632,6 +647,16 @@ class FoundryOrchestrator:
                     f"approval refused: '{user}' lacks the required role(s) "
                     f"({', '.join(role.value for role in missing)}) for this run; "
                     f"required: {', '.join(role.value for role in required)}"
+                )
+            # N-of-M approval matrix (issue #31): a run may need several *distinct*
+            # human approvers before it advances. Refuse a duplicate sign-off from
+            # someone who already approved, so the distinct-approver count - and
+            # the audit trail - stay honest rather than being inflated by one
+            # person clicking twice.
+            prior_users, _ = self._approval_summary(session, run_id)
+            if user in prior_users:
+                raise OrchestratorError(
+                    f"approval refused: '{user}' has already approved run {run_id}"
                 )
             approval_record = {
                 "user": user,
@@ -649,13 +674,29 @@ class FoundryOrchestrator:
                     output_content=approval_record,
                 )
             )
-            run.status = RunStatus.APPROVED
-            run.approved_by = user
-            run.approved_at = datetime.now(timezone.utc)
-            run.current_step = "approved"
+            # Count this approver among the distinct sign-offs and only advance
+            # the run once the effective minimum is met. Until then the run stays
+            # at WAITING_APPROVAL, accumulating approvals - the human gate is a
+            # one-way ratchet towards stricter, never weakened (invariant #1).
+            approver_count = len(prior_users) + 1
+            min_required = self._min_approvals_for(repo)
             issue_id = run.linear_issue_id
-            session.commit()
-        self._notify_state(issue_id, RunStatus.APPROVED)
+            if approver_count >= min_required:
+                run.status = RunStatus.APPROVED
+                run.approved_by = user
+                run.approved_at = datetime.now(timezone.utc)
+                run.current_step = "approved"
+                session.commit()
+                self._notify_state(issue_id, RunStatus.APPROVED)
+            else:
+                # Still short of the required sign-offs: record progress on the
+                # run so the timeline/dashboard shows "1 of 2", and leave the run
+                # parked for the next approver. No state-change notification - the
+                # status has not changed - so we don't re-spam the approval prompt.
+                run.current_step = (
+                    f"awaiting_approval ({approver_count}/{min_required})"
+                )
+                session.commit()
 
     def reject(self, run_id: str, *, user: str) -> None:
         """Terminate a run a human declined (from ``/foundry reject``)."""
@@ -1180,9 +1221,13 @@ class FoundryOrchestrator:
             risk = self._load(session, run_id, ArtifactType.RISK_ASSESSMENT)
             plan = self._load(session, run_id, ArtifactType.DELIVERY_PLAN)
             ticket = self._load(session, run_id, ArtifactType.TICKET_SNAPSHOT)
-            approval = self._load_raw(session, run_id, ArtifactType.APPROVAL_RECORD)
-
-            granted = set(approval.get("granted_roles", [])) if approval else set()
+            # Aggregate every recorded approval (N-of-M, issue #31): the granted
+            # roles are the union across all distinct approvers, and the run is
+            # "approved" iff at least one human signed off. With the default
+            # single-approval lifecycle there is exactly one record, so this is
+            # byte-for-byte the previous behaviour.
+            approval_users, granted = self._approval_summary(session, run_id)
+            approval_present = bool(approval_users)
             # Enforce the budget cap at first dispatch too (issue #29): no job
             # has spent yet, so the projected cost is just this dispatch's
             # estimate - enough to refuse a run whose single attempt already
@@ -1197,8 +1242,11 @@ class FoundryOrchestrator:
                 # An approval record exists iff a human approved this run; the
                 # gate now requires it for any autonomous action (issue #18). A
                 # missing record (a path that bypassed approve()) is denied here
-                # rather than slipping through ungoverned.
-                approval_present=approval is not None,
+                # rather than slipping through ungoverned. The N-of-M count is
+                # enforced in the lifecycle (a run only reaches APPROVED once the
+                # minimum distinct approvers signed off), so by the time dispatch
+                # runs the count is already satisfied.
+                approval_present=approval_present,
                 budget=PolicyBudget(
                     cost_usd=self._accumulated_cost(session, run_id),
                     pending_cost_usd=self._estimated_cost_per_dispatch,
@@ -1532,8 +1580,9 @@ class FoundryOrchestrator:
             context = self._load(session, run_id, ArtifactType.CONTEXT_BUNDLE)
             risk = self._load(session, run_id, ArtifactType.RISK_ASSESSMENT)
             plan = self._load(session, run_id, ArtifactType.DELIVERY_PLAN)
-            approval = self._load_raw(session, run_id, ArtifactType.APPROVAL_RECORD)
-            granted = set(approval.get("granted_roles", [])) if approval else set()
+            # Union of granted roles across every approver (N-of-M, issue #31);
+            # a single-approval run yields exactly the one record's roles.
+            approval_users, granted = self._approval_summary(session, run_id)
 
             # The first job was the original dispatch; everything after is a
             # remediation attempt.
@@ -1571,7 +1620,7 @@ class FoundryOrchestrator:
                 approvals=granted,
                 # The original dispatch only happens after approval, so an
                 # approval record exists for any run reaching a retry (issue #18).
-                approval_present=approval is not None,
+                approval_present=bool(approval_users),
                 retry=PolicyRetry(
                     attempt=attempt, max_attempts=self._max_agent_retries
                 ),
@@ -1977,6 +2026,60 @@ class FoundryOrchestrator:
         if not repo:
             return []
         return list(self._repo_required_roles.get(repo, []))
+
+    def _min_approvals_for(self, repo: str | None) -> int:
+        """Minimum distinct approvers for a run routed to ``repo`` (issue #31).
+
+        The effective minimum is the global floor raised by any per-repo
+        override - ``max(global, per-repo)`` - so a repo can only ever demand
+        *more* sign-offs than the floor, never fewer (invariant #1). Defaults to
+        1 (single approval), which is the historical behaviour byte-for-byte.
+        """
+        floor = self._min_approvals
+        if repo and repo in self._repo_min_approvals:
+            return max(floor, self._repo_min_approvals[repo])
+        return floor
+
+    def _approval_records(self, session, run_id: str) -> list[dict]:
+        """Every recorded ``APPROVAL_RECORD`` artifact for a run, oldest first.
+
+        Each :meth:`approve` writes one such artifact, so the full set is the
+        run's accumulated approvals - the basis for the N-of-M distinct-approver
+        count and the union of granted roles across approvers (issue #31).
+        """
+        import json
+
+        rows = (
+            session.query(FoundryArtifact)
+            .filter(
+                FoundryArtifact.run_id == run_id,
+                FoundryArtifact.artifact_type == ArtifactType.APPROVAL_RECORD,
+            )
+            .order_by(FoundryArtifact.version)
+            .all()
+        )
+        return [json.loads(row.content_json) for row in rows]
+
+    def _approval_summary(
+        self, session, run_id: str
+    ) -> tuple[list[str], set[str]]:
+        """Distinct approver identities (oldest first) and the union of granted
+        roles across all of a run's recorded approvals (issue #31).
+
+        With the default ``min_approvals`` of 1 there is exactly one approval
+        record, so the union is that record's roles - byte-for-byte the previous
+        single-record behaviour. With N-of-M the role coverage is the union over
+        every distinct approver, so several approvers can jointly satisfy the
+        required roles.
+        """
+        users: list[str] = []
+        roles: set[str] = set()
+        for record in self._approval_records(session, run_id):
+            user = record.get("user")
+            if user is not None and user not in users:
+                users.append(user)
+            roles.update(record.get("granted_roles", []))
+        return users, roles
 
     def _forbidden_globs_for(self, repo: str | None) -> list[str]:
         """Global forbidden globs plus any extra ones scoped to ``repo``.

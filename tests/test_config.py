@@ -69,6 +69,9 @@ policy:
   repo_required_roles:
     payments-service: ["security"]
     platform-monorepo: ["engineering", "security"]
+  min_approvals: 2
+  repo_min_approvals:
+    payments-service: 3
 triggers:
   label: "ai:go"
   status: "Ready for Foundry"
@@ -112,6 +115,8 @@ def test_load_from_yaml(tmp_path) -> None:
         "payments-service": ("security",),
         "platform-monorepo": ("engineering", "security"),
     }
+    assert s.min_approvals == 2
+    assert s.repo_min_approvals_map == {"payments-service": 3}
     assert s.temporal_address == "temporal.internal:7233"
 
 
@@ -123,6 +128,33 @@ def test_repo_forbidden_globs_default_empty() -> None:
 def test_repo_required_roles_default_empty() -> None:
     """No config => no per-repo approval roles (risk-derived roles unchanged)."""
     assert Settings.from_env({}).repo_required_roles_map == {}
+
+
+def test_min_approvals_defaults_to_one() -> None:
+    """No config => the historical single-approval lifecycle (issue #31)."""
+    s = Settings.from_env({})
+    assert s.min_approvals == 1
+    assert s.repo_min_approvals_map == {}
+
+
+def test_min_approvals_rejects_below_one(tmp_path) -> None:
+    """A minimum below one sign-off would weaken the human gate - refused at
+    load (invariant #1)."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text("policy:\n  min_approvals: 0\n")
+    with pytest.raises(ValueError, match="min_approvals must be >= 1"):
+        Settings.load(path, env={})
+
+
+def test_repo_min_approvals_rejects_below_one(tmp_path) -> None:
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text("policy:\n  repo_min_approvals:\n    payments-service: 0\n")
+    with pytest.raises(ValueError, match="must be >= 1"):
+        Settings.load(path, env={})
 
 
 def test_repo_required_roles_rejects_unknown_role(tmp_path) -> None:
