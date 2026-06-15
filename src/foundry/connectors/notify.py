@@ -39,6 +39,11 @@ class ApprovalRequest:
     repo: str
     acceptance_criteria: tuple[str, ...] = ()
     required_approvals: tuple[str, ...] = ()
+    # Effective N-of-M count: the number of *distinct* humans who must sign off
+    # before the run advances (``policy.min_approvals`` raised by any per-repo
+    # override, issue #31). Surfaced in the approval message only when >1, so the
+    # default single-approval prompt is byte-for-byte unchanged.
+    min_approvals: int = 1
 
 
 class RunNotifier(Protocol):

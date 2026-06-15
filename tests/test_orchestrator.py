@@ -2024,6 +2024,25 @@ def test_per_repo_min_approvals_never_lowers_global_floor(session_factory) -> No
     assert _status(session_factory, run_id) is RunStatus.APPROVED
 
 
+def test_min_approvals_surfaced_in_tracker_comment(session_factory) -> None:
+    """The intake comment tells the approver up front that the run needs >1
+    distinct sign-off, so the two-person rule isn't a parked-run surprise (#31)."""
+    tracker = InMemoryIssueTracker()
+    orch = _orch(session_factory, issue_tracker=tracker, min_approvals=2)
+    orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    comment = tracker.comments["i-1"][0]
+    assert "Approvers required:" in comment
+    assert "2 distinct sign-offs" in comment
+
+
+def test_single_approval_tracker_comment_has_no_count(session_factory) -> None:
+    """Default single-approval intake comment is unchanged - no N-of-M line."""
+    tracker = InMemoryIssueTracker()
+    orch = _orch(session_factory, issue_tracker=tracker)
+    orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    assert "Approvers required:" not in tracker.comments["i-1"][0]
+
+
 def test_min_approvals_unions_roles_across_approvers(session_factory) -> None:
     """N-of-M composes with required roles: each distinct approver must hold the
     required role, and the run dispatches once enough have signed (the granted

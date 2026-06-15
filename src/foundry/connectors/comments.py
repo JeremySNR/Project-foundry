@@ -69,6 +69,7 @@ def format_analysis_comment(
     status: RunStatus,
     *,
     required_roles: list[str] | None = None,
+    min_approvals: int = 1,
 ) -> str:
     """Render the planning summary comment posted to the issue.
 
@@ -76,6 +77,13 @@ def format_analysis_comment(
     hold - the risk-derived roles unioned with any per-repo roles scoped to the
     routed repo (issue #31). It defaults to the risk-derived roles so callers
     that don't compute the union still render correctly.
+
+    ``min_approvals`` is the effective N-of-M count - the number of *distinct*
+    humans who must sign off before the run advances (``policy.min_approvals``
+    raised by any per-repo ``policy.repo_min_approvals``, issue #31). It is only
+    surfaced when greater than 1, so the default single-approval prompt is
+    unchanged; when set, an approver is told up front that one sign-off is not
+    enough, avoiding the surprise of an approval that leaves the run parked.
     """
     repo = plan.affected_repositories[0] if plan.affected_repositories else "_unknown_"
     approvals = (
@@ -105,6 +113,12 @@ def format_analysis_comment(
         ]
     if approvals:
         lines += ["", f"**Required approval:** {', '.join(approvals)}"]
+    if min_approvals > 1:
+        lines += [
+            "",
+            f"**Approvers required:** {min_approvals} distinct sign-offs "
+            "(two-person rule)",
+        ]
 
     if status is RunStatus.WAITING_APPROVAL:
         lines += [

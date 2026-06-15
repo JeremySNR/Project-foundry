@@ -91,6 +91,10 @@ def _approval_message(req: ApprovalRequest) -> tuple[str, list[dict[str, Any]]]:
     ]
     if req.required_approvals:
         fields.append("*Required approval:*\n" + ", ".join(req.required_approvals))
+    if req.min_approvals > 1:
+        fields.append(
+            f"*Approvers required:*\n{req.min_approvals} distinct sign-offs"
+        )
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",

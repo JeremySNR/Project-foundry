@@ -145,6 +145,30 @@ def test_analysis_comment_for_waiting_approval_has_commands() -> None:
     assert "customer-web" in body
 
 
+def test_analysis_comment_surfaces_n_of_m_when_required() -> None:
+    """When the run needs >1 distinct approver, the comment says so up front, so
+    the first approver isn't surprised by a run that stays parked (issue #31)."""
+    analysis, risk, plan = _artifacts(
+        "Acceptance Criteria:\n- a button exists\n- it persists", ["customer-web"]
+    )
+    body = format_analysis_comment(
+        analysis, risk, plan, RunStatus.WAITING_APPROVAL, min_approvals=2
+    )
+    assert "Approvers required:" in body
+    assert "2 distinct sign-offs" in body
+
+
+def test_analysis_comment_omits_n_of_m_for_single_approval() -> None:
+    """The default single-approval prompt is unchanged - no N-of-M line."""
+    analysis, risk, plan = _artifacts(
+        "Acceptance Criteria:\n- a button exists\n- it persists", ["customer-web"]
+    )
+    body = format_analysis_comment(
+        analysis, risk, plan, RunStatus.WAITING_APPROVAL, min_approvals=1
+    )
+    assert "Approvers required:" not in body
+
+
 def test_analysis_comment_for_needs_clarification() -> None:
     analysis, risk, plan = _artifacts("vague", [])
     body = format_analysis_comment(analysis, risk, plan, RunStatus.NEEDS_CLARIFICATION)

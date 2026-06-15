@@ -432,13 +432,24 @@ class FoundryOrchestrator:
                 self._repo_required_roles_for(repo_name),
             )
         ]
+        # The effective N-of-M count for the routed repo (issue #31). Surfaced in
+        # the approval prompts alongside the roles so an approver is told up front
+        # that one sign-off may not be enough - matching what approve() enforces,
+        # so the "two-person rule" never surprises the first approver as a run
+        # that stays parked after they sign off.
+        min_required = self._min_approvals_for(repo_name)
         # Mirror the outcome back to the tracker (Linear) if one is configured.
         if self._tracker is not None:
             try:
                 self._tracker.post_comment(
                     ticket.issue_id,
                     format_analysis_comment(
-                        analysis, risk, plan, status, required_roles=effective_roles
+                        analysis,
+                        risk,
+                        plan,
+                        status,
+                        required_roles=effective_roles,
+                        min_approvals=min_required,
                     ),
                 )
                 self._tracker.set_state(ticket.issue_id, state_for(status))
@@ -452,7 +463,12 @@ class FoundryOrchestrator:
         # message when the run parks for approval, else a status notification.
         if status is RunStatus.WAITING_APPROVAL:
             self._notify_approval(
-                ticket, analysis, risk, plan, required_roles=effective_roles
+                ticket,
+                analysis,
+                risk,
+                plan,
+                required_roles=effective_roles,
+                min_approvals=min_required,
             )
         else:
             self._notify_run_status(ticket.issue_id, ticket.issue_key, status)
@@ -549,12 +565,14 @@ class FoundryOrchestrator:
         plan: DeliveryPlan,
         *,
         required_roles: list[str] | None = None,
+        min_approvals: int = 1,
     ) -> None:
         """Post the interactive approval message to the chat surface.
 
         ``required_roles`` is the *effective* approval roles (risk-derived plus
         any per-repo roles, issue #31); it falls back to the risk-derived roles
-        for callers that don't compute the union.
+        for callers that don't compute the union. ``min_approvals`` is the
+        effective N-of-M count (issue #31), surfaced in the message only when >1.
         """
         if self._notifier is None:
             return
@@ -574,6 +592,7 @@ class FoundryOrchestrator:
             repo=repo,
             acceptance_criteria=tuple(analysis.acceptance_criteria),
             required_approvals=roles,
+            min_approvals=min_approvals,
         )
         try:
             self._notifier.approval_requested(request)
