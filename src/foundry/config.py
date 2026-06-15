@@ -164,6 +164,15 @@ class Settings:
     # only for a local plain-HTTP deployment.
     oidc_cookie_secure: bool = True
     session_secret: str | None = None  # secret: env only
+    # RP-Initiated Logout 1.0 (issue #34): when set, /dashboard/logout deletes the
+    # local session cookie *and* redirects on to the IdP's end-session endpoint so
+    # the SSO session is terminated too (not just the local cookie). Optional even
+    # when browser login is configured; unset => logout returns to /dashboard
+    # byte-for-byte as before. post_logout_redirect_uri (where the IdP returns the
+    # browser after logout) must be pre-registered with the IdP and is only
+    # meaningful with end_session_endpoint set.
+    oidc_end_session_endpoint: str | None = None
+    oidc_post_logout_redirect_uri: str | None = None
 
     # --- webhook replay protection (behaviour: yaml) ---
     # How long a processed delivery id is remembered in foundry_webhook_deliveries
@@ -663,6 +672,20 @@ class Settings:
                     "oidc.session_ttl_seconds must be > 0, got "
                     f"{self.oidc_session_ttl_seconds}"
                 )
+        # RP-initiated logout is consumed only by the logout route, which requires
+        # the browser-login config; an end_session_endpoint without it would be
+        # silently inert. Fail-closed at load rather than ship a half-built logout.
+        if self.oidc_end_session_endpoint and not set_login:
+            raise ValueError(
+                "OIDC RP-initiated logout (end_session_endpoint) requires the "
+                "browser-login config (client_id, authorization_endpoint, "
+                "token_endpoint, redirect_uri) to be set as well"
+            )
+        if self.oidc_post_logout_redirect_uri and not self.oidc_end_session_endpoint:
+            raise ValueError(
+                "oidc.post_logout_redirect_uri is only meaningful with "
+                "end_session_endpoint set"
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -953,6 +976,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["oidc_session_ttl_seconds"] = int(oidc["session_ttl_seconds"])
     if "cookie_secure" in oidc:
         out["oidc_cookie_secure"] = _bool(oidc["cookie_secure"])
+    if "end_session_endpoint" in oidc:
+        out["oidc_end_session_endpoint"] = str(oidc["end_session_endpoint"])
+    if "post_logout_redirect_uri" in oidc:
+        out["oidc_post_logout_redirect_uri"] = str(oidc["post_logout_redirect_uri"])
 
     temporal = data.get("temporal", {}) or {}
     if "address" in temporal:
@@ -1031,6 +1058,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_OIDC_AUTHORIZATION_ENDPOINT": "oidc_authorization_endpoint",
         "FOUNDRY_OIDC_TOKEN_ENDPOINT": "oidc_token_endpoint",
         "FOUNDRY_OIDC_REDIRECT_URI": "oidc_redirect_uri",
+        "FOUNDRY_OIDC_END_SESSION_ENDPOINT": "oidc_end_session_endpoint",
+        "FOUNDRY_OIDC_POST_LOGOUT_REDIRECT_URI": "oidc_post_logout_redirect_uri",
         "FOUNDRY_SESSION_SECRET": "session_secret",
     }
     for env_key, field_name in mapping.items():

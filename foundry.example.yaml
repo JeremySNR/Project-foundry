@@ -364,6 +364,17 @@ auth:
   #   scopes: ["openid", "email"]    # what the login requests from the IdP
   #   session_ttl_seconds: 28800     # how long a signed-in session lasts (8h)
   #   cookie_secure: true            # mark cookies Secure; false only for local HTTP
+  #   #
+  #   # RP-Initiated Logout (federated logout): when set, /dashboard/logout
+  #   # deletes the local session cookie AND redirects on to the IdP's
+  #   # end-session endpoint so the SSO session is terminated too - otherwise a
+  #   # shared workstation silently re-authenticates on the next login. Optional;
+  #   # unset = logout just clears the local cookie. post_logout_redirect_uri
+  #   # (where the IdP returns the browser after logout) must be pre-registered
+  #   # with the IdP and is only meaningful with end_session_endpoint set. Env:
+  #   # FOUNDRY_OIDC_END_SESSION_ENDPOINT / FOUNDRY_OIDC_POST_LOGOUT_REDIRECT_URI.
+  #   end_session_endpoint: "https://login.example.com/v2/logout"
+  #   post_logout_redirect_uri: "https://foundry.example.com/dashboard"
 
 notifications:
   # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status

@@ -484,8 +484,18 @@ def create_app(
 
     @app.get("/dashboard/logout", include_in_schema=False)
     def dashboard_logout() -> RedirectResponse:
-        """Clear the dashboard session cookie and return to the dashboard."""
-        response = RedirectResponse("/dashboard", status_code=302)
+        """Clear the dashboard session cookie; optionally end the IdP session too.
+
+        When RP-initiated logout is configured (``auth.oidc.end_session_endpoint``)
+        the browser is redirected on to the IdP's end-session endpoint so the SSO
+        session is terminated, not just the local Foundry cookie - otherwise a
+        shared workstation would silently re-authenticate on the next login.
+        Without it (the default), the user is returned to the now-signed-out
+        dashboard, byte-for-byte as before. The local cookie is deleted either way.
+        """
+        login: OidcLogin | None = app.state.oidc_login
+        target = login.end_session_url() if login is not None else None
+        response = RedirectResponse(target or "/dashboard", status_code=302)
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
 
@@ -1945,6 +1955,8 @@ def app_from_settings(settings: Settings) -> FastAPI:
             scopes=settings.oidc_scopes,
             session_ttl_seconds=settings.oidc_session_ttl_seconds,
             cookie_secure=settings.oidc_cookie_secure,
+            end_session_endpoint=settings.oidc_end_session_endpoint,
+            post_logout_redirect_uri=settings.oidc_post_logout_redirect_uri,
         )
     return create_app(
         webhook_secret=settings.linear_webhook_secret,
