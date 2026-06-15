@@ -160,6 +160,7 @@ class FoundryOrchestrator:
         repo_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         min_approvals: int = 1,
         repo_min_approvals: Mapping[str, int] | None = None,
+        path_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         max_agent_retries: int = 2,
         retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
@@ -230,6 +231,21 @@ class FoundryOrchestrator:
         self._min_approvals = max(1, min_approvals)
         self._repo_min_approvals = {
             repo: count for repo, count in (repo_min_approvals or {}).items()
+        }
+        # Per-*path* required approval roles (issue #31/#35, per-path policy
+        # scoping for monorepos). Unlike the per-repo roles above (resolved at
+        # intake from the routed repo, before a diff exists), these are evaluated
+        # diff-aware in the PR re-check: a PR whose diff touches a configured path
+        # whose role is not already covered by the run's approvers escalates the
+        # run to REVIEW_REQUIRED for a human sign-off. Strictly additive - it can
+        # only ever *escalate* to human review, never release a run (invariant #1)
+        # - and enforced in the orchestrator lifecycle, like the forbidden-path
+        # block, so there is no policy-engine/Rego lock-step concern (invariant #2
+        # does not apply). Role names are validated at config load, so coercing
+        # here is safe. Empty by default = the historical behaviour byte-for-byte.
+        self._path_required_roles = {
+            glob: [ApprovalRole(r) for r in roles]
+            for glob, roles in (path_required_roles or {}).items()
         }
         if sensitive_path_globs is None:
             from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
@@ -1931,9 +1947,65 @@ class FoundryOrchestrator:
             )
             return RunStatus.REVIEW_REQUIRED
 
+        unapproved_paths = self._unapproved_path_roles(
+            session, run_id, pr_state.files_changed
+        )
+        if unapproved_paths:
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "category": "path_required_roles",
+                        "reason": (
+                            "diff touches paths that require approval roles not "
+                            "granted by the run's approvers"
+                        ),
+                        "required_roles": sorted(unapproved_paths),
+                        "paths": {
+                            role: sorted(set(paths))
+                            for role, paths in unapproved_paths.items()
+                        },
+                    },
+                )
+            )
+            return RunStatus.REVIEW_REQUIRED
+
         if len(pr_state.files_changed) > self._max_files_changed:
             return RunStatus.REVIEW_REQUIRED
         return RunStatus.PR_OPEN
+
+    def _unapproved_path_roles(
+        self, session, run_id: str, files: list[str]
+    ) -> dict[str, list[str]]:
+        """Per-path approval roles a diff demands that no approver has granted.
+
+        For each configured ``policy.path_required_roles`` rule, a changed file
+        matching the path glob demands that rule's roles. A role is *satisfied*
+        if it is already in the union of roles granted across the run's approvers
+        (:meth:`_approval_summary`) - so a path whose role the upfront risk pass
+        already forced a human to sign with does **not** re-escalate, mirroring
+        how an *anticipated* sensitive area is not flagged again.
+
+        Returns the role -> matched paths for every still-*unsatisfied* role; an
+        empty mapping (the default with no rules configured) means nothing to
+        escalate. Strictly additive: this can only ever surface a role to require,
+        never drop one (invariant #1).
+        """
+        if not self._path_required_roles:
+            return {}
+        _, granted = self._approval_summary(session, run_id)
+        unapproved: dict[str, list[str]] = {}
+        for path in files:
+            for pattern, roles in self._path_required_roles.items():
+                if not glob_match(path, pattern):
+                    continue
+                for role in roles:
+                    if role.value in granted:
+                        continue
+                    unapproved.setdefault(role.value, []).append(path)
+        return unapproved
 
     def _unexpected_sensitive_areas(
         self, session, run_id: str, files: list[str]

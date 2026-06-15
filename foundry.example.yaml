@@ -122,6 +122,20 @@ policy:
   # sign-offs than the global floor, never fewer (a one-way ratchet to stricter).
   # repo_min_approvals:
   #   payments-service: 3
+  # Per-*path* required approval roles (issue #31/#35, per-path policy scoping for
+  # monorepos). Unlike repo_required_roles (resolved at intake from the routed
+  # repo, before any diff exists), these are evaluated *diff-aware* on every PR
+  # push: if a PR's diff touches a configured path glob whose role is not already
+  # covered by the run's approvers, the run escalates to "review required" for a
+  # human sign-off. Use this to protect a sub-tree (e.g. a monorepo's billing or
+  # identity service) without forcing the role on every run routed to the repo.
+  # Strictly additive: it can only ever *escalate* a run to human review, never
+  # release one. Valid roles: product, engineering, security, qa (validated at
+  # load). Enforced in the orchestrator lifecycle (like the forbidden-path block),
+  # so it adds no policy-engine/Rego rule.
+  # path_required_roles:
+  #   "**/billing/**": ["security"]
+  #   "services/identity/**": ["engineering", "security"]
   # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)
   # risk pass never flagged the area, the run escalates to human review.
   # Override per area; unlisted areas keep the built-in defaults.
