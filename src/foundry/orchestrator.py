@@ -1973,6 +1973,25 @@ class FoundryOrchestrator:
             return RunStatus.REVIEW_REQUIRED
 
         if len(pr_state.files_changed) > self._max_files_changed:
+            # The diff is larger than the allowed cap - hand it to a human.
+            # Record the escalation so the trail says *why* the run went to
+            # review (it was previously a silent status flip) and so the
+            # approval-queue clock can date the wait from this transition.
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "category": "diff_too_large",
+                        "reason": (
+                            "diff changes more files than the configured cap"
+                        ),
+                        "files_changed": len(pr_state.files_changed),
+                        "max_files_changed": self._max_files_changed,
+                    },
+                )
+            )
             return RunStatus.REVIEW_REQUIRED
         return RunStatus.PR_OPEN
 

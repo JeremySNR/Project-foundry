@@ -248,6 +248,36 @@ def test_oversized_pr_requires_review(session_factory) -> None:
     assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
 
 
+def test_oversized_pr_records_risk_escalated_event(session_factory) -> None:
+    """The too-many-files escalation is no longer a silent status flip: it
+    records a RISK_ESCALATED event so the trail says why the run went to review
+    and the approval-queue clock can date the wait from this transition."""
+    from foundry.db.models import AuditEventType
+
+    provider = InMemoryFakeProvider()
+    orch = _orch(session_factory, provider=provider, max_files_changed=2)
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(run_id, user="lead@example.com")
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+
+    pr = PullRequestState(
+        repo="customer-web",
+        pr_number=3,
+        url="https://github.com/example/customer-web/pull/3",
+        branch="foundry/lin-123",
+        status=PRStatus.OPEN,
+        files_changed=["a.ts", "b.ts", "c.ts"],
+    )
+    assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
+
+    metas = _audit_meta(session_factory, run_id, AuditEventType.RISK_ESCALATED)
+    assert any(m.get("category") == "diff_too_large" for m in metas)
+    meta = next(m for m in metas if m.get("category") == "diff_too_large")
+    assert meta["files_changed"] == 3
+    assert meta["max_files_changed"] == 2
+
+
 def test_vague_ticket_needs_clarification_and_cannot_dispatch(session_factory) -> None:
     orch = _orch(session_factory)
     run_id = orch.intake_and_plan(
