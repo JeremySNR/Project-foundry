@@ -1,0 +1,115 @@
+# Foundry starter policy preset: PCI-DSS (cardholder data environment)
+# =====================================================================
+# A starting point for organisations bringing Foundry into scope of the Payment
+# Card Industry Data Security Standard. The mapping is indicative, not an
+# assessment - a QSA certifies your environment, not this file - but it wires up
+# the controls a PCI programme expects to see governing automated change:
+#
+#   * Req 6.2 / 6.3 (develop & maintain secure systems; change control) ->
+#     confident routing, a tight file-change ceiling and a single remediation
+#     retry, so changes stay small, scoped and reviewable.
+#   * Req 6.4.x (separation of duties between dev and the change authoriser) ->
+#     a two-person rule: every run needs two DISTINCT human approvers before it
+#     dispatches (policy.min_approvals), with key-management changes raised to
+#     three.
+#   * Req 3 (protect stored account data) / Req 4 (protect cryptographic keys) ->
+#     protected-path blocks over crypto/key material and the cardholder-data
+#     subtrees, plus a path-scoped security sign-off on anything that touches
+#     them in the diff.
+#   * Req 7 (restrict access by business need-to-know) -> per-repo security
+#     sign-off on the services inside the cardholder data environment (CDE).
+#   * Req 10 / Req 12 (accountability & oversight) -> human approval is already a
+#     hard gate rule; name your approvers and their roles below.
+#
+# Copy into your foundry.yaml and adapt the repo names, path globs and approvers
+# - the lists here are illustrative of a CDE, not your topology. Secrets still
+# come from the environment, never here.
+
+policy:
+  provider: local
+
+  # High routing confidence: work must never land in a repo outside (or wrongly
+  # inside) the cardholder data environment. Matches the change-management bar.
+  repo_confidence_threshold: 85
+
+  # The tightest blast radius of the presets - a PCI change record should
+  # describe a small, well-understood diff.
+  max_files_changed: 8
+
+  # Paths the agent may never modify (the sticky forbidden-path block - matching
+  # any of these marks the run BLOCKED and is never retried). Restates the
+  # built-in defaults (infra / migrations / .env / secrets) and adds the
+  # cryptographic-key and payment-config surfaces PCI keeps off-limits to
+  # automation. Matched at the repo root and at any nested depth.
+  forbidden_globs:
+    - "infra/**"
+    - "**/infra/**"
+    - "migrations/**"
+    - "**/migrations/**"
+    - "**/.env*"
+    - "**/secrets/**"
+    - "**/*.pem"                  # private keys / certificates
+    - "**/*.key"
+    - "**/*.p12"                  # key stores
+    - "**/keystore/**"            # cryptographic key material (Req 3.6 / 4)
+    - "**/keys/**"
+    - "**/hsm/**"                 # hardware security module config
+    - "**/.github/workflows/**"   # CI/CD pipeline definitions
+    - "**/terraform/**"           # infrastructure as code
+
+  # Separation of duties (Req 6.4.x): every run needs two DISTINCT human
+  # approvers before it leaves WAITING_APPROVAL. Strictly additive - a single
+  # sign-off no longer releases a run. The per-repo override raises the bar for
+  # the most sensitive repo without lowering it anywhere (effective minimum is
+  # max(global, per-repo)).
+  min_approvals: 2
+  repo_min_approvals:
+    # Key-management / HSM custodian changes warrant a third authoriser.
+    key-management-service: 3
+
+  # Per-repo required approval roles, on top of whatever the risk classifier
+  # derives. Strictly additive: these can only ADD a required sign-off, never
+  # drop a risk-derived one. Mandate a security approval on every service inside
+  # the cardholder data environment regardless of how the ticket text reads.
+  # Replace the repo names with yours.
+  repo_required_roles:
+    payments-service: ["security"]
+    cardholder-data-service: ["security"]
+    key-management-service: ["security", "engineering"]
+
+  # Per-path required approval roles (evaluated diff-aware after a PR opens): a
+  # PR whose diff touches a cardholder-data or cryptographic subtree must carry a
+  # security sign-off, even in a repo that is not itself flagged as CDE. Strictly
+  # additive - it can only ever escalate a run to human review, never release
+  # one. Use it to catch sensitive code that lives across repo boundaries.
+  path_required_roles:
+    "**/cardholder/**": ["security"]
+    "**/pan/**": ["security"]        # primary account number handling
+    "**/crypto/**": ["security"]
+
+remediation:
+  # A single retry, CI failures only: a recurring failure on a PCI-scoped run
+  # should re-engage a human, not loop autonomously.
+  max_agent_retries: 1
+  retry_on:
+    - ci_failed
+
+budget:
+  max_cost_per_run: 6.0
+  estimated_cost_per_dispatch: 1.0
+
+approval:
+  # The two-person rule and per-repo/per-path role rules above are only
+  # satisfiable if enough DISTINCT approvers hold the required roles - e.g. a run
+  # routed to payments-service needs two distinct sign-offs whose combined roles
+  # include "security". List your real PCI change authorisers here; role grants
+  # are configured per user and are never asserted by the API caller.
+  approvers:
+    - email: "security-lead@example.com"
+      roles: ["security"]
+    - email: "security-officer@example.com"
+      roles: ["security"]
+    - email: "eng-lead@example.com"
+      roles: ["engineering"]
+    - email: "change-authoriser@example.com"
+      roles: ["engineering"]

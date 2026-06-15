@@ -89,6 +89,7 @@ def _run_explain(name: str) -> None:
     print(f"Effective policy for preset '{name}':\n")
     print(f"  repo_confidence_threshold : {summary['repo_confidence_threshold']}")
     print(f"  max_files_changed         : {summary['max_files_changed']}")
+    print(f"  min_approvals             : {summary['min_approvals']}")
     print(f"  max_agent_retries         : {summary['max_agent_retries']}")
     print(f"  retry_on                  : {', '.join(summary['retry_on']) or '-'}")
     cap = summary["max_cost_per_run"]
@@ -104,6 +105,16 @@ def _run_explain(name: str) -> None:
         print("\n  per-repo required approval roles (additive - only ever stricter):")
         for repo, roles in summary["repo_required_roles"].items():
             print(f"      {repo}: {', '.join(roles)}")
+
+    if summary["repo_min_approvals"]:
+        print("\n  per-repo minimum distinct approvers (additive - max with global):")
+        for repo, count in summary["repo_min_approvals"].items():
+            print(f"      {repo}: {count}")
+
+    if summary["path_required_roles"]:
+        print("\n  per-path required approval roles (diff-aware - only ever stricter):")
+        for glob, roles in summary["path_required_roles"].items():
+            print(f"      {glob}: {', '.join(roles)}")
 
     if summary["repo_forbidden_globs"]:
         print("\n  per-repo extra forbidden globs:")

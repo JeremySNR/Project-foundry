@@ -47,7 +47,12 @@ def test_catalogue_matches_files_on_disk_both_ways() -> None:
 
 def test_list_presets_have_names_and_summaries() -> None:
     presets = list_presets()
-    assert {p.name for p in presets} == {"baseline", "soc2", "change-management"}
+    assert {p.name for p in presets} == {
+        "baseline",
+        "soc2",
+        "change-management",
+        "pci-dss",
+    }
     for preset in presets:
         assert preset.summary.strip()
         assert preset.yaml_text.strip()
@@ -66,7 +71,7 @@ def test_unknown_preset_raises_with_available_names() -> None:
 # --------------------------------------------------------------------------- #
 # Every preset is valid, adoptable config
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("name", ["baseline", "soc2", "change-management"])
+@pytest.mark.parametrize("name", ["baseline", "soc2", "change-management", "pci-dss"])
 def test_preset_loads_into_valid_settings(name: str) -> None:
     settings = load_preset_settings(name)
     assert isinstance(settings, Settings)
@@ -75,7 +80,7 @@ def test_preset_loads_into_valid_settings(name: str) -> None:
     assert settings.policy_provider == "local"
 
 
-@pytest.mark.parametrize("name", ["baseline", "soc2", "change-management"])
+@pytest.mark.parametrize("name", ["baseline", "soc2", "change-management", "pci-dss"])
 def test_preset_never_drops_a_default_forbidden_glob(name: str) -> None:
     """A preset may add protected paths but must not remove a built-in one.
 
@@ -238,6 +243,48 @@ def test_change_management_requires_engineering_on_infra_repo() -> None:
     assert allowed.allowed is True
 
 
+def test_pci_dss_requires_security_signoff_on_cardholder_repo() -> None:
+    settings = load_preset_settings("pci-dss")
+    engine = _engine_for(settings)
+
+    # A cardholder-data-service run with only a generic approval is refused: the
+    # preset's per-repo rule demands a SECURITY role regardless of (here, low)
+    # risk - the engine path is identical to soc2's per-repo rule.
+    denied = engine.evaluate(
+        _start_input(settings, repo="cardholder-data-service", confidence=95)
+    )
+    assert denied.allowed is False
+    assert ApprovalRole.SECURITY in denied.required_approvals
+
+    # With the security sign-off recorded, the same run clears the gate.
+    allowed = engine.evaluate(
+        _start_input(
+            settings,
+            repo="cardholder-data-service",
+            confidence=95,
+            approvals={"security": True},
+        )
+    )
+    assert allowed.allowed is True
+
+
+def test_pci_dss_configures_the_modern_policy_knobs() -> None:
+    """The N-of-M and per-path knobs (enforced in the orchestrator lifecycle,
+    not the engine) parse as configured - the preset is real, adoptable config.
+    """
+    settings = load_preset_settings("pci-dss")
+    # Separation of duties: a two-person rule org-wide, raised to three for the
+    # key-management repo (effective minimum is max(global, per-repo)).
+    assert settings.min_approvals == 2
+    assert settings.repo_min_approvals_map["key-management-service"] == 3
+    # Per-path security sign-off over cardholder / cryptographic subtrees.
+    path_roles = settings.path_required_roles_map
+    assert path_roles["**/cardholder/**"] == ("security",)
+    assert path_roles["**/crypto/**"] == ("security",)
+    # The crypto/key material is also a sticky forbidden-path block.
+    assert "**/keys/**" in settings.forbidden_globs
+
+
 # --------------------------------------------------------------------------- #
 # Effective-policy summary (the `explain` data)
 # --------------------------------------------------------------------------- #
@@ -248,6 +295,26 @@ def test_effective_policy_summary_reflects_preset() -> None:
     assert "payments-service" in summary["repo_required_roles"]
     assert summary["repo_required_roles"]["payments-service"] == ["security"]
     assert set(DEFAULT_FORBIDDEN_GLOBS).issubset(set(summary["forbidden_globs"]))
+
+
+def test_effective_policy_summary_surfaces_n_of_m_and_path_roles() -> None:
+    """`explain` must reflect the whole gate, including the knobs that landed
+    after the library (N-of-M approvals and per-path roles) - otherwise it
+    under-reports what a config will enforce."""
+    summary = effective_policy_summary(load_preset_settings("pci-dss"))
+    assert summary["min_approvals"] == 2
+    assert summary["repo_min_approvals"] == {"key-management-service": 3}
+    assert summary["path_required_roles"]["**/cardholder/**"] == ["security"]
+    assert summary["path_required_roles"]["**/crypto/**"] == ["security"]
+
+
+def test_effective_policy_summary_defaults_when_knobs_unset() -> None:
+    """A preset that sets none of the newer knobs reports the inert defaults,
+    not a missing key (so `explain` never KeyErrors on an older config)."""
+    summary = effective_policy_summary(load_preset_settings("baseline"))
+    assert summary["min_approvals"] == 1
+    assert summary["repo_min_approvals"] == {}
+    assert summary["path_required_roles"] == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +346,18 @@ def test_cli_explain_prints_effective_knobs(
     out = capsys.readouterr().out
     assert "repo_confidence_threshold : 85" in out
     assert "platform-infra" in out
+
+
+def test_cli_explain_surfaces_n_of_m_and_path_roles(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from foundry.policy.cli import main
+
+    main(["explain", "pci-dss"])
+    out = capsys.readouterr().out
+    assert "min_approvals             : 2" in out
+    assert "key-management-service: 3" in out
+    assert "**/cardholder/**: security" in out
 
 
 def test_cli_unknown_preset_exits_nonzero(

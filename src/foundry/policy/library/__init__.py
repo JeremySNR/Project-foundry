@@ -64,6 +64,14 @@ _PRESETS: tuple[tuple[str, str, str], ...] = (
         "release/deploy paths kept off-limits to the agent, engineering sign-off "
         "on infrastructure repos, single-retry and a conservative budget cap.",
     ),
+    (
+        "pci-dss",
+        "pci_dss.yaml",
+        "PCI-DSS cardholder data environment: high routing confidence, a "
+        "two-person rule (separation of duties) raised to three for key "
+        "management, protected crypto/key paths, and per-repo plus per-path "
+        "security sign-off on cardholder-data and cryptographic surfaces.",
+    ),
 )
 
 
@@ -161,6 +169,17 @@ def effective_policy_summary(settings: "Settings") -> dict[str, Any]:
         },
         "repo_required_roles": {
             repo: list(roles) for repo, roles in settings.repo_required_roles
+        },
+        # N-of-M approval matrix (issue #31): the minimum DISTINCT human sign-offs
+        # a run needs, globally and per-repo (effective = max(global, per-repo)).
+        "min_approvals": settings.min_approvals,
+        "repo_min_approvals": {
+            repo: count for repo, count in settings.repo_min_approvals
+        },
+        # Per-path required approval roles (issue #31): path glob -> roles that
+        # must sign off when a PR's diff touches the subtree.
+        "path_required_roles": {
+            glob: list(roles) for glob, roles in settings.path_required_roles
         },
         "max_agent_retries": settings.max_agent_retries,
         "retry_on": list(settings.retry_on),

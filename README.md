@@ -208,7 +208,7 @@ approval:
       roles: ["security"]
 ```
 
-Rather than start from a blank policy block, copy a vetted preset: Foundry ships a **starter policy library** (`baseline`, `soc2`, `change-management`) built only from the knobs above. `foundry-policy presets` lists them, `foundry-policy show soc2` prints one to paste into your config, and `foundry-policy explain soc2` shows the gate knobs it resolves to (threshold, protected paths, per-repo sign-offs, caps). The presets are copy-to-adopt — browsing the library never changes a running deployment — and each is strict-or-stricter than the built-in defaults, so adopting one only ever tightens the gate.
+Rather than start from a blank policy block, copy a vetted preset: Foundry ships a **starter policy library** (`baseline`, `soc2`, `change-management`, `pci-dss`) built only from the knobs above. `foundry-policy presets` lists them, `foundry-policy show soc2` prints one to paste into your config, and `foundry-policy explain soc2` shows the gate knobs it resolves to (threshold, protected paths, per-repo sign-offs, the two-person-rule approval count, per-path roles, caps). The `pci-dss` preset exercises the full modern surface — an org-wide two-person rule (`min_approvals`, separation of duties), per-path `security` sign-off on cardholder/crypto subtrees, and protected key material. The presets are copy-to-adopt — browsing the library never changes a running deployment — and each is strict-or-stricter than the built-in defaults, so adopting one only ever tightens the gate.
 
 Secrets via env:
 
