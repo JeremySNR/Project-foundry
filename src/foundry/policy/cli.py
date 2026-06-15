@@ -5,6 +5,7 @@ Usage::
     foundry-policy presets                 # list the shipped presets
     foundry-policy show <name>             # print a preset's YAML (copy-to-adopt)
     foundry-policy explain <name>          # show the gate knobs a preset resolves to
+    foundry-policy check --against <name>  # verify YOUR config meets a baseline
 
 This is decision-support and documentation only - it **never** changes a running
 deployment's policy. ``presets`` lists what the library ships; ``show`` prints a
@@ -13,6 +14,13 @@ repo names / approvers; ``explain`` loads the preset through the same
 ``Settings`` validator your config uses and prints the effective gate knobs (the
 confidence threshold, protected paths, per-repo overrides and the retry/budget
 caps), so you can see a preset's effect without standing up a run.
+
+``check`` is the verification counterpart to ``explain``: it loads *your* config
+(``--config`` or ``FOUNDRY_CONFIG``) and a baseline (a preset name or a path to
+another config) and reports, control by control, whether your config is *at
+least as strict* as the baseline - exiting non-zero when it is weaker, so it
+drops straight into a compliance CI pipeline. The comparison is read-only and
+uses only the already-gated knobs, so it adds no policy mechanism.
 
 The presets are committed YAML built only from existing, already-gated config
 knobs - they add no new policy mechanism and touch neither ``policy/engine.py``
@@ -44,6 +52,23 @@ def main(argv: list[str] | None = None) -> None:
     )
     explain_p.add_argument("name", help="Preset name (see 'foundry-policy presets').")
 
+    check_p = sub.add_parser(
+        "check",
+        help="Verify your config is at least as strict as a baseline (exits "
+        "non-zero if weaker).",
+    )
+    check_p.add_argument(
+        "--config",
+        help="Path to the config to check (defaults to $FOUNDRY_CONFIG).",
+    )
+    check_p.add_argument(
+        "--against",
+        required=True,
+        metavar="PRESET_OR_PATH",
+        help="Baseline to check against: a preset name (e.g. 'soc2') or a path "
+        "to another config file.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "presets":
         _run_presets()
@@ -51,6 +76,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_show(args.name)
     elif args.command == "explain":
         _run_explain(args.name)
+    elif args.command == "check":
+        _run_check(args.config, args.against)
 
 
 def _run_presets() -> None:
@@ -120,3 +147,48 @@ def _run_explain(name: str) -> None:
         print("\n  per-repo extra forbidden globs:")
         for repo, globs in summary["repo_forbidden_globs"].items():
             print(f"      {repo}: {', '.join(globs)}")
+
+
+def _run_check(config_path: str | None, against: str) -> None:
+    import os
+
+    from foundry.config import Settings
+    from foundry.policy.library import compare_policy_strictness, resolve_settings
+
+    source = config_path or os.environ.get("FOUNDRY_CONFIG")
+    if not source:
+        print(
+            "error: no config to check; pass --config PATH or set FOUNDRY_CONFIG",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    from pathlib import Path
+
+    if not Path(source).exists():
+        print(f"error: config file not found: {source}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        subject = Settings.load(source, env=os.environ)
+        baseline = resolve_settings(against)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    comparison = compare_policy_strictness(subject, baseline)
+    print(f"Checking '{source}' against baseline '{against}':\n")
+    for finding in comparison.findings:
+        marker = "PASS" if finding.ok else "FAIL"
+        print(f"  {marker}  {finding.knob:<26}: {finding.detail}")
+
+    print()
+    if comparison.ok:
+        print(f"RESULT: PASS - config meets or exceeds baseline '{against}'.")
+    else:
+        weak = len(comparison.weaknesses)
+        print(
+            f"RESULT: FAIL - config is weaker than baseline '{against}' on "
+            f"{weak} control(s)."
+        )
+        sys.exit(1)
