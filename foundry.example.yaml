@@ -277,6 +277,18 @@ dashboard:
   # partial sign-off does not reset it.
   approval_sla_seconds: 14400  # 4h
 
+  # Execution SLA: how long (seconds) a run may sit dispatched to an agent
+  # (AGENT_RUNNING - agent working, no PR opened yet) before the fleet strip and
+  # GET /metrics/executions flag it as breaching. The machine-state complement to
+  # approval_sla_seconds: the hung/runaway-agent signal that turns the bare
+  # "agents running" count into "and 1 has been running over the SLA". Read-only:
+  # it changes no policy gate and blocks no run. Omit it (the default) for no SLA -
+  # the oldest run-time is still shown, but nothing is flagged. Env override:
+  # FOUNDRY_EXECUTION_SLA_SECONDS (empty string disables it). The clock is dated
+  # from the run's latest AGENT_STARTED event, so a retry re-dispatch resets it to
+  # the current attempt.
+  execution_sla_seconds: 3600  # 1h
+
 auth:
   # OIDC bearer auth for the token-gated API + dashboard (issue #34). OPTIONAL
   # and additive: when configured, a valid OIDC JWT from your IdP is accepted on

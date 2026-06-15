@@ -73,6 +73,15 @@ _ALL_WAIT_START_EVENTS = tuple(
     {e for events in _WAIT_START_EVENTS_BY_STATUS.values() for e in events}
 )
 
+# Run states where Foundry is actively waiting on the *agent* (not a human) and
+# spending budget: dispatched to an agent, no PR opened yet. The machine-side
+# complement to HUMAN_WAIT_STATUSES. Kept tight to AGENT_RUNNING: PR_OPEN /
+# REVIEW_REQUIRED are waiting on CI or reviewers (the product deliberately stops
+# at a reviewed PR), not on the agent. The wait clock is dated from the *latest*
+# AGENT_STARTED event - the dispatch that put the run in flight, so a retry
+# re-dispatch correctly resets the age to the current attempt.
+EXECUTION_IN_FLIGHT_STATUSES = (RunStatus.AGENT_RUNNING,)
+
 
 def _percentile(sorted_values: list[int], fraction: float) -> int | None:
     if not sorted_values:
@@ -418,8 +427,96 @@ def approval_queue(
     }
 
 
+def _dispatch_since_map(session, runs: list[FoundryRun]) -> dict[str, datetime]:
+    """For each run, the time it was last dispatched to an agent - the latest
+    ``AGENT_STARTED`` event. A run can be re-dispatched (a remediation retry),
+    so the *latest* such event is when the *current* in-flight attempt began.
+
+    Runs that carry no dispatch event yet are absent from the map; the caller
+    falls back to the run's immutable ``created_at``.
+    """
+    if not runs:
+        return {}
+    rows = (
+        session.query(
+            FoundryAuditEvent.run_id,
+            func.max(FoundryAuditEvent.created_at),
+        )
+        .filter(
+            FoundryAuditEvent.run_id.in_([r.id for r in runs]),
+            FoundryAuditEvent.event_type == AuditEventType.AGENT_STARTED,
+        )
+        .group_by(FoundryAuditEvent.run_id)
+        .all()
+    )
+    return {run_id: created_at for run_id, created_at in rows if created_at is not None}
+
+
+def execution_queue(
+    session, *, now: datetime | None = None, sla_seconds: int | None = None
+) -> dict:
+    """In-flight agent runs with per-run run-time age - the machine-state
+    complement to :func:`approval_queue`, and the drill-down behind the fleet
+    strip's ``agents_running`` count.
+
+    Every run currently dispatched to an agent and not yet at a PR
+    (:data:`EXECUTION_IN_FLIGHT_STATUSES`), oldest first, each with how long it
+    has been running (``running_seconds``, dated from the latest
+    ``AGENT_STARTED`` audit event - the dispatch that put it in flight). When
+    ``sla_seconds`` is set, runs running at least that long are flagged
+    ``sla_breached`` and counted in the ``sla_breaches`` summary - the signal a
+    VP/on-call wants for a hung or runaway agent silently burning budget; with
+    no SLA the breach signal is inert (``sla_breaches`` is 0), matching the
+    historical behaviour byte-for-byte.
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(EXECUTION_IN_FLIGHT_STATUSES))
+        .all()
+    )
+    dispatched_since = _dispatch_since_map(session, runs)
+
+    entries: list[dict] = []
+    for run in runs:
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a run somehow has no dispatch event recorded yet.
+        since = dispatched_since.get(run.id) or run.created_at
+        # Clamp at 0: a future-dated row (clock skew) is not negative run time.
+        ran = max(0, int((now - _as_utc(since)).total_seconds()))
+        breached = sla_seconds is not None and ran >= sla_seconds
+        status = run.status.value if isinstance(run.status, RunStatus) else str(run.status)
+        entries.append(
+            {
+                "run_id": run.id,
+                "linear_issue_key": run.linear_issue_key,
+                "status": status,
+                "current_step": run.current_step,
+                "risk_level": run.risk_level.value if run.risk_level is not None else None,
+                "running_since": _as_utc(since).isoformat(),
+                "running_seconds": ran,
+                "sla_breached": breached,
+            }
+        )
+
+    entries.sort(key=lambda e: e["running_seconds"], reverse=True)
+    breaches = sum(1 for e in entries if e["sla_breached"])
+    return {
+        "now": now.isoformat(),
+        "sla_seconds": sla_seconds,
+        "count": len(entries),
+        "oldest_running_seconds": entries[0]["running_seconds"] if entries else None,
+        "sla_breaches": breaches,
+        "runs": entries,
+    }
+
+
 def fleet_status(
-    session, *, sla_seconds: int | None = None, now: datetime | None = None
+    session,
+    *,
+    sla_seconds: int | None = None,
+    execution_sla_seconds: int | None = None,
+    now: datetime | None = None,
 ) -> dict:
     """Live operational snapshot — every run's *current* state across the org.
 
@@ -473,6 +570,10 @@ def fleet_status(
     # Reuses the same derivation the GET /metrics/approvals drill-down serves, so
     # the strip summary and the queue list can never disagree.
     queue = approval_queue(session, now=now, sla_seconds=sla_seconds)
+    # The machine-side equivalent for ``agents_running``: the oldest in-flight
+    # agent run and how many have breached the execution SLA. Same derivation the
+    # GET /metrics/executions drill-down serves, so they can never disagree.
+    execution = execution_queue(session, now=now, sla_seconds=execution_sla_seconds)
 
     return {
         "total_runs": sum(by_status.values()),
@@ -483,6 +584,9 @@ def fleet_status(
         "approval_sla_seconds": sla_seconds,
         "approvals_breaching_sla": queue["sla_breaches"],
         "agents_running": _count(RunStatus.AGENT_RUNNING),
+        "oldest_execution_seconds": execution["oldest_running_seconds"],
+        "execution_sla_seconds": execution_sla_seconds,
+        "executions_breaching_sla": execution["sla_breaches"],
         "prs_open": _count(RunStatus.PR_OPEN),
         "active_cost_usd": round(active_cost, 2) if active_cost is not None else None,
         "by_status": by_status,

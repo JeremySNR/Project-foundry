@@ -455,6 +455,67 @@ def test_approvals_reflects_configured_sla() -> None:
     assert fleet["approval_sla_seconds"] == 14_400
 
 
+def test_executions_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/executions").status_code == 401
+    assert (
+        client.get(
+            "/metrics/executions", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_executions_empty_database(client) -> None:
+    body = client.get("/metrics/executions", headers=AUTH).json()
+    assert body["count"] == 0
+    assert body["runs"] == []
+    assert body["oldest_running_seconds"] is None
+    assert body["sla_breaches"] == 0
+    assert body["sla_seconds"] is None
+
+
+def test_executions_lists_in_flight_agent_run(client) -> None:
+    # Drive a run to agent_running: ready ticket -> approve -> dispatched.
+    _post_webhook(client, _ready_payload("issue-a", "LIN-500"), delivery="d-a")
+    run_a = _latest_run_id(client)
+    client.post(
+        f"/runs/{run_a}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+    body = client.get("/metrics/executions", headers=AUTH).json()
+    assert body["count"] == 1
+    entry = body["runs"][0]
+    assert entry["run_id"] == run_a
+    assert entry["status"] == "agent_running"
+    assert entry["running_seconds"] >= 0
+    assert entry["sla_breached"] is False  # no SLA configured
+
+
+def test_fleet_includes_execution_queue_summary() -> None:
+    client = _client_with(execution_sla_seconds=3600)  # 1h
+    # No agent running yet: the strip's execution summary is empty/inert.
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["execution_sla_seconds"] == 3600
+    assert body["executions_breaching_sla"] == 0
+    assert body["oldest_execution_seconds"] is None
+
+    # Dispatch an agent; the strip now reports a non-negative oldest run-time.
+    _post_webhook(client, _ready_payload("issue-a", "LIN-500"), delivery="d-a")
+    run_a = _latest_run_id(client)
+    client.post(
+        f"/runs/{run_a}/approval",
+        json={"user": "lead@example.com", "text": "/foundry approve"},
+        headers=AUTH,
+    )
+    body = client.get("/metrics/fleet", headers=AUTH).json()
+    assert body["agents_running"] == 1
+    assert body["oldest_execution_seconds"] is not None
+    assert body["oldest_execution_seconds"] >= 0
+    # A just-dispatched run hasn't breached a 1h SLA.
+    assert body["executions_breaching_sla"] == 0
+
+
 def test_final_summary_appears_in_timeline(client) -> None:
     _run_to_merged(client)
     run_id = _latest_run_id(client)

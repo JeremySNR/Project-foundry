@@ -1,15 +1,17 @@
 """The Foundry dashboard: one static page, zero build step, zero new deps.
 
 Read-only visibility over the audit data that already exists: a live fleet
-strip (runs in flight / approval queue / spend in flight, from the current run
-states), the delivery metrics strip, a delivery-trend-over-time table, the
-agent scorecards, a per-agent merge-confidence trend (is each agent improving?),
-an epic board (multi-repo runs rolled up, issue #35), the run
-list (with an approval-queue filter) and, per run, the full decision timeline
-(artifacts, audit events, policy decisions, agent jobs). All data comes from
-``GET /runs``, ``GET /metrics/fleet``, ``GET /metrics/delivery``,
-``GET /metrics/delivery/trends``, ``GET /metrics/agents``,
-``GET /metrics/agents/trends``, ``GET /epics`` and
+strip (runs in flight / approval queue / execution queue / spend in flight, from
+the current run states), an approval-queue panel and an execution-queue panel
+(in-flight agent runs with run-time age + SLA, issue #37), the delivery metrics
+strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
+merge-confidence trend (is each agent improving?), an epic board (multi-repo
+runs rolled up, issue #35), the run list (with an approval-queue filter) and,
+per run, the full decision timeline (artifacts, audit events, policy decisions,
+agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
+``GET /metrics/approvals``, ``GET /metrics/executions``,
+``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
+``GET /metrics/agents``, ``GET /metrics/agents/trends``, ``GET /epics`` and
 ``GET /runs/{id}/timeline``; the calls carry the bearer token the user pastes
 once (kept in localStorage, never sent anywhere but this API).
 
@@ -99,7 +101,7 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #fleet, #metrics, #agents, #trends, #agent-trends, #epics, #queue {
+  #fleet, #metrics, #agents, #trends, #agent-trends, #epics, #queue, #exec-queue {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
@@ -161,15 +163,15 @@ DASHBOARD_HTML = """<!doctype html>
     border-color: var(--accent); color: var(--accent);
   }
   .queue-filter .count { color: var(--muted); }
-  #queue summary { color: var(--text); cursor: pointer; }
-  #queue .run {
+  #queue summary, #exec-queue summary { color: var(--text); cursor: pointer; }
+  #queue .run, #exec-queue .run {
     padding: 6px 0; border-bottom: 1px dashed var(--border); cursor: pointer;
   }
-  #queue .run:last-child { border-bottom: none; }
-  #queue .run:hover .key { color: var(--accent); }
-  #queue .run.breach { border-left: 3px solid var(--red); padding-left: 8px; }
-  #queue .age { margin-left: 8px; font-variant-numeric: tabular-nums; }
-  #queue .age.bad { color: var(--red); font-weight: 600; }
+  #queue .run:last-child, #exec-queue .run:last-child { border-bottom: none; }
+  #queue .run:hover .key, #exec-queue .run:hover .key { color: var(--accent); }
+  #queue .run.breach, #exec-queue .run.breach { border-left: 3px solid var(--red); padding-left: 8px; }
+  #queue .age, #exec-queue .age { margin-left: 8px; font-variant-numeric: tabular-nums; }
+  #queue .age.bad, #exec-queue .age.bad { color: var(--red); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -184,6 +186,7 @@ DASHBOARD_HTML = """<!doctype html>
 </header>
 <div id="fleet"></div>
 <div id="queue"></div>
+<div id="exec-queue"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -432,10 +435,20 @@ async function loadFleet() {
     const breaching = f.approvals_breaching_sla
       ? `<span class="stat bad"><b>${f.approvals_breaching_sla}</b> over SLA</span>`
       : "";
+    // The machine-side equivalent: oldest in-flight agent run + executions over
+    // the execution SLA (issue #37). Both omitted when no agent is running.
+    const oldestExec = f.agents_running
+      ? `<span class="stat"><b>${dur(f.oldest_execution_seconds)}</b> oldest run</span>`
+      : "";
+    const execBreaching = f.executions_breaching_sla
+      ? `<span class="stat bad"><b>${f.executions_breaching_sla}</b> over SLA</span>`
+      : "";
     el.innerHTML = `
       <span class="label">Fleet now</span>
       <span class="stat"><b>${f.runs_active}</b> in flight</span>
       <span class="stat"><b>${f.agents_running}</b> agents running</span>
+      ${oldestExec}
+      ${execBreaching}
       <span class="stat ${f.awaiting_human ? "bad" : ""}"><b>${f.awaiting_human}</b> awaiting a human</span>
       ${oldest}
       ${breaching}
@@ -471,6 +484,38 @@ async function loadApprovals() {
       ? ` &middot; ${q.sla_breaches} of ${q.count} over the ${dur(q.sla_seconds)} SLA`
       : "";
     el.innerHTML = `<details open><summary>approval queue &mdash; ${q.count} parked on a human, oldest first${sla}</summary>${rows}</details>`;
+    el.style.display = "block";
+    el.querySelectorAll(".run[data-id]").forEach((node) => {
+      node.addEventListener("click", () => loadTimeline(node.dataset.id));
+    });
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
+async function loadExecutions() {
+  const el = $("#exec-queue");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/executions", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const q = await resp.json();
+    const runs = q.runs || [];
+    if (!runs.length) { el.style.display = "none"; return; }  // nothing running: hide
+    const rows = runs.map((r) => `
+      <div class="run ${r.sla_breached ? "breach" : ""}" data-id="${esc(r.run_id)}" title="open timeline">
+        <span class="key">${esc(r.linear_issue_key)}</span>${badge(r.status)}
+        <span class="age ${r.sla_breached ? "bad" : ""}">${dur(r.running_seconds)} running</span>
+        <div class="meta">${esc(r.run_id)} &middot; ${esc(r.risk_level || "unclassified")} risk
+          &middot; ${esc(r.current_step || "-")}</div>
+      </div>`).join("");
+    const sla = q.sla_seconds
+      ? ` &middot; ${q.sla_breaches} of ${q.count} over the ${dur(q.sla_seconds)} SLA`
+      : "";
+    el.innerHTML = `<details open><summary>execution queue &mdash; ${q.count} agent${q.count === 1 ? "" : "s"} running, oldest first${sla}</summary>${rows}</details>`;
     el.style.display = "block";
     el.querySelectorAll(".run[data-id]").forEach((node) => {
       node.addEventListener("click", () => loadTimeline(node.dataset.id));
@@ -674,6 +719,7 @@ function refresh() {
   loadRuns();
   loadFleet();
   loadApprovals();
+  loadExecutions();
   loadMetrics();
   loadTrends();
   loadAgents();
