@@ -1476,6 +1476,33 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **failures_by_repo(session, since=since)}
 
+    @app.get("/metrics/failures/by-work-type")
+    def metrics_failures_by_work_type(
+        request: Request, days: int = 7
+    ) -> dict[str, Any]:
+        """Recently-failed runs **rolled up by work type** - the work-type-axis
+        triage cut that complements ``GET /metrics/failures/by-category`` and
+        ``GET /metrics/failures/by-repo``. Where those answer *what reason* and
+        *which repo*, this answers *which kind of work* is failing - the "do bugs
+        fail while features ship?" question, the failure-side mirror of
+        ``GET /metrics/delivery/by-work-type``. Work types are ordered
+        most-frequent first; runs that were never classified bucket under an
+        explicit ``(unclassified)`` sentinel.
+
+        Reuses the same failure-event derivation the feed and the other roll-ups
+        serve, so the totals can't drift. Read-only, changes no gate: a blocked
+        run stays blocked (invariant #7). Token-gated and fail-closed like the
+        other metrics endpoints.
+        """
+        from foundry.memory.metrics import failures_by_work_type
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **failures_by_work_type(session, since=since)}
+
     @app.get("/metrics/failures/trends")
     def metrics_failures_trends(
         request: Request, days: int = 30, bucket: str = "day"

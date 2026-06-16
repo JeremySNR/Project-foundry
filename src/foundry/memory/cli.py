@@ -12,6 +12,7 @@ Usage::
     foundry-memory failures [--days D]
     foundry-memory failures-by-category [--days D]
     foundry-memory failures-by-repo [--days D]
+    foundry-memory failures-by-work-type [--days D]
     foundry-memory failures-trends [--bucket day|week] [--days D]
     foundry-memory approvals
     foundry-memory executions
@@ -188,6 +189,18 @@ def main() -> None:
         help="Only count runs that failed in the last N days (default: 7).",
     )
 
+    fail_wt_p = sub.add_parser(
+        "failures-by-work-type",
+        help="Print recent failures grouped by work type, most-frequent first "
+        "(offline twin of GET /metrics/failures/by-work-type).",
+    )
+    fail_wt_p.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Only count runs that failed in the last N days (default: 7).",
+    )
+
     fail_trends_p = sub.add_parser(
         "failures-trends",
         help="Print recent failures bucketed over time, oldest period first "
@@ -305,6 +318,8 @@ def main() -> None:
         _run_failures_by_category(args)
     elif args.command == "failures-by-repo":
         _run_failures_by_repo(args)
+    elif args.command == "failures-by-work-type":
+        _run_failures_by_work_type(args)
     elif args.command == "failures-trends":
         _run_failures_trends(args)
     elif args.command == "approvals":
@@ -689,6 +704,37 @@ def _run_failures_by_repo(args: argparse.Namespace) -> None:
             f"{repo['repo']:<40} {repo['count']:<7} {repo['blocked']:<8} "
             f"{repo['failed']:<7} {_fmt_age(repo['newest_failure_seconds']):<9} "
             f"{_fmt_age(repo['oldest_failure_seconds'])}"
+        )
+
+
+def _run_failures_by_work_type(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import failures_by_work_type
+
+    since = _since_from_days(args.days)
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = failures_by_work_type(session, since=since)
+
+    work_types = report["work_types"]
+    if not work_types:
+        print(f"No runs failed in the last {args.days}d - nothing to triage.")
+        return
+
+    print(
+        f"Failures by work type (last {args.days}d): {report['count']} total across "
+        f"{report['distinct_work_types']} work type(s), {report['blocked']} blocked, "
+        f"{report['failed']} execution-failed (most frequent first):\n"
+    )
+    print(
+        f"{'work type':<20} {'count':<7} {'blocked':<8} {'failed':<7} "
+        f"{'newest':<9} oldest"
+    )
+    for wt in work_types:
+        print(
+            f"{wt['work_type']:<20} {wt['count']:<7} {wt['blocked']:<8} "
+            f"{wt['failed']:<7} {_fmt_age(wt['newest_failure_seconds']):<9} "
+            f"{_fmt_age(wt['oldest_failure_seconds'])}"
         )
 
 

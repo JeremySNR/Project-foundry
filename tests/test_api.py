@@ -909,6 +909,18 @@ def test_dashboard_renders_failures_by_repo_panel() -> None:
     assert "loadFailureRepos();" in DASHBOARD_HTML
 
 
+def test_dashboard_renders_failures_by_work_type_panel() -> None:
+    """The failures-by-work-type panel (issue #37) must fetch the by-work-type
+    endpoint, have a panel to render into, and be wired into the refresh loop —
+    the work-type-axis complement to the by-repo/by-category roll-ups ("do bugs
+    fail while features ship?")."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/failures/by-work-type' in DASHBOARD_HTML
+    assert '<div id="failure-work-types"></div>' in DASHBOARD_HTML
+    assert "loadFailureWorkTypes();" in DASHBOARD_HTML
+
+
 def test_dashboard_renders_failure_trend_panel() -> None:
     """The failure-trend panel (issue #37) must fetch the failures/trends
     endpoint, have a panel to render into, and be wired into the refresh loop —

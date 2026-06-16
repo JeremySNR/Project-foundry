@@ -1276,6 +1276,65 @@ def test_failures_by_repo_matches_feed_totals(client) -> None:
     assert sum(r["count"] for r in agg["repos"]) == feed["count"]
 
 
+# -- GET /metrics/failures/by-work-type (failure work-type cut, issue #37) ----
+
+
+def test_failures_by_work_type_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/failures/by-work-type").status_code == 401
+    assert (
+        client.get(
+            "/metrics/failures/by-work-type",
+            headers={"Authorization": "Bearer wrong"},
+        ).status_code
+        == 401
+    )
+
+
+def test_failures_by_work_type_rejects_bad_window(client) -> None:
+    assert (
+        client.get(
+            "/metrics/failures/by-work-type?days=0", headers=AUTH
+        ).status_code
+        == 422
+    )
+
+
+def test_failures_by_work_type_empty_database(client) -> None:
+    body = client.get("/metrics/failures/by-work-type", headers=AUTH).json()
+    assert body["days"] == 7
+    assert body["count"] == 0
+    assert body["blocked"] == 0
+    assert body["failed"] == 0
+    assert body["distinct_work_types"] == 0
+    assert body["work_types"] == []
+
+
+def test_failures_by_work_type_rolls_up_blocked_run(client) -> None:
+    _run_to_blocked(client)
+    body = client.get("/metrics/failures/by-work-type", headers=AUTH).json()
+    assert body["count"] == 1
+    assert body["blocked"] == 1
+    assert body["failed"] == 0
+    assert body["distinct_work_types"] == 1
+    wt = body["work_types"][0]
+    # A real run carries a classified work type from its TICKET_ANALYSIS artifact.
+    assert isinstance(wt["work_type"], str) and wt["work_type"]
+    assert wt["count"] == 1
+    assert wt["blocked"] == 1
+    assert wt["newest_failure_seconds"] >= 0
+    assert wt["oldest_failure_seconds"] >= 0
+
+
+def test_failures_by_work_type_matches_feed_totals(client) -> None:
+    _run_to_blocked(client, issue_id="issue-w1", key="LIN-931")
+    _run_to_blocked(client, issue_id="issue-w2", key="LIN-932")
+    feed = client.get("/metrics/failures", headers=AUTH).json()
+    agg = client.get("/metrics/failures/by-work-type", headers=AUTH).json()
+    assert feed["count"] == agg["count"] == 2
+    assert feed["blocked"] == agg["blocked"]
+    assert sum(w["count"] for w in agg["work_types"]) == feed["count"]
+
+
 # -- GET /metrics/failures/trends (failure over-time cut, issue #37) ----------
 
 

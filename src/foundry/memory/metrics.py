@@ -16,8 +16,10 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 
 from foundry.db.models import (
+    ArtifactType,
     AuditEventType,
     FoundryAgentJob,
+    FoundryArtifact,
     FoundryAuditEvent,
     FoundryRun,
     FoundryRunOutcome,
@@ -1188,6 +1190,43 @@ def _run_repo_map(session, runs: list[FoundryRun]) -> dict[str, str | None]:
     }
 
 
+def _run_work_type_map(session, runs: list[FoundryRun]) -> dict[str, str | None]:
+    """For each run, the work type the ticket was classified as.
+
+    ``FoundryRun`` carries no ``work_type`` column (it is stored only on the
+    denormalized ``FoundryRunOutcome``, which a still-active or never-finished run
+    may not have), so this derives it the same way
+    :func:`foundry.memory.outcomes.record_outcome` does when it stamps
+    ``FoundryRunOutcome.work_type``: from the ``work_type`` field of the run's
+    latest ``TICKET_ANALYSIS`` artifact. A run with no analysis artifact (or one
+    whose analysis never carried a work type) maps to ``None`` - correctly counted
+    as unclassified by the caller, mirroring :func:`_run_repo_map`'s unrouted
+    ``None``.
+    """
+    if not runs:
+        return {}
+    rows = (
+        session.query(FoundryArtifact)
+        .filter(
+            FoundryArtifact.run_id.in_([r.id for r in runs]),
+            FoundryArtifact.artifact_type == ArtifactType.TICKET_ANALYSIS,
+        )
+        # Ascending so the last row per run wins - the latest analysis, exactly the
+        # ordering record_outcome's _latest_artifact_contents uses.
+        .order_by(FoundryArtifact.version, FoundryArtifact.created_at)
+        .all()
+    )
+    latest: dict[str, str | None] = {}
+    for row in rows:
+        try:
+            content = json.loads(row.content_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(content, dict):
+            latest[row.run_id] = content.get("work_type")
+    return {run.id: latest.get(run.id) for run in runs}
+
+
 def failure_queue(
     session, *, since: datetime, now: datetime | None = None
 ) -> dict:
@@ -1465,6 +1504,111 @@ def failures_by_repo(
         "failed": failed_total,
         "distinct_repos": len(repos),
         "repos": repos,
+    }
+
+
+def failures_by_work_type(
+    session, *, since: datetime, now: datetime | None = None
+) -> dict:
+    """Recently-failed runs **rolled up by work type** - the work-type-axis triage
+    cut that complements :func:`failures_by_category` and :func:`failures_by_repo`.
+
+    Where :func:`failures_by_category` answers *what reason* runs are failing for
+    and :func:`failures_by_repo` answers *which repo* the failures land in, this
+    answers *which kind of work* is failing - the on-call's "do bugs fail while
+    features ship?" question, the failure-side mirror of
+    :func:`delivery_by_work_type`. The delivery surface already has both a repo and
+    a work-type cut; the failure surface had a by-category roll-up, a by-repo
+    roll-up and a trend but no work-type grouping until this.
+
+    Every run currently in a terminal-failure state (:data:`FAILURE_STATUSES`)
+    whose failure happened within the window (at or after ``since``) is grouped by
+    its work type - the ``work_type`` of its latest ``TICKET_ANALYSIS`` artifact,
+    via :func:`_run_work_type_map` (the same field ``record_outcome`` stamps onto
+    ``FoundryRunOutcome.work_type``, since ``FoundryRun`` itself carries no
+    work-type column). A run that was never classified buckets under
+    :data:`UNCLASSIFIED_WORK_TYPE_LABEL`, exactly as an unclassified outcome does
+    in :func:`delivery_by_work_type`. Failure time and the blocked/failed split
+    come from the **same** :func:`_failure_event_map` /
+    :data:`_FAILURE_EVENTS_BY_STATUS` derivation the feed, the by-category roll-up,
+    the by-repo roll-up and the trend use, so the totals here can never drift from
+    theirs.
+
+    Each work type carries its ``count`` (with a ``blocked``/``failed`` split), the
+    ``newest_failure_seconds`` / ``oldest_failure_seconds`` age span of its
+    members, and the ``last_failure`` ISO timestamp. Work types are ordered
+    **most-frequent first**, ties broken by most-recent then name - the same
+    "fix this first" order as the by-category and by-repo cuts.
+
+    Read-only - it surfaces what already happened and blocks/merges nothing. A
+    blocked run stays blocked (invariant #7).
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    since = _as_utc(since)
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(FAILURE_STATUSES))
+        .all()
+    )
+    failed_map = _failure_event_map(session, runs)
+    work_type_map = _run_work_type_map(session, runs)
+
+    buckets: dict[str, dict] = {}
+    total = blocked_total = failed_total = 0
+    for run in runs:
+        marked = failed_map.get(run.id)
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a failed run carries no marker event - same rule as the feed.
+        failed_at = _as_utc(marked[0] if marked is not None else run.created_at)
+        if failed_at < since:
+            continue  # an older incident, outside the window
+        elapsed = max(0, int((now - failed_at).total_seconds()))
+        is_blocked = run.status == RunStatus.BLOCKED
+        work_type = work_type_map.get(run.id) or UNCLASSIFIED_WORK_TYPE_LABEL
+
+        bucket = buckets.get(work_type)
+        if bucket is None:
+            bucket = buckets[work_type] = {
+                "work_type": work_type,
+                "count": 0,
+                "blocked": 0,
+                "failed": 0,
+                "newest_failure_seconds": elapsed,
+                "oldest_failure_seconds": elapsed,
+                "last_failure": failed_at,
+            }
+        bucket["count"] += 1
+        if is_blocked:
+            bucket["blocked"] += 1
+            blocked_total += 1
+        else:
+            bucket["failed"] += 1
+            failed_total += 1
+        # Smallest elapsed = most recent; largest = oldest.
+        bucket["newest_failure_seconds"] = min(bucket["newest_failure_seconds"], elapsed)
+        bucket["oldest_failure_seconds"] = max(bucket["oldest_failure_seconds"], elapsed)
+        if failed_at > bucket["last_failure"]:
+            bucket["last_failure"] = failed_at
+        total += 1
+
+    work_types = list(buckets.values())
+    # Most-frequent first; ties to the most-recently-seen (smallest newest age),
+    # then work-type name for a stable, deterministic order - same as by-category
+    # and by-repo.
+    work_types.sort(
+        key=lambda w: (-w["count"], w["newest_failure_seconds"], w["work_type"])
+    )
+    for w in work_types:
+        w["last_failure"] = w["last_failure"].isoformat()
+
+    return {
+        "now": now.isoformat(),
+        "since": since.isoformat(),
+        "count": total,
+        "blocked": blocked_total,
+        "failed": failed_total,
+        "distinct_work_types": len(work_types),
+        "work_types": work_types,
     }
 
 

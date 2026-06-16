@@ -13,8 +13,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import json
+
 from foundry.db import FoundryRun, create_all, make_engine, make_session_factory
-from foundry.db.models import AuditEventType, FoundryAgentJob, FoundryAuditEvent
+from foundry.db.models import (
+    ArtifactType,
+    AuditEventType,
+    FoundryAgentJob,
+    FoundryArtifact,
+    FoundryAuditEvent,
+)
 from foundry.memory.cli import main
 from foundry.schemas.common import OverallRisk, RunStatus
 
@@ -35,6 +43,7 @@ def _add_run(
     risk: OverallRisk | None = None,
     current_step: str | None = None,
     repo: str | None = None,
+    work_type: str | None = None,
 ) -> str:
     global _counter
     _counter += 1
@@ -63,6 +72,21 @@ def _add_run(
                 provider="fake",
                 repo=repo,
                 started_at=created_at,
+            )
+        )
+    # Nor a work_type column; it is derived from the latest TICKET_ANALYSIS
+    # artifact (the same field record_outcome reads).
+    if work_type is not None:
+        _counter += 1
+        session.add(
+            FoundryArtifact(
+                id=f"a-{_counter}",
+                run_id=rid,
+                artifact_type=ArtifactType.TICKET_ANALYSIS,
+                version=1,
+                content_json=json.dumps({"work_type": work_type}),
+                content_hash=f"h-{_counter}",
+                created_at=created_at,
             )
         )
     return rid
@@ -344,6 +368,69 @@ def test_failures_by_repo_rejects_bad_window(monkeypatch, db_url) -> None:
     monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
     monkeypatch.setattr(
         "sys.argv", ["foundry-memory", "failures-by-repo", "--days", "0"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+
+
+# --- failures-by-work-type -------------------------------------------------
+
+
+def test_failures_by_work_type_empty_database(monkeypatch, capsys, db_url) -> None:
+    _seed(db_url)
+    _run_cli(monkeypatch, db_url, "failures-by-work-type")
+    assert "No runs failed in the last 7d" in capsys.readouterr().out
+
+
+def test_failures_by_work_type_rolls_up_by_work_type(
+    monkeypatch, capsys, db_url
+) -> None:
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        for hours in (1, 2):  # two blocked runs classified as bugs
+            rid = _add_run(
+                session,
+                status=RunStatus.BLOCKED,
+                created_at=now - timedelta(hours=hours),
+                work_type="bug",
+            )
+            _add_event(
+                session,
+                rid,
+                AuditEventType.RUN_BLOCKED,
+                now - timedelta(hours=hours),
+                metadata_json='{"category": "policy_denied"}',
+            )
+        rid = _add_run(
+            session,
+            status=RunStatus.EXECUTION_FAILED,
+            created_at=now - timedelta(hours=3),
+            work_type="feature",
+        )
+        _add_event(
+            session,
+            rid,
+            AuditEventType.AGENT_FAILED,
+            now - timedelta(hours=3),
+            metadata_json='{"reason": "agent error"}',
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "failures-by-work-type")
+    out = capsys.readouterr().out
+    assert "3 total across 2 work type(s), 2 blocked, 1 execution-failed" in out
+    # Most-frequent first: bug (2) before feature (1).
+    assert out.index("bug") < out.index("feature")
+
+
+def test_failures_by_work_type_rejects_bad_window(monkeypatch, db_url) -> None:
+    _seed(db_url)
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr(
+        "sys.argv", ["foundry-memory", "failures-by-work-type", "--days", "0"]
     )
     with pytest.raises(SystemExit) as exc:
         main()
