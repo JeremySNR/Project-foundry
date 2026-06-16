@@ -76,6 +76,11 @@ from foundry.db.models import (
 from foundry.engines import build_openai_analyzer
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.policy import LocalPolicyEngine, OpaPolicyEngine, PolicyEngine
+from foundry.policy.freeze import (
+    ChangeFreezeWindow,
+    active_freeze,
+    describe_window,
+)
 from foundry.schemas.common import ApprovalRole, RunStatus
 from foundry.schemas.ticket import RawTicket
 
@@ -246,6 +251,7 @@ def create_app(
     effective_policy: Mapping[str, Any] | None = None,
     policy_provider: str | None = None,
     policy_check: Mapping[str, Any] | None = None,
+    change_freeze_windows: Iterable[ChangeFreezeWindow] | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -350,6 +356,14 @@ def create_app(
     app.state.policy_check = (
         dict(policy_check) if policy_check is not None else None
     )
+    # The configured change-freeze / maintenance windows (issue #31), kept as the
+    # parsed ChangeFreezeWindow objects (not the static `describe_window` strings
+    # that go into `effective_policy`) so GET /metrics/policy can evaluate which -
+    # if any - is in effect *right now* against the app clock, exactly as the
+    # orchestrator does before holding an autonomous re-dispatch. Read-only; the
+    # gate itself is unchanged. Default () => no windows => `active_freeze` is
+    # always null, byte-for-byte the prior response.
+    app.state.change_freeze_windows = tuple(change_freeze_windows or ())
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.deduplicator = WebhookDeduplicator(
         session_factory,
@@ -1314,13 +1328,27 @@ def create_app(
         ``configured`` is False (and ``policy`` null) when the app was built without
         a Settings (e.g. a bare ``create_app`` in tests). Token-gated and fail-closed
         like the other metrics endpoints; read-only, changes no gate.
+
+        ``active_freeze`` is the one live, time-dependent field: evaluated **at
+        request time** against the app clock with the same ``active_freeze()`` the
+        orchestrator uses before holding an autonomous re-dispatch, so an operator
+        can see *"is a change freeze in effect right now, and why"* - the question
+        the static ``policy.change_freeze_windows`` list can't answer. ``null`` when
+        no window is in effect (or none configured); otherwise the active window's
+        ``description`` and ``reason``.
         """
         _require_api_token(app, request)
         policy = app.state.effective_policy
+        frozen = active_freeze(app.state.change_freeze_windows, app.state.clock())
         return {
             "configured": policy is not None,
             "provider": app.state.policy_provider,
             "policy": policy,
+            "active_freeze": (
+                {"description": describe_window(frozen), "reason": frozen.reason}
+                if frozen is not None
+                else None
+            ),
         }
 
     @app.get("/metrics/policy/check")
@@ -2178,6 +2206,10 @@ def app_from_settings(settings: Settings) -> FastAPI:
         # computed from the same `compare_policy_strictness` the `foundry-policy
         # check` CLI exits on, so the in-app signal can't drift from the CI gate's.
         policy_check=policy_check,
+        # The parsed change-freeze windows, so GET /metrics/policy can report which
+        # (if any) is active right now (issue #31) - the same windows the
+        # orchestrator is handed for its pre-redispatch hold.
+        change_freeze_windows=settings.change_freeze_windows,
     )
 
 

@@ -256,6 +256,14 @@ def _run_explain(
         for repo, globs in summary["repo_forbidden_globs"].items():
             print(f"      {repo}: {', '.join(globs)}")
 
+    if summary["change_freeze_windows"]:
+        print(
+            "\n  change-freeze windows "
+            "(autonomous re-dispatch held for a human while active):"
+        )
+        for window in summary["change_freeze_windows"]:
+            print(f"      {window}")
+
 
 def _run_check(config_path: str | None, against: str, fmt: str = "text") -> None:
     import json
