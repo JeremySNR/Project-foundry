@@ -1425,6 +1425,31 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **failure_queue(session, since=since)}
 
+    @app.get("/metrics/failures/by-category")
+    def metrics_failures_by_category(
+        request: Request, days: int = 7
+    ) -> dict[str, Any]:
+        """Recently-failed runs **rolled up by reason** - the aggregate triage cut
+        that complements the per-run ``GET /metrics/failures`` feed. Where that feed
+        lists every recent incident newest-first, this answers *what are the top
+        reasons runs are blocking/failing, and how many of each?* - so a spiking
+        systemic blocker (``policy_denied``, ``budget_exceeded``, ...) is visible at
+        a glance. Categories are ordered most-frequent first; runs whose failure
+        carries no parseable reason bucket under an explicit ``(unknown)`` sentinel.
+
+        Reuses the same failure-event derivation the feed serves, so the two can't
+        drift. Read-only, changes no gate: a blocked run stays blocked (invariant
+        #7). Token-gated and fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import failures_by_category
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **failures_by_category(session, since=since)}
+
     @app.get("/metrics/policy")
     def metrics_policy(request: Request) -> dict[str, Any]:
         """The effective policy gate this deployment resolves to - the read-only,

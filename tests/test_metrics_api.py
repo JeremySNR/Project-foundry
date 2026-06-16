@@ -1155,3 +1155,63 @@ def test_failures_lists_blocked_run(client) -> None:
     assert entry["reason"] == "human_stopped"
     assert body["blocked"] == 1
     assert body["failed"] == 0
+
+
+# -- GET /metrics/failures/by-category (aggregate triage cut, issue #37) ------
+
+
+def test_failures_by_category_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/failures/by-category").status_code == 401
+    assert (
+        client.get(
+            "/metrics/failures/by-category", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_failures_by_category_rejects_bad_window(client) -> None:
+    assert (
+        client.get("/metrics/failures/by-category?days=0", headers=AUTH).status_code
+        == 422
+    )
+
+
+def test_failures_by_category_empty_database(client) -> None:
+    body = client.get("/metrics/failures/by-category", headers=AUTH).json()
+    assert body["days"] == 7
+    assert body["count"] == 0
+    assert body["blocked"] == 0
+    assert body["failed"] == 0
+    assert body["distinct_categories"] == 0
+    assert body["categories"] == []
+
+
+def test_failures_by_category_rolls_up_blocked_run(client) -> None:
+    _run_to_blocked(client)
+    body = client.get("/metrics/failures/by-category", headers=AUTH).json()
+    assert body["count"] == 1
+    assert body["blocked"] == 1
+    assert body["failed"] == 0
+    assert body["distinct_categories"] == 1
+    cat = body["categories"][0]
+    # Grouped by the same reason the feed reports for the run.
+    assert cat["category"] == "human_stopped"
+    assert cat["count"] == 1
+    assert cat["blocked"] == 1
+    assert cat["newest_failure_seconds"] >= 0
+    assert cat["oldest_failure_seconds"] >= 0
+
+
+def test_failures_by_category_matches_feed_totals(client) -> None:
+    # Two blocked runs share the human_stopped reason: the feed lists 2 runs, the
+    # roll-up reports 1 category with count 2 - and the totals agree.
+    _run_to_blocked(client, issue_id="issue-b1", key="LIN-901")
+    _run_to_blocked(client, issue_id="issue-b2", key="LIN-902")
+    feed = client.get("/metrics/failures", headers=AUTH).json()
+    agg = client.get("/metrics/failures/by-category", headers=AUTH).json()
+    assert feed["count"] == agg["count"] == 2
+    assert feed["blocked"] == agg["blocked"]
+    assert agg["distinct_categories"] == 1
+    assert agg["categories"][0]["count"] == 2
+    assert sum(c["count"] for c in agg["categories"]) == feed["count"]

@@ -886,6 +886,17 @@ def test_dashboard_renders_delivery_by_work_type_trend_strip() -> None:
     assert "loadWorkTypeTrends();" in DASHBOARD_HTML
 
 
+def test_dashboard_renders_failures_by_category_panel() -> None:
+    """The failures-by-category panel (issue #37) must fetch the
+    by-category endpoint, have a panel to render into, and be wired into the
+    refresh loop — the aggregate complement to the per-run failure feed."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/failures/by-category' in DASHBOARD_HTML
+    assert '<div id="failure-categories"></div>' in DASHBOARD_HTML
+    assert "loadFailureCategories();" in DASHBOARD_HTML
+
+
 # -- Enricher wiring via build_orchestrator ------------------------------------
 
 

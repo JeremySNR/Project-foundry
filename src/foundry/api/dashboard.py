@@ -7,7 +7,8 @@ execution-queue panel (in-flight agent runs with run-time age + SLA, issue #37)
 and a review-queue panel (open PRs with review-latency age + a "stale since last
 push" age, each with its own SLA, issue #37), a failure/triage panel (recently
 blocked or execution-failed runs with how long ago they failed and why, newest
-first, issue #37),
+first, issue #37) and a failures-by-category panel (the same recent failures
+rolled up by reason, most-frequent first - the systemic-blocker view, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
@@ -21,7 +22,7 @@ the run list (with an approval-queue filter) and,
 per run, the full decision timeline (artifacts, audit events, policy decisions,
 agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/approvals``, ``GET /metrics/executions``, ``GET /metrics/reviews``,
-``GET /metrics/failures``,
+``GET /metrics/failures``, ``GET /metrics/failures/by-category``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
 ``GET /metrics/delivery/by-work-type``,
@@ -229,6 +230,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="exec-queue"></div>
 <div id="review-queue"></div>
 <div id="failure-queue"></div>
+<div id="failure-categories"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -648,6 +650,38 @@ async function loadFailures() {
     el.querySelectorAll(".run[data-id]").forEach((node) => {
       node.addEventListener("click", () => loadTimeline(node.dataset.id));
     });
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
+async function loadFailureCategories() {
+  const el = $("#failure-categories");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/failures/by-category?days=7", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const cats = m.categories || [];
+    if (!cats.length) { el.style.display = "none"; return; }  // nothing failed recently: hide
+    const rows = cats.map((c) => `<tr>
+        <td>${esc(c.category)}</td>
+        <td class="num">${c.count}</td>
+        <td class="num">${c.blocked}</td>
+        <td class="num">${c.failed}</td>
+        <td class="num">${dur(c.newest_failure_seconds)} ago</td>
+        <td class="num">${dur(c.oldest_failure_seconds)} ago</td>
+      </tr>`).join("");
+    el.innerHTML = `<details open><summary>failures by category (${m.days}d) &mdash; ${m.count} failure${m.count === 1 ? "" : "s"} across ${m.distinct_categories} categor${m.distinct_categories === 1 ? "y" : "ies"}, most frequent first</summary>
+      <table><tr><th>reason</th><th>count</th><th>blocked</th><th>failed</th>
+        <th>newest</th><th>oldest</th></tr>${rows}</table>
+    </details>`;
+    el.style.display = "block";
   } catch (err) {
     el.style.display = "none";
   }
@@ -1113,6 +1147,7 @@ function refresh() {
   loadExecutions();
   loadReviews();
   loadFailures();
+  loadFailureCategories();
   loadMetrics();
   loadTrends();
   loadAgents();

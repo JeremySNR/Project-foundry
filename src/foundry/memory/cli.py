@@ -161,6 +161,18 @@ def main() -> None:
         help="Only show runs that failed in the last N days (default: 7).",
     )
 
+    fail_cat_p = sub.add_parser(
+        "failures-by-category",
+        help="Print recent failures rolled up by reason, most-frequent first "
+        "(offline twin of GET /metrics/failures/by-category).",
+    )
+    fail_cat_p.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Only count runs that failed in the last N days (default: 7).",
+    )
+
     sub.add_parser(
         "approvals",
         help="Print runs awaiting human approval, oldest first (offline twin of "
@@ -256,6 +268,8 @@ def main() -> None:
         _run_fleet()
     elif args.command == "failures":
         _run_failures(args)
+    elif args.command == "failures-by-category":
+        _run_failures_by_category(args)
     elif args.command == "approvals":
         _run_approvals()
     elif args.command == "executions":
@@ -582,6 +596,34 @@ def _run_failures(args: argparse.Namespace) -> None:
         print(
             f"{_fmt_age(run['failed_seconds']):<9} {run['status']:<18} "
             f"{issue:<14} {run['run_id'][:12]:<14} {reason}"
+        )
+
+
+def _run_failures_by_category(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import failures_by_category
+
+    since = _since_from_days(args.days)
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = failures_by_category(session, since=since)
+
+    categories = report["categories"]
+    if not categories:
+        print(f"No runs failed in the last {args.days}d - nothing to triage.")
+        return
+
+    print(
+        f"Failures by category (last {args.days}d): {report['count']} total across "
+        f"{report['distinct_categories']} categories, {report['blocked']} blocked, "
+        f"{report['failed']} execution-failed (most frequent first):\n"
+    )
+    print(f"{'count':<7} {'blocked':<8} {'failed':<7} {'newest':<9} {'oldest':<9} reason")
+    for cat in categories:
+        print(
+            f"{cat['count']:<7} {cat['blocked']:<8} {cat['failed']:<7} "
+            f"{_fmt_age(cat['newest_failure_seconds']):<9} "
+            f"{_fmt_age(cat['oldest_failure_seconds']):<9} {cat['category']}"
         )
 
 
