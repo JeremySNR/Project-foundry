@@ -8,7 +8,9 @@ and a review-queue panel (open PRs with review-latency age + a "stale since last
 push" age, each with its own SLA, issue #37), a failure/triage panel (recently
 blocked or execution-failed runs with how long ago they failed and why, newest
 first, issue #37) and a failures-by-category panel (the same recent failures
-rolled up by reason, most-frequent first - the systemic-blocker view, issue #37),
+rolled up by reason, most-frequent first - the systemic-blocker view, issue #37)
+and a failure-trend panel (the same failures bucketed by week - the
+direction-of-travel view: "are we failing more than usual?", issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
@@ -23,6 +25,7 @@ per run, the full decision timeline (artifacts, audit events, policy decisions,
 agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/approvals``, ``GET /metrics/executions``, ``GET /metrics/reviews``,
 ``GET /metrics/failures``, ``GET /metrics/failures/by-category``,
+``GET /metrics/failures/trends``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
 ``GET /metrics/delivery/by-work-type``,
@@ -118,7 +121,7 @@ DASHBOARD_HTML = """<!doctype html>
   .error { color: var(--red); padding: 16px 24px; }
   .kv { color: var(--muted); font-size: 12px; }
   .kv b { color: var(--text); font-weight: 600; }
-  #fleet, #metrics, #agents, #trends, #agent-trends, #epics, #queue, #exec-queue, #review-queue {
+  #fleet, #metrics, #agents, #trends, #agent-trends, #epics, #queue, #exec-queue, #review-queue, #failure-trends {
     display: none; padding: 10px 24px; border-bottom: 1px solid var(--border);
     background: var(--panel); font-size: 13px;
   }
@@ -184,6 +187,21 @@ DASHBOARD_HTML = """<!doctype html>
     background: var(--green); border-radius: 1px;
   }
   #worktype-trends .spark i.empty { height: 2px; background: var(--border); }
+  #failure-trends table {
+    border-collapse: collapse; margin: 8px 0 2px; font-size: 12px;
+  }
+  #failure-trends th, #failure-trends td {
+    border: 1px solid var(--border); padding: 3px 10px; text-align: left;
+    color: var(--muted);
+  }
+  #failure-trends th { color: var(--text); }
+  #failure-trends summary { color: var(--text); cursor: pointer; }
+  #failure-trends td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  #failure-trends .bar {
+    display: inline-block; height: 8px; background: var(--red);
+    border-radius: 2px; vertical-align: middle; min-width: 1px;
+  }
+  #failure-trends .bar.failed { background: var(--amber); }
   #epics summary { color: var(--text); cursor: pointer; }
   .epic { padding: 8px 0; border-bottom: 1px dashed var(--border); }
   .epic:last-child { border-bottom: none; }
@@ -231,6 +249,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="review-queue"></div>
 <div id="failure-queue"></div>
 <div id="failure-categories"></div>
+<div id="failure-trends"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -680,6 +699,46 @@ async function loadFailureCategories() {
     el.innerHTML = `<details open><summary>failures by category (${m.days}d) &mdash; ${m.count} failure${m.count === 1 ? "" : "s"} across ${m.distinct_categories} categor${m.distinct_categories === 1 ? "y" : "ies"}, most frequent first</summary>
       <table><tr><th>reason</th><th>count</th><th>blocked</th><th>failed</th>
         <th>newest</th><th>oldest</th></tr>${rows}</table>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
+async function loadFailureTrends() {
+  const el = $("#failure-trends");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/failures/trends?days=30&bucket=week", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    if (!m.count) { el.style.display = "none"; return; }  // nothing failed recently: hide
+    const periods = m.periods || [];
+    if (!periods.length) { el.style.display = "none"; return; }
+    // Scale the bars to the busiest period so the rise/fall is legible; the
+    // bar splits blocked (red) vs execution-failed (amber), like the
+    // delivery trend splits shipped vs blocked.
+    const maxCount = Math.max(1, ...periods.map((p) => p.count));
+    const rows = periods.map((p) => {
+      const blockW = Math.round((p.blocked / maxCount) * 120);
+      const failW = Math.round((p.failed / maxCount) * 120);
+      return `<tr>
+        <td>${esc(fmtPeriod(p.period_start))}</td>
+        <td class="num">${p.count}</td>
+        <td class="num">${p.blocked}</td>
+        <td class="num">${p.failed}</td>
+        <td><span class="bar" style="width:${blockW}px"></span><span class="bar failed" style="width:${failW}px"></span></td>
+      </tr>`;
+    }).join("");
+    el.innerHTML = `<details open><summary>failure trend &mdash; runs failed by week (${m.days}d, ${m.count} total: ${m.blocked} blocked, ${m.failed} execution-failed) &mdash; are we failing more than usual?</summary>
+      <table><tr><th>week of</th><th>failures</th><th>blocked</th><th>execution-failed</th><th></th></tr>${rows}</table>
+      <div class="kv">bar = blocked (red) + execution-failed (amber), scaled to the busiest week</div>
     </details>`;
     el.style.display = "block";
   } catch (err) {
@@ -1148,6 +1207,7 @@ function refresh() {
   loadReviews();
   loadFailures();
   loadFailureCategories();
+  loadFailureTrends();
   loadMetrics();
   loadTrends();
   loadAgents();
