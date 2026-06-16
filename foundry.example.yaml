@@ -315,6 +315,20 @@ dashboard:
   # event, so a fresh push resets it.
   review_stale_sla_seconds: 172800  # 48h
 
+  # Compliance baseline (issue #31): a preset name (soc2 / pci-dss /
+  # change-management / baseline - see `foundry-policy presets`) OR a path to
+  # another config file. When set, GET /metrics/policy/check and the dashboard
+  # compliance panel report, control by control, whether THIS deployment's gate is
+  # at least as strict as the baseline - the always-on, in-app twin of
+  # `foundry-policy check --against`, so "has our gate drifted below SOC 2?" is
+  # answerable on the dashboard, not just from a one-shot CLI run in CI. Read-only:
+  # it labels the gate, it changes and blocks nothing; it uses only the existing,
+  # already-gated knobs, so it adds no policy mechanism. Omit it (the default) for
+  # no check. Env override: FOUNDRY_POLICY_BASELINE (empty string disables it). An
+  # unresolvable baseline (typo'd preset / missing file) fails LOUD at startup, so
+  # a compliance check never silently "passes".
+  policy_baseline: soc2
+
 auth:
   # OIDC bearer auth for the token-gated API + dashboard (issue #34). OPTIONAL
   # and additive: when configured, a valid OIDC JWT from your IdP is accepted on

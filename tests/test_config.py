@@ -369,6 +369,23 @@ def test_review_stale_sla_rejects_below_one() -> None:
         Settings.from_env({"FOUNDRY_REVIEW_STALE_SLA_SECONDS": "0"})
 
 
+def test_policy_baseline_defaults_off() -> None:
+    assert Settings.from_env({}).policy_baseline is None
+
+
+def test_policy_baseline_from_yaml_and_env(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("dashboard:\n  policy_baseline: soc2\n")
+    s = Settings.load(path, env={})
+    assert s.policy_baseline == "soc2"
+    # Env overrides YAML (operational knob).
+    s2 = Settings.load(path, env={"FOUNDRY_POLICY_BASELINE": "pci-dss"})
+    assert s2.policy_baseline == "pci-dss"
+    # Empty env string disables it (back to no compliance check).
+    s3 = Settings.load(path, env={"FOUNDRY_POLICY_BASELINE": ""})
+    assert s3.policy_baseline is None
+
+
 def test_slack_notifications_from_env_and_yaml(tmp_path) -> None:
     # Bot token is env-only; the channel may come from YAML or env (env wins).
     s = Settings.from_env(

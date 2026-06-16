@@ -245,6 +245,7 @@ def create_app(
     review_stale_sla_seconds: int | None = None,
     effective_policy: Mapping[str, Any] | None = None,
     policy_provider: str | None = None,
+    policy_check: Mapping[str, Any] | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -340,6 +341,15 @@ def create_app(
         dict(effective_policy) if effective_policy is not None else None
     )
     app.state.policy_provider = policy_provider
+    # The compliance verdict of the live gate against the configured baseline
+    # (issue #31): the read-only, always-on twin of `foundry-policy check
+    # --against`. Surfaced at GET /metrics/policy/check + the dashboard so an
+    # operator/auditor sees whether the gate still meets (or has drifted below)
+    # the committed compliance baseline. None when no baseline is configured;
+    # read-only, changes no gate. Copied so a caller's mapping can't mutate it.
+    app.state.policy_check = (
+        dict(policy_check) if policy_check is not None else None
+    )
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.deduplicator = WebhookDeduplicator(
         session_factory,
@@ -1313,6 +1323,35 @@ def create_app(
             "policy": policy,
         }
 
+    @app.get("/metrics/policy/check")
+    def metrics_policy_check(request: Request) -> dict[str, Any]:
+        """The compliance verdict of the live gate against the configured baseline -
+        the read-only, always-on, in-app twin of ``foundry-policy check --against``.
+
+        When ``dashboard.policy_baseline`` is set (a preset name or a config path),
+        returns the per-control verdicts (``findings``), the overall ``ok``, and the
+        ``weaknesses`` list - whether the deployment's gate is at least as strict as
+        the committed compliance baseline (and where it has drifted below it). The
+        verdict is computed at build time from the same ``compare_policy_strictness``
+        the CLI ``check`` exits on, so the dashboard signal can't drift from the CI
+        gate's.
+
+        ``configured`` is False (and the verdict fields empty/None) when no baseline
+        is configured. Token-gated and fail-closed like the other metrics endpoints;
+        read-only, changes no gate.
+        """
+        _require_api_token(app, request)
+        check = app.state.policy_check
+        if check is None:
+            return {
+                "configured": False,
+                "baseline": None,
+                "ok": None,
+                "findings": [],
+                "weaknesses": [],
+            }
+        return {"configured": True, **check}
+
     @app.post("/runs/{run_id}/approval")
     def approval(
         run_id: str,
@@ -1984,7 +2023,30 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
 
 
 def app_from_settings(settings: Settings) -> FastAPI:
-    from foundry.policy.library import effective_policy_summary
+    from foundry.policy.library import (
+        comparison_to_dict,
+        compare_policy_strictness,
+        effective_policy_summary,
+        resolve_settings,
+    )
+
+    # When a compliance baseline is configured, resolve it now and pre-compute the
+    # strictness verdict for GET /metrics/policy/check + the dashboard. Fail loud at
+    # startup (deploy-time) on an unresolvable baseline rather than silently serving
+    # no signal - a compliance check must never quietly "pass" on a typo'd baseline.
+    policy_check = None
+    if settings.policy_baseline:
+        try:
+            baseline_settings = resolve_settings(settings.policy_baseline)
+        except ValueError as exc:
+            raise ValueError(
+                f"dashboard.policy_baseline is misconfigured: {exc}"
+            ) from exc
+        comparison = compare_policy_strictness(settings, baseline_settings)
+        policy_check = {
+            "baseline": settings.policy_baseline,
+            **comparison_to_dict(comparison),
+        }
 
     engine = make_engine(settings.database_url)
     init_schema(engine)
@@ -2094,6 +2156,10 @@ def app_from_settings(settings: Settings) -> FastAPI:
         # view can't drift from the CLI's.
         effective_policy=effective_policy_summary(settings),
         policy_provider=settings.policy_provider,
+        # The compliance verdict against the configured baseline (issue #31),
+        # computed from the same `compare_policy_strictness` the `foundry-policy
+        # check` CLI exits on, so the in-app signal can't drift from the CI gate's.
+        policy_check=policy_check,
     )
 
 

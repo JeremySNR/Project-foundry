@@ -231,6 +231,17 @@ class Settings:
     # (the historical behaviour, byte-for-byte).
     review_stale_sla_seconds: int | None = None
 
+    # Compliance baseline the deployment is continuously checked against (issue
+    # #31): a preset name (e.g. ``soc2``/``pci-dss``) or a path to another config
+    # file. When set, ``GET /metrics/policy/check`` and the dashboard compliance
+    # panel report, control by control, whether the live gate is at least as
+    # strict as this baseline - the always-on, in-app twin of ``foundry-policy
+    # check --against``. Read-only: it labels the gate, it changes and blocks
+    # nothing. None (default) = no baseline, no check (byte-for-byte the historical
+    # behaviour). An unresolvable baseline fails loud at app startup rather than
+    # silently producing no signal (a compliance check must not quietly "pass").
+    policy_baseline: str | None = None
+
     # --- issue tracker (behaviour: yaml) ---
     # "linear" (default), "github_issues" (the issue is the ticket; approvers
     # are then keyed by GitHub login instead of email), or "jira".
@@ -952,6 +963,9 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "review_stale_sla_seconds" in dashboard:
         value = dashboard["review_stale_sla_seconds"]
         out["review_stale_sla_seconds"] = None if value is None else int(value)
+    if "policy_baseline" in dashboard:
+        value = dashboard["policy_baseline"]
+        out["policy_baseline"] = None if value is None else str(value)
 
     notifications = data.get("notifications", {}) or {}
     if "slack_channel" in notifications:
@@ -1135,4 +1149,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
     if "FOUNDRY_REVIEW_STALE_SLA_SECONDS" in env:
         raw = env["FOUNDRY_REVIEW_STALE_SLA_SECONDS"].strip()
         out["review_stale_sla_seconds"] = None if raw == "" else int(raw)
+    if "FOUNDRY_POLICY_BASELINE" in env:
+        raw = env["FOUNDRY_POLICY_BASELINE"].strip()
+        out["policy_baseline"] = None if raw == "" else raw
     return out
