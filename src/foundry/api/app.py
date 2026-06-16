@@ -1185,6 +1185,36 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **delivery_by_work_type(session, since=since)}
 
+    @app.get("/metrics/delivery/by-work-type/trends")
+    def metrics_delivery_by_work_type_trends(
+        request: Request, days: int = 90, bucket: str = "week"
+    ) -> dict[str, Any]:
+        """Per-work-type delivery outcomes bucketed over time - the work-type
+        dimension of ``/metrics/delivery/trends`` (the way
+        ``/metrics/delivery/by-work-type`` is to ``/metrics/delivery``, and
+        ``/metrics/delivery/by-repo/trends`` is to ``/metrics/delivery/by-repo``).
+        Each work type carries a zero-filled series on one shared time axis plus
+        its window totals, so a caller can see whether a given kind of work is
+        shipping more reliably or stalling - do features slip while bugs hold
+        steady? Token-gated and fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS, delivery_by_work_type_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **delivery_by_work_type_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/agents")
     def metrics_agents(request: Request, days: int = 90) -> dict[str, Any]:
         """Per-provider agent scorecards: merge rate, retries and spend, broken

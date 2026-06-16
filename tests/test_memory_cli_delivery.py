@@ -295,3 +295,45 @@ def test_delivery_by_repo_trends_lists_per_repo_series(monkeypatch, capsys, db_u
     assert "payments-service: 1/1 merged" in out
     assert "web-frontend: 1/1 merged" in out
     assert "week of" in out
+
+
+# --- delivery-by-work-type-trends -----------------------------------------
+
+
+def test_delivery_by_work_type_trends_empty_database(
+    monkeypatch, capsys, db_url
+) -> None:
+    _seed(db_url)
+    _run_cli(monkeypatch, db_url, "delivery-by-work-type-trends")
+    assert "No runs finished in the last 90d." in capsys.readouterr().out
+
+
+def test_delivery_by_work_type_trends_lists_per_type_series(
+    monkeypatch, capsys, db_url
+) -> None:
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        _add_outcome(session, outcome="merged", work_type="bug", completed_at=now)
+        _add_outcome(session, outcome="merged", work_type="feature", completed_at=now)
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "delivery-by-work-type-trends", "--bucket", "week")
+    out = capsys.readouterr().out
+    assert "Per-work-type delivery by week (last 90d" in out
+    assert "bug: 1/1 merged" in out
+    assert "feature: 1/1 merged" in out
+    assert "week of" in out
+
+
+def test_delivery_by_work_type_trends_rejects_bad_bucket(monkeypatch, db_url) -> None:
+    _seed(db_url)
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["foundry-memory", "delivery-by-work-type-trends", "--bucket", "month"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2

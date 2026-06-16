@@ -351,6 +351,51 @@ def test_by_repo_trends_reports_a_merge_in_a_period(client) -> None:
     assert sum(c["prs_shipped"] for c in web["series"]) == 1
 
 
+def test_by_work_type_trends_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/delivery/by-work-type/trends").status_code == 401
+
+
+def test_by_work_type_trends_rejects_bad_window_and_bucket(client) -> None:
+    assert (
+        client.get(
+            "/metrics/delivery/by-work-type/trends?days=0", headers=AUTH
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            "/metrics/delivery/by-work-type/trends?bucket=month", headers=AUTH
+        ).status_code
+        == 422
+    )
+
+
+def test_by_work_type_trends_empty_database(client) -> None:
+    body = client.get("/metrics/delivery/by-work-type/trends", headers=AUTH).json()
+    assert body["days"] == 90
+    assert body["bucket"] == "week"
+    assert body["periods"] == []
+    assert body["work_types"] == []
+
+
+def test_by_work_type_trends_reports_a_merge_in_a_period(client) -> None:
+    _run_to_merged(client)
+    body = client.get(
+        "/metrics/delivery/by-work-type/trends?days=30&bucket=day", headers=AUTH
+    ).json()
+    assert body["days"] == 30
+    assert body["bucket"] == "day"
+    types = {t["work_type"]: t for t in body["work_types"]}
+    # "Add customer favourites" classifies as a feature.
+    assert "feature" in types
+    feat = types["feature"]
+    assert feat["runs_finished"] == 1
+    assert feat["prs_shipped"] == 1
+    # One run -> one populated period, aligned to the shared axis.
+    assert [c["period_start"] for c in feat["series"]] == body["periods"]
+    assert sum(c["prs_shipped"] for c in feat["series"]) == 1
+
+
 def test_agent_metrics_requires_bearer_token(client) -> None:
     assert client.get("/metrics/agents").status_code == 401
     assert client.get("/metrics/agents?days=0", headers=AUTH).status_code == 422
