@@ -163,6 +163,11 @@ risk:
   provider: llm             # or "heuristic" (default): keywords + globs, no key.
                             # "llm" adds cited evidence to the audit trail and can
                             # only ESCALATE over the deterministic floor, never lower it.
+  extra_sensitive_keywords: # teach the ticket-text heuristic your domain vocab (#31):
+    payments: ["pan", "cardholder"]    # area -> extra keywords, merged ON TOP of the
+    customer_data: ["member record"]   # built-in floor. Strictly additive (only ever
+                                       # flags MORE areas) - the ticket-text twin of
+                                       # sensitive_path_globs below.
 policy:
   repo_confidence_threshold: 70   # block work we can't confidently place in a repo
   max_files_changed: 12           # bigger PRs go to a human

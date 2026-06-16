@@ -8,7 +8,9 @@ from foundry.engines import (
     StaticContextEnricher,
     TemplatePlanner,
     branch_name_for,
+    merge_sensitive_keywords,
 )
+from foundry.engines.risk import _SENSITIVE_KEYWORDS
 from foundry.schemas.common import (
     AgentMode,
     ApprovalRole,
@@ -229,6 +231,61 @@ def test_no_repo_match_is_blocked_risk() -> None:
     context = StaticContextEnricher().enrich(ticket, analysis)  # no repo signal
     risk = HeuristicRiskClassifier().classify(ticket, analysis, context)
     assert risk.overall_risk is OverallRisk.BLOCKED
+
+
+def test_extra_keywords_flag_area_builtins_miss() -> None:
+    # "PAN" (primary account number) is real cardholder-data vocabulary the
+    # built-in payments keywords don't carry. Without extras it stays low risk.
+    ticket = _ready_ticket(
+        title="Tokenise the PAN before storage",
+        description="Acceptance Criteria:\n- the PAN never lands in logs",
+    )
+    analysis = HeuristicAnalyzer().analyse(ticket)
+    context = StaticContextEnricher().enrich(ticket, analysis)
+    assert HeuristicRiskClassifier().classify(
+        ticket, analysis, context
+    ).sensitive_areas.payments is False
+
+    merged = merge_sensitive_keywords({"payments": ["pan", "cardholder"]})
+    risk = HeuristicRiskClassifier(keywords=merged).classify(ticket, analysis, context)
+    assert risk.sensitive_areas.payments is True
+    assert risk.overall_risk is OverallRisk.HIGH
+    assert ApprovalRole.SECURITY in risk.required_approvals
+    assert risk.allowed_agent_mode is AgentMode.HUMAN_ONLY
+
+
+def test_extra_keywords_are_strictly_additive() -> None:
+    # The built-in payments keywords still fire when extras are supplied.
+    ticket = _ready_ticket(
+        title="Update Stripe invoice handling",
+        description="Acceptance Criteria:\n- invoices reconcile",
+    )
+    analysis = HeuristicAnalyzer().analyse(ticket)
+    context = StaticContextEnricher().enrich(ticket, analysis)
+    merged = merge_sensitive_keywords({"payments": ["pan"]})
+    risk = HeuristicRiskClassifier(keywords=merged).classify(ticket, analysis, context)
+    assert risk.sensitive_areas.payments is True
+
+
+def test_merge_sensitive_keywords_preserves_floor_and_dedupes() -> None:
+    base = merge_sensitive_keywords(None)
+    # Floor preserved verbatim when there are no extras.
+    assert base["payments"] == _SENSITIVE_KEYWORDS["payments"]
+    # Extras appended, lower-cased and de-duplicated; built-ins kept first.
+    merged = merge_sensitive_keywords({"payments": ["PAN", "pan", "stripe"]})
+    assert merged["payments"][: len(_SENSITIVE_KEYWORDS["payments"])] == (
+        _SENSITIVE_KEYWORDS["payments"]
+    )
+    assert merged["payments"].count("stripe") == 1  # already a built-in, not re-added
+    assert merged["payments"].count("pan") == 1  # case-folded duplicate collapsed
+
+
+def test_merge_sensitive_keywords_ignores_unknown_area() -> None:
+    # Settings validates area names; the merge helper itself just ignores them
+    # so a stray key can never synthesise a non-existent area.
+    merged = merge_sensitive_keywords({"not_an_area": ["whatever"]})
+    assert "not_an_area" not in merged
+    assert set(merged) == set(_SENSITIVE_KEYWORDS)
 
 
 # -- planner ------------------------------------------------------------------

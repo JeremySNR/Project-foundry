@@ -8,7 +8,7 @@ risk level, but the hard allow/deny decision is made by ``foundry.policy``.
 from __future__ import annotations
 
 import fnmatch
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, Sequence
 
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.schemas.common import AgentMode, ApprovalRole, OverallRisk
@@ -39,6 +39,41 @@ _SENSITIVE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "production_deploy": ("deploy to production", "prod deploy", "release to prod",
                           "production release"),
 }
+
+
+def merge_sensitive_keywords(
+    extra: Mapping[str, Sequence[str]] | None,
+) -> dict[str, tuple[str, ...]]:
+    """Layer operator-supplied keywords *on top of* the built-in floor.
+
+    The built-in ``_SENSITIVE_KEYWORDS`` table is the offline/no-key reference
+    detection set. A deployment can extend it - teach the heuristic its own
+    domain vocabulary (e.g. ``"pan"``/``"cardholder"`` for ``payments``,
+    ``"member record"`` for ``customer_data``) - via ``risk.extra_sensitive_keywords``
+    (issue #31). This is the ticket-text twin of the already-configurable
+    diff-stage ``policy.sensitive_path_globs``.
+
+    Strictly additive: every built-in keyword is preserved and the extras are
+    appended (lower-cased, de-duplicated, built-ins first), so detection can only
+    ever be *added to*, never removed - more keywords flag more areas, never
+    fewer, so risk can only escalate (invariant #1). Extras keyed on an area that
+    is not a built-in sensitive area are ignored here; ``Settings`` validates the
+    area names at load (fail-closed), so a typo never reaches this point silently.
+    """
+    merged = {area: tuple(keywords) for area, keywords in _SENSITIVE_KEYWORDS.items()}
+    for area, keywords in (extra or {}).items():
+        if area not in merged:
+            continue
+        seen = set(merged[area])
+        added = []
+        for kw in keywords:
+            normalised = kw.lower()
+            if normalised and normalised not in seen:
+                seen.add(normalised)
+                added.append(normalised)
+        if added:
+            merged[area] = (*merged[area], *added)
+    return merged
 
 
 def glob_match(path: str, pattern: str) -> bool:
@@ -107,7 +142,19 @@ class GlobDiffRiskClassifier:
 
 
 class HeuristicRiskClassifier:
-    """Keyword-driven reference risk classifier."""
+    """Keyword-driven reference risk classifier.
+
+    ``keywords`` defaults to the built-in ``_SENSITIVE_KEYWORDS`` floor. A
+    deployment can pass a merged map (see :func:`merge_sensitive_keywords`) to
+    extend detection with its own domain vocabulary without forking
+    (``risk.extra_sensitive_keywords``, issue #31) - strictly additive, so the
+    classifier can only ever flag *more* areas, never fewer.
+    """
+
+    def __init__(self, keywords: Mapping[str, Sequence[str]] | None = None) -> None:
+        self._keywords: Mapping[str, Sequence[str]] = (
+            keywords if keywords is not None else _SENSITIVE_KEYWORDS
+        )
 
     def classify(
         self, ticket: RawTicket, analysis: TicketAnalysis, context: ContextBundle
@@ -117,7 +164,7 @@ class HeuristicRiskClassifier:
         blob = ticket.risk_blob()
         hits = {
             area: [k for k in keywords if k in blob]
-            for area, keywords in _SENSITIVE_KEYWORDS.items()
+            for area, keywords in self._keywords.items()
         }
         sensitive = SensitiveAreas(**{area: bool(found) for area, found in hits.items()})
 

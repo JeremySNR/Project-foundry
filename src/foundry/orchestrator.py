@@ -65,6 +65,7 @@ from foundry.engines.risk import (
     HeuristicRiskClassifier,
     RiskClassifier,
     glob_match,
+    merge_sensitive_keywords,
 )
 from foundry.policy.engine import (
     LocalPolicyEngine,
@@ -167,6 +168,7 @@ class FoundryOrchestrator:
         repo_min_approvals: Mapping[str, int] | None = None,
         path_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
+        extra_sensitive_keywords: Mapping[str, Sequence[str]] | None = None,
         change_freeze_windows: Sequence[ChangeFreezeWindow] | None = None,
         clock: Callable[[], datetime] | None = None,
         max_agent_retries: int = 2,
@@ -177,7 +179,18 @@ class FoundryOrchestrator:
         self._sf = session_factory
         self._analyzer = analyzer or HeuristicAnalyzer()
         self._enricher = enricher or StaticContextEnricher()
-        self._risk = risk_classifier or HeuristicRiskClassifier()
+        # Ticket-text risk classifier. When none is injected, build the default
+        # heuristic, layering any operator-supplied extra keywords on top of the
+        # built-in floor (issue #31, the ticket-text twin of sensitive_path_globs).
+        # Strictly additive - extras can only flag *more* areas, never fewer.
+        if risk_classifier is not None:
+            self._risk = risk_classifier
+        elif extra_sensitive_keywords:
+            self._risk = HeuristicRiskClassifier(
+                keywords=merge_sensitive_keywords(extra_sensitive_keywords)
+            )
+        else:
+            self._risk = HeuristicRiskClassifier()
         self._planner = planner or TemplatePlanner()
         # Epic-producer seam (issue #35): deterministic by default; the LLM
         # decomposer (decomposition.provider: llm) recovers prose-described
