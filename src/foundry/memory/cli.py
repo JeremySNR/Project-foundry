@@ -10,6 +10,9 @@ Usage::
                                    [--min-samples N] [--days D]
     foundry-memory fleet
     foundry-memory failures [--days D]
+    foundry-memory approvals
+    foundry-memory executions
+    foundry-memory reviews
 
 ``backfill`` derives outcome rows for terminal runs that finished before the
 ``foundry_run_outcomes`` table existed (or that a fail-soft hook missed);
@@ -32,6 +35,16 @@ just broke and needs a human?" (``failures`` - recently blocked/execution-failed
 runs, newest first, bounded to a recent window). Mirrors how ``foundry-evidence``
 is the offline twin of the evidence endpoints. Both are read-only and block
 nothing.
+
+``approvals``, ``executions`` and ``reviews`` are the offline twins of the three
+*in-flight* queue drill-downs (``GET /metrics/approvals`` / ``/metrics/executions``
+/ ``/metrics/reviews``) - the per-run cuts behind the ``fleet`` snapshot's
+``awaiting_human`` / ``agents_running`` / ``prs_open`` counts. Each lists the runs
+currently parked in that state, oldest first, with its age and (when the matching
+``dashboard.*_sla_seconds`` knob is set) whether it has breached - so an on-call
+engineer can answer "what is the oldest thing waiting, and is it overdue?" from the
+command line. Like ``fleet``/``failures`` they call the same ``memory/metrics.py``
+derivations the endpoints serve, so the CLI and API verdicts can't drift.
 
 Settings come from ``FOUNDRY_CONFIG`` and the usual environment variable
 overrides.
@@ -126,6 +139,22 @@ def main() -> None:
         help="Only show runs that failed in the last N days (default: 7).",
     )
 
+    sub.add_parser(
+        "approvals",
+        help="Print runs awaiting human approval, oldest first (offline twin of "
+        "GET /metrics/approvals).",
+    )
+    sub.add_parser(
+        "executions",
+        help="Print in-flight agent runs, oldest first (offline twin of "
+        "GET /metrics/executions).",
+    )
+    sub.add_parser(
+        "reviews",
+        help="Print open PRs awaiting review, oldest first (offline twin of "
+        "GET /metrics/reviews).",
+    )
+
     args = parser.parse_args()
     if args.command == "backfill":
         _run_backfill(args)
@@ -141,6 +170,12 @@ def main() -> None:
         _run_fleet()
     elif args.command == "failures":
         _run_failures(args)
+    elif args.command == "approvals":
+        _run_approvals()
+    elif args.command == "executions":
+        _run_executions()
+    elif args.command == "reviews":
+        _run_reviews()
 
 
 def _session_factory():
@@ -432,4 +467,104 @@ def _run_failures(args: argparse.Namespace) -> None:
         print(
             f"{_fmt_age(run['failed_seconds']):<9} {run['status']:<18} "
             f"{issue:<14} {run['run_id'][:12]:<14} {reason}"
+        )
+
+
+def _render_inflight_queue(
+    *, title: str, empty_msg: str, report: dict, age_key: str, age_header: str
+) -> None:
+    """Shared renderer for the single-age in-flight queues (approvals, executions).
+
+    Both surface the same per-run shape - a parked run with one age and an
+    ``sla_breached`` flag, the queue ordered oldest first - and differ only in the
+    age field's name/header and the empty message, so the table layout lives here.
+    """
+    runs = report["runs"]
+    if not runs:
+        print(empty_msg)
+        return
+    print(
+        f"{title}: {report['count']} total"
+        f"{_sla_note(report['sla_breaches'], report['sla_seconds'])} (oldest first):\n"
+    )
+    print(f"{age_header:<9} {'status':<18} {'issue':<14} {'run':<14} step")
+    for run in runs:
+        breach = "  ! breaching SLA" if run["sla_breached"] else ""
+        step = run["current_step"] or "-"
+        print(
+            f"{_fmt_age(run[age_key]):<9} {run['status']:<18} "
+            f"{(run['linear_issue_key'] or '-'):<14} {run['run_id'][:12]:<14} "
+            f"{step}{breach}"
+        )
+
+
+def _run_approvals() -> None:
+    from foundry.memory.metrics import approval_queue
+
+    settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = approval_queue(session, sla_seconds=settings.approval_sla_seconds)
+    _render_inflight_queue(
+        title="Approval queue (runs parked on a human)",
+        empty_msg="No runs are awaiting human approval.",
+        report=report,
+        age_key="waiting_seconds",
+        age_header="waited",
+    )
+
+
+def _run_executions() -> None:
+    from foundry.memory.metrics import execution_queue
+
+    settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = execution_queue(session, sla_seconds=settings.execution_sla_seconds)
+    _render_inflight_queue(
+        title="Execution queue (agents in flight)",
+        empty_msg="No agents are currently running.",
+        report=report,
+        age_key="running_seconds",
+        age_header="running",
+    )
+
+
+def _run_reviews() -> None:
+    from foundry.memory.metrics import review_queue
+
+    settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = review_queue(
+            session,
+            sla_seconds=settings.review_sla_seconds,
+            stale_sla_seconds=settings.review_stale_sla_seconds,
+        )
+
+    runs = report["runs"]
+    if not runs:
+        print("No open PRs are awaiting review.")
+        return
+
+    print(
+        f"Review queue (open PRs awaiting review): {report['count']} total"
+        f"{_sla_note(report['sla_breaches'], report['sla_seconds'])} (oldest first):\n"
+    )
+    # Staleness ("inactive since last push") is a separate signal from the open-age
+    # review SLA, so it gets its own knob and summary line - shown only when set.
+    stale_note = _sla_note(report["stale_breaches"], report["stale_sla_seconds"])
+    if stale_note:
+        print(f"  staleness{stale_note}\n")
+
+    print(f"{'unreviewed':<11} {'inactive':<10} {'status':<10} {'issue':<14} run")
+    for run in runs:
+        flags = []
+        if run["sla_breached"]:
+            flags.append("review")
+        if run["stale_breached"]:
+            flags.append("stale")
+        breach = f"  ! {'+'.join(flags)} SLA" if flags else ""
+        print(
+            f"{_fmt_age(run['unreviewed_seconds']):<11} "
+            f"{_fmt_age(run['inactive_seconds']):<10} "
+            f"{run['status']:<10} {(run['linear_issue_key'] or '-'):<14} "
+            f"{run['run_id'][:12]}{breach}"
         )
