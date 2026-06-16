@@ -10,6 +10,9 @@ Usage::
                                    [--min-samples N] [--days D]
     foundry-memory fleet
     foundry-memory failures [--days D]
+    foundry-memory failures-by-category [--days D]
+    foundry-memory failures-by-repo [--days D]
+    foundry-memory failures-trends [--bucket day|week] [--days D]
     foundry-memory approvals
     foundry-memory executions
     foundry-memory reviews
@@ -173,6 +176,18 @@ def main() -> None:
         help="Only count runs that failed in the last N days (default: 7).",
     )
 
+    fail_repo_p = sub.add_parser(
+        "failures-by-repo",
+        help="Print recent failures grouped by routed repo, most-frequent first "
+        "(offline twin of GET /metrics/failures/by-repo).",
+    )
+    fail_repo_p.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Only count runs that failed in the last N days (default: 7).",
+    )
+
     fail_trends_p = sub.add_parser(
         "failures-trends",
         help="Print recent failures bucketed over time, oldest period first "
@@ -288,6 +303,8 @@ def main() -> None:
         _run_failures(args)
     elif args.command == "failures-by-category":
         _run_failures_by_category(args)
+    elif args.command == "failures-by-repo":
+        _run_failures_by_repo(args)
     elif args.command == "failures-trends":
         _run_failures_trends(args)
     elif args.command == "approvals":
@@ -644,6 +661,34 @@ def _run_failures_by_category(args: argparse.Namespace) -> None:
             f"{cat['count']:<7} {cat['blocked']:<8} {cat['failed']:<7} "
             f"{_fmt_age(cat['newest_failure_seconds']):<9} "
             f"{_fmt_age(cat['oldest_failure_seconds']):<9} {cat['category']}"
+        )
+
+
+def _run_failures_by_repo(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import failures_by_repo
+
+    since = _since_from_days(args.days)
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = failures_by_repo(session, since=since)
+
+    repos = report["repos"]
+    if not repos:
+        print(f"No runs failed in the last {args.days}d - nothing to triage.")
+        return
+
+    print(
+        f"Failures by repo (last {args.days}d): {report['count']} total across "
+        f"{report['distinct_repos']} repo(s), {report['blocked']} blocked, "
+        f"{report['failed']} execution-failed (most frequent first):\n"
+    )
+    print(f"{'repo':<40} {'count':<7} {'blocked':<8} {'failed':<7} {'newest':<9} oldest")
+    for repo in repos:
+        print(
+            f"{repo['repo']:<40} {repo['count']:<7} {repo['blocked']:<8} "
+            f"{repo['failed']:<7} {_fmt_age(repo['newest_failure_seconds']):<9} "
+            f"{_fmt_age(repo['oldest_failure_seconds'])}"
         )
 
 

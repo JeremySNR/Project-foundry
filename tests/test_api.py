@@ -897,6 +897,18 @@ def test_dashboard_renders_failures_by_category_panel() -> None:
     assert "loadFailureCategories();" in DASHBOARD_HTML
 
 
+def test_dashboard_renders_failures_by_repo_panel() -> None:
+    """The failures-by-repo panel (issue #37) must fetch the by-repo endpoint,
+    have a panel to render into, and be wired into the refresh loop — the
+    repo-axis complement to the failures-by-category roll-up ("is one repo the
+    systemic blocker?")."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/failures/by-repo' in DASHBOARD_HTML
+    assert '<div id="failure-repos"></div>' in DASHBOARD_HTML
+    assert "loadFailureRepos();" in DASHBOARD_HTML
+
+
 def test_dashboard_renders_failure_trend_panel() -> None:
     """The failure-trend panel (issue #37) must fetch the failures/trends
     endpoint, have a panel to render into, and be wired into the refresh loop —
