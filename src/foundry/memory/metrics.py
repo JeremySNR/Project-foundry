@@ -9,6 +9,7 @@ period are small.
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import datetime, timedelta, timezone
 
@@ -104,6 +105,31 @@ REVIEW_IN_FLIGHT_STATUSES = (RunStatus.PR_OPEN,)
 # (PR_OPENED) and every later push (PR_UPDATED). The latest of these dates the
 # staleness clock - see :func:`_pr_activity_since_map`.
 _PR_ACTIVITY_EVENTS = (AuditEventType.PR_OPENED, AuditEventType.PR_UPDATED)
+
+# Terminal-failure states a human should triage - the failure-side complement to
+# the three in-flight queues above. ``BLOCKED`` is the gate refusing work no
+# matter who approves (unroutable, policy-denied, a forbidden-path block, a human
+# stop) - sticky and never retried (invariant #7); ``EXECUTION_FAILED`` is a run
+# whose agent crashed or produced no PR in its window. Both mean "Foundry stopped
+# and a person should look", and unlike the waiting queues a run never *leaves*
+# these states (a fresh trigger starts a new run), so the failure queue is bounded
+# to a recent window rather than listing every failure ever.
+FAILURE_STATUSES = (RunStatus.BLOCKED, RunStatus.EXECUTION_FAILED)
+
+# The audit event that marks a run *entering* each terminal-failure state, mapped
+# per status (mirrors :data:`_WAIT_START_EVENTS_BY_STATUS`): ``BLOCKED`` is
+# recorded by RUN_BLOCKED, ``EXECUTION_FAILED`` by AGENT_FAILED. The latest such
+# event for a run dates *when* it failed and carries *why* in its audit metadata
+# (a ``category`` like ``policy_denied``/``pr_window_expired``, or a ``reason``).
+_FAILURE_EVENTS_BY_STATUS: dict[RunStatus, tuple[AuditEventType, ...]] = {
+    RunStatus.BLOCKED: (AuditEventType.RUN_BLOCKED,),
+    RunStatus.EXECUTION_FAILED: (AuditEventType.AGENT_FAILED,),
+}
+
+# The flat set of every failure-marker event, for the single audit-trail query.
+_ALL_FAILURE_EVENTS = tuple(
+    {e for events in _FAILURE_EVENTS_BY_STATUS.values() for e in events}
+)
 
 
 def _percentile(sorted_values: list[int], fraction: float) -> int | None:
@@ -862,6 +888,149 @@ def review_queue(
         ),
         "sla_breaches": breaches,
         "stale_breaches": stale_breaches,
+        "runs": entries,
+    }
+
+
+def _failure_reason(metadata_json: str | None) -> str | None:
+    """The human-readable failure reason from a failure event's audit metadata -
+    its ``category`` (e.g. ``policy_denied``, ``unroutable``, ``forbidden_path``,
+    ``pr_window_expired``, ``human_stopped``) or, failing that, its ``reason``
+    string.
+
+    Returns ``None`` when there is no metadata or it can't be parsed - this is a
+    read-only reporting path and must never raise on a malformed row.
+    """
+    if not metadata_json:
+        return None
+    try:
+        meta = json.loads(metadata_json)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get("category") or meta.get("reason")
+    return value if isinstance(value, str) else None
+
+
+def _failure_event_map(
+    session, runs: list[FoundryRun]
+) -> dict[str, tuple[datetime, str | None]]:
+    """For each failed run, the ``(time, reason)`` it entered its terminal-failure
+    state - the latest marker event *valid for that run's status*
+    (:data:`_FAILURE_EVENTS_BY_STATUS`) and the reason from that event's metadata.
+
+    A generic event (RUN_BLOCKED, AGENT_FAILED) is only honoured for the status it
+    actually marks the entry of, so an AGENT_FAILED left on a run that later got
+    BLOCKED doesn't date the block. Runs that carry no marker event are absent
+    from the map; the caller falls back to the run's immutable ``created_at`` with
+    an unknown reason.
+    """
+    if not runs:
+        return {}
+    rows = (
+        session.query(
+            FoundryAuditEvent.run_id,
+            FoundryAuditEvent.event_type,
+            FoundryAuditEvent.created_at,
+            FoundryAuditEvent.metadata_json,
+        )
+        .filter(
+            FoundryAuditEvent.run_id.in_([r.id for r in runs]),
+            FoundryAuditEvent.event_type.in_(_ALL_FAILURE_EVENTS),
+        )
+        .all()
+    )
+    by_run: dict[str, list[tuple[AuditEventType, datetime, str | None]]] = {}
+    for run_id, event_type, created_at, metadata_json in rows:
+        if created_at is not None:
+            by_run.setdefault(run_id, []).append((event_type, created_at, metadata_json))
+
+    result: dict[str, tuple[datetime, str | None]] = {}
+    for run in runs:
+        markers = _FAILURE_EVENTS_BY_STATUS.get(run.status, ())
+        candidates = [
+            (created_at, metadata_json)
+            for (event_type, created_at, metadata_json) in by_run.get(run.id, [])
+            if event_type in markers
+        ]
+        if candidates:
+            created_at, metadata_json = max(candidates, key=lambda c: c[0])
+            result[run.id] = (created_at, _failure_reason(metadata_json))
+    return result
+
+
+def failure_queue(
+    session, *, since: datetime, now: datetime | None = None
+) -> dict:
+    """Recently-failed runs needing triage - the incident feed behind the fleet
+    strip's blocked/failed counts, the failure-side complement to
+    :func:`approval_queue` / :func:`execution_queue` / :func:`review_queue`.
+
+    Every run currently in a terminal-failure state (:data:`FAILURE_STATUSES` -
+    ``blocked`` or ``execution_failed``) whose failure happened within the window
+    (at or after ``since``), each with how long ago it failed (``failed_seconds``,
+    dated from the failure event - see :data:`_FAILURE_EVENTS_BY_STATUS`) and why
+    (``reason``, read from that event's audit metadata).
+
+    Ordered **newest first** - the most recent incident on top. This deliberately
+    differs from the three waiting queues (which order oldest-first, since a run
+    *draining* out of the state makes the longest wait the most urgent): a failed
+    run is terminal and never leaves the state, so the queue is a recency-ordered
+    incident feed bounded by ``since`` rather than an ever-growing all-time list.
+
+    Read-only - it surfaces what already happened and blocks/merges nothing. A
+    blocked run stays blocked (invariant #7); re-triggering the ticket starts a
+    fresh run, it does not revive the failed one.
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    since = _as_utc(since)
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(FAILURE_STATUSES))
+        .all()
+    )
+    failed_map = _failure_event_map(session, runs)
+
+    entries: list[dict] = []
+    for run in runs:
+        marked = failed_map.get(run.id)
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a failed run somehow carries no marker event; the reason is unknown.
+        if marked is not None:
+            failed_at, reason = marked
+        else:
+            failed_at, reason = run.created_at, None
+        failed_at = _as_utc(failed_at)
+        if failed_at < since:
+            continue  # an older incident, outside the live window
+        # Clamp at 0: a future-dated row (clock skew) is not negative elapsed time.
+        elapsed = max(0, int((now - failed_at).total_seconds()))
+        status = run.status.value if isinstance(run.status, RunStatus) else str(run.status)
+        entries.append(
+            {
+                "run_id": run.id,
+                "linear_issue_key": run.linear_issue_key,
+                "status": status,
+                "current_step": run.current_step,
+                "risk_level": run.risk_level.value if run.risk_level is not None else None,
+                "reason": reason,
+                "failed_since": failed_at.isoformat(),
+                "failed_seconds": elapsed,
+            }
+        )
+
+    entries.sort(key=lambda e: e["failed_seconds"])  # newest first
+    return {
+        "now": now.isoformat(),
+        "since": since.isoformat(),
+        "count": len(entries),
+        "newest_failure_seconds": entries[0]["failed_seconds"] if entries else None,
+        "oldest_failure_seconds": entries[-1]["failed_seconds"] if entries else None,
+        "blocked": sum(1 for e in entries if e["status"] == RunStatus.BLOCKED.value),
+        "failed": sum(
+            1 for e in entries if e["status"] == RunStatus.EXECUTION_FAILED.value
+        ),
         "runs": entries,
     }
 
