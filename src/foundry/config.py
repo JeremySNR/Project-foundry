@@ -279,6 +279,16 @@ class Settings:
     # same heuristic floor (needs OPENAI_API_KEY).
     risk_provider: str = "heuristic"
     risk_model: str = "gpt-5.5"
+    # Operator-supplied extra keywords for the ticket-text risk classifier
+    # (issue #31): sensitive-area name -> additional keywords that flag that area
+    # when they appear in a ticket's title/description. Merged *on top of* the
+    # built-in keyword floor in engines/risk.py (never replacing it), so a
+    # deployment can teach the heuristic its own domain vocabulary (e.g. "pan"
+    # for payments, "member record" for customer_data) without forking. The
+    # ticket-text twin of ``policy.sensitive_path_globs``. Strictly additive: it
+    # can only ever flag *more* areas, never fewer, so it only escalates risk.
+    # Area names are validated against SENSITIVE_AREA_KEYS at load (fail-closed).
+    extra_sensitive_keywords: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # Delivery planner backend. "template" renders deterministic
     # "Satisfy acceptance criterion: X" steps (the no-key default); "llm" adds
     # an LLM pass that produces file-level steps, test locations and verify
@@ -657,6 +667,20 @@ class Settings:
                         f"policy.path_required_roles path {glob!r} lists unknown "
                         f"approval roles {bad}; valid roles are {sorted(valid_roles)}"
                     )
+        # Extra risk keywords must be keyed on a real sensitive area (issue #31):
+        # a typo'd area name would silently never flag anything, so the operator
+        # would believe their domain vocabulary was wired in when it was not.
+        # Validated at load, fail-closed - mirrors the path_required_roles check.
+        if self.extra_sensitive_keywords:
+            from foundry.schemas.common import SENSITIVE_AREA_KEYS
+
+            valid_areas = set(SENSITIVE_AREA_KEYS)
+            for area, _keywords in self.extra_sensitive_keywords:
+                if area not in valid_areas:
+                    raise ValueError(
+                        f"risk.extra_sensitive_keywords lists unknown sensitive "
+                        f"area {area!r}; valid areas are {sorted(valid_areas)}"
+                    )
         # Change-freeze windows must be well-formed (issue #31): a real set of
         # weekdays + start/end OR an absolute range, a resolvable IANA tz. A
         # malformed window is a deploy-time error, not a silently-inert freeze
@@ -770,6 +794,11 @@ class Settings:
         return {area: globs for area, globs in self.sensitive_path_globs}
 
     @property
+    def extra_sensitive_keywords_map(self) -> dict[str, tuple[str, ...]]:
+        """sensitive-area name -> extra ticket-text keywords for that area."""
+        return {area: keywords for area, keywords in self.extra_sensitive_keywords}
+
+    @property
     def repo_forbidden_map(self) -> dict[str, tuple[str, ...]]:
         """repo name -> extra forbidden globs scoped to that repo."""
         return {repo: globs for repo, globs in self.repo_forbidden_globs}
@@ -837,6 +866,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["risk_provider"] = risk["provider"]
     if "model" in risk:
         out["risk_model"] = risk["model"]
+    if "extra_sensitive_keywords" in risk:
+        out["extra_sensitive_keywords"] = tuple(
+            (str(area), tuple(str(kw) for kw in keywords))
+            for area, keywords in (risk["extra_sensitive_keywords"] or {}).items()
+        )
 
     planner = data.get("planner", {}) or {}
     if "provider" in planner:

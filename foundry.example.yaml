@@ -24,6 +24,16 @@ risk:
   #               Costs one model call at intake plus one per PR-push event.
   provider: heuristic
   model: gpt-5.5
+  # Extra keywords for the *ticket-text* heuristic, layered on top of the
+  # built-in keyword floor (sensitive-area name -> extra keywords). Teach the
+  # classifier your domain vocabulary without forking - the ticket-text twin of
+  # policy.sensitive_path_globs below. Strictly additive: extras can only flag
+  # MORE areas, never fewer, so they only ever escalate risk. Area names must be
+  # one of the seven built-in areas (auth, payments, customer_data, pii,
+  # database_migration, infrastructure, production_deploy) or load fails.
+  # extra_sensitive_keywords:
+  #   payments: ["pan", "cardholder", "tokenisation"]
+  #   customer_data: ["member record", "loyalty profile"]
 
 planner:
   # Delivery planner backend (override with FOUNDRY_PLANNER_PROVIDER):

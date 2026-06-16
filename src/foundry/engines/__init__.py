@@ -40,6 +40,7 @@ from .risk import (
     GlobDiffRiskClassifier,
     HeuristicRiskClassifier,
     RiskClassifier,
+    merge_sensitive_keywords,
 )
 
 __all__ = [
@@ -58,6 +59,7 @@ __all__ = [
     "HeuristicRiskClassifier",
     "DiffRiskClassifier",
     "GlobDiffRiskClassifier",
+    "merge_sensitive_keywords",
     "LlmRiskClassifier",
     "LlmDiffRiskClassifier",
     "build_llm_risk_classifier",

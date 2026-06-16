@@ -54,6 +54,10 @@ database:
 analyzer:
   provider: openai
   model: gpt-4o-2026-04-23
+risk:
+  extra_sensitive_keywords:
+    payments: ["pan", "cardholder"]
+    customer_data: ["member record"]
 policy:
   repo_confidence_threshold: 85
   max_files_changed: 5
@@ -125,11 +129,34 @@ def test_load_from_yaml(tmp_path) -> None:
         "services/identity/**": ("engineering", "security"),
     }
     assert s.temporal_address == "temporal.internal:7233"
+    assert s.extra_sensitive_keywords_map == {
+        "payments": ("pan", "cardholder"),
+        "customer_data": ("member record",),
+    }
 
 
 def test_repo_forbidden_globs_default_empty() -> None:
     """No config => no per-repo forbidden globs (global list unchanged)."""
     assert Settings.from_env({}).repo_forbidden_map == {}
+
+
+def test_extra_sensitive_keywords_default_empty() -> None:
+    """No config => no extra risk keywords (built-in floor unchanged)."""
+    assert Settings.from_env({}).extra_sensitive_keywords_map == {}
+
+
+def test_extra_sensitive_keywords_unknown_area_rejected(tmp_path) -> None:
+    """A typo'd sensitive-area name fails loud at load (fail-closed)."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "risk:\n"
+        "  extra_sensitive_keywords:\n"
+        '    not_an_area: ["whatever"]\n'
+    )
+    with pytest.raises(ValueError, match="unknown sensitive area"):
+        Settings.load(path, env={})
 
 
 def test_repo_required_roles_default_empty() -> None:

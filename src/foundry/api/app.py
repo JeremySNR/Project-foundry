@@ -1895,14 +1895,30 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         if settings.use_openai_analyzer
         else None
     )
+    # Operator-supplied extra ticket-text risk keywords (issue #31), layered on
+    # top of the built-in floor. Applied to whichever ticket-text classifier is
+    # built below - the default heuristic (wired via the orchestrator) and, on
+    # the LLM path, the heuristic *floor* under the escalate-only LLM pass.
+    extra_risk_keywords = settings.extra_sensitive_keywords_map
     risk_classifier = None
     diff_risk_classifier = None
     if settings.risk_provider == "llm":
         from foundry.engines.llm import OpenAIStructuredLLM
         from foundry.engines.llm_risk import LlmDiffRiskClassifier, LlmRiskClassifier
+        from foundry.engines.risk import (
+            HeuristicRiskClassifier,
+            merge_sensitive_keywords,
+        )
 
         risk_llm = OpenAIStructuredLLM(model=settings.risk_model)
-        risk_classifier = LlmRiskClassifier(risk_llm)
+        floor = (
+            HeuristicRiskClassifier(
+                keywords=merge_sensitive_keywords(extra_risk_keywords)
+            )
+            if extra_risk_keywords
+            else None
+        )
+        risk_classifier = LlmRiskClassifier(risk_llm, floor=floor)
         diff_risk_classifier = LlmDiffRiskClassifier(
             risk_llm, settings.sensitive_globs_map
         )
@@ -2015,6 +2031,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         repo_min_approvals=settings.repo_min_approvals_map,
         path_required_roles=settings.path_required_roles_map,
         sensitive_path_globs=settings.sensitive_globs_map,
+        extra_sensitive_keywords=extra_risk_keywords,
         change_freeze_windows=settings.change_freeze_windows,
         max_agent_retries=settings.max_agent_retries,
         retry_on=settings.retry_on,
