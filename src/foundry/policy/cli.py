@@ -6,6 +6,7 @@ Usage::
     foundry-policy show <name>             # print a preset's YAML (copy-to-adopt)
     foundry-policy explain <name>          # show the gate knobs a preset resolves to
     foundry-policy check --against <name>  # verify YOUR config meets a baseline
+    foundry-policy check --against <name> --format json   # machine-readable
 
 This is decision-support and documentation only - it **never** changes a running
 deployment's policy. ``presets`` lists what the library ships; ``show`` prints a
@@ -20,7 +21,12 @@ caps), so you can see a preset's effect without standing up a run.
 another config) and reports, control by control, whether your config is *at
 least as strict* as the baseline - exiting non-zero when it is weaker, so it
 drops straight into a compliance CI pipeline. The comparison is read-only and
-uses only the already-gated knobs, so it adds no policy mechanism.
+uses only the already-gated knobs, so it adds no policy mechanism. ``check``
+takes ``--format text`` (default, the human report) or ``--format json`` (the
+same per-control verdicts as a machine-readable object on stdout, for a CI step
+that wants to parse the result rather than scrape the text); the exit code is
+identical in both modes (0 = meets/exceeds the baseline, 1 = weaker, 2 = a usage
+or config error).
 
 The presets are committed YAML built only from existing, already-gated config
 knobs - they add no new policy mechanism and touch neither ``policy/engine.py``
@@ -31,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import NoReturn
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -68,6 +75,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Baseline to check against: a preset name (e.g. 'soc2') or a path "
         "to another config file.",
     )
+    check_p.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format: 'text' (default, human report) or 'json' "
+        "(machine-readable per-control verdicts on stdout for CI). The exit "
+        "code is the same either way (0 ok, 1 weaker, 2 usage/config error).",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "presets":
@@ -77,7 +92,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "explain":
         _run_explain(args.name)
     elif args.command == "check":
-        _run_check(args.config, args.against)
+        _run_check(args.config, args.against, args.format)
 
 
 def _run_presets() -> None:
@@ -149,34 +164,58 @@ def _run_explain(name: str) -> None:
             print(f"      {repo}: {', '.join(globs)}")
 
 
-def _run_check(config_path: str | None, against: str) -> None:
+def _run_check(config_path: str | None, against: str, fmt: str = "text") -> None:
+    import json
     import os
+    from pathlib import Path
 
     from foundry.config import Settings
     from foundry.policy.library import compare_policy_strictness, resolve_settings
 
+    def _fail(message: str) -> NoReturn:
+        # Usage / config errors exit 2 - distinct from a clean "weaker" verdict
+        # (exit 1) - so CI can tell "you misconfigured the check" from "the
+        # config failed the baseline". In json mode the error is emitted as a
+        # structured object on stderr, so a json consumer never parses free text.
+        if fmt == "json":
+            json.dump({"error": message}, sys.stderr)
+            sys.stderr.write("\n")
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        sys.exit(2)
+
     source = config_path or os.environ.get("FOUNDRY_CONFIG")
     if not source:
-        print(
-            "error: no config to check; pass --config PATH or set FOUNDRY_CONFIG",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    from pathlib import Path
+        _fail("no config to check; pass --config PATH or set FOUNDRY_CONFIG")
 
     if not Path(source).exists():
-        print(f"error: config file not found: {source}", file=sys.stderr)
-        sys.exit(2)
+        _fail(f"config file not found: {source}")
 
     try:
         subject = Settings.load(source, env=os.environ)
         baseline = resolve_settings(against)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        sys.exit(2)
+        _fail(str(exc))
 
     comparison = compare_policy_strictness(subject, baseline)
+
+    if fmt == "json":
+        payload = {
+            "config": source,
+            "baseline": against,
+            "ok": comparison.ok,
+            "findings": [
+                {"knob": finding.knob, "ok": finding.ok, "detail": finding.detail}
+                for finding in comparison.findings
+            ],
+            "weaknesses": [finding.knob for finding in comparison.weaknesses],
+        }
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        if not comparison.ok:
+            sys.exit(1)
+        return
+
     print(f"Checking '{source}' against baseline '{against}':\n")
     for finding in comparison.findings:
         marker = "PASS" if finding.ok else "FAIL"

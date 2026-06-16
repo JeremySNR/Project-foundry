@@ -710,3 +710,84 @@ def test_cli_check_uses_foundry_config_env(
     # baseline preset vs baseline floor -> passes, no --config needed.
     main(["check", "--against", "baseline"])
     assert "RESULT: PASS" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# `foundry-policy check --format json` (machine-readable output for CI)
+# --------------------------------------------------------------------------- #
+def test_cli_check_json_passes_with_structured_output(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, load_preset_yaml("soc2"))
+    main(["check", "--config", config, "--against", "soc2", "--format", "json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["config"] == config
+    assert payload["baseline"] == "soc2"
+    assert payload["weaknesses"] == []
+    # One finding per compared knob, each carrying its verdict + detail.
+    knobs = {finding["knob"] for finding in payload["findings"]}
+    assert "repo_confidence_threshold" in knobs
+    assert all(finding["ok"] for finding in payload["findings"])
+    assert all(
+        {"knob", "ok", "detail"} <= finding.keys() for finding in payload["findings"]
+    )
+
+
+def test_cli_check_json_fails_exits_one_and_names_weaknesses(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, "policy:\n  repo_confidence_threshold: 50\n")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["check", "--config", config, "--against", "soc2", "--format", "json"])
+    assert excinfo.value.code == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "repo_confidence_threshold" in payload["weaknesses"]
+    # The weak knob's finding is marked not-ok in the findings list too.
+    weak = next(
+        f for f in payload["findings"] if f["knob"] == "repo_confidence_threshold"
+    )
+    assert weak["ok"] is False
+
+
+def test_cli_check_json_emits_structured_error_on_unknown_baseline(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, "policy:\n  repo_confidence_threshold: 90\n")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["check", "--config", config, "--against", "nope", "--format", "json"])
+    # Usage / config errors still exit 2 (distinct from a "weaker" verdict),
+    # but in json mode the error is a structured object on stderr.
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    error = json.loads(captured.err)
+    assert "nope" in error["error"]
+
+
+def test_cli_check_defaults_to_text_format(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry.policy.cli import main
+
+    # No --format flag -> the human report, byte-for-byte as before.
+    config = _write_config(tmp_path, load_preset_yaml("soc2"))
+    main(["check", "--config", config, "--against", "soc2"])
+    out = capsys.readouterr().out
+    assert "RESULT: PASS" in out
+    assert "PASS  repo_confidence_threshold" in out
