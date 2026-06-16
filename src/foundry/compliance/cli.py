@@ -6,6 +6,8 @@ Usage::
     foundry-evidence epic <run_id>    [--format json|html|pdf] [--output PATH]
     foundry-evidence archive [--from ISO] [--to ISO] [--days N]
                              [--format json|html|pdf] [--output PATH]
+    foundry-evidence verify [run_id] [--from ISO] [--to ISO] [--days N]
+                            [--output PATH]
 
 This is the offline twin of the evidence endpoints (``GET /runs/{id}/evidence``,
 ``GET /runs/{id}/epic/evidence``, ``GET /evidence``): it reads the same
@@ -22,6 +24,14 @@ resolving the epic root first so it works when pointed at a child run too
 in a date range, with the same ``from``-inclusive / ``to``-exclusive bound
 semantics as ``GET /evidence`` (a date-only ``to`` covers the whole day), falling
 back to the last ``--days`` (default 90) when no explicit window is given.
+
+``verify`` is the **audit-integrity CI gate** - the audit-side sibling of
+``foundry-policy check``. It recomputes the tamper-evidence verdict (artifact
+content hashes, the gap-free audit sequence, and the cross-row hash chain) for
+one run, or for every run in a date range, prints a machine-readable JSON
+verdict, and **exits non-zero when any chain fails to verify** so a pipeline can
+break the build on a tampered trail. It runs the *same* ``verify_integrity`` that
+backs an evidence pack's ``integrity`` block, so the two can't drift.
 
 Settings come from ``FOUNDRY_CONFIG`` and the usual environment variable
 overrides.
@@ -86,6 +96,48 @@ def main() -> None:
     )
     _add_output_args(archive_p)
 
+    verify_p = sub.add_parser(
+        "verify",
+        help=(
+            "Verify audit-chain integrity and exit non-zero on any failure "
+            "(the audit-integrity CI gate)."
+        ),
+    )
+    verify_p.add_argument(
+        "run_id",
+        nargs="?",
+        default=None,
+        help="A single run to verify; omit to verify every run in the window.",
+    )
+    verify_p.add_argument(
+        "--from",
+        dest="from_",
+        default=None,
+        metavar="ISO",
+        help="Start of the window (inclusive), ISO 8601 date or datetime.",
+    )
+    verify_p.add_argument(
+        "--to",
+        default=None,
+        metavar="ISO",
+        help=(
+            "End of the window (exclusive), ISO 8601 date or datetime; a "
+            "date-only value covers the whole day. Defaults to now."
+        ),
+    )
+    verify_p.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Window length in days when --from is omitted (default: 90).",
+    )
+    verify_p.add_argument(
+        "--output",
+        default=None,
+        metavar="PATH",
+        help="Write the JSON verdict to PATH instead of stdout.",
+    )
+
     args = parser.parse_args()
     if args.command == "run":
         _run_export(args)
@@ -93,6 +145,8 @@ def main() -> None:
         _epic_export(args)
     elif args.command == "archive":
         _archive_export(args)
+    elif args.command == "verify":
+        _verify(args)
 
 
 def _add_output_args(p: argparse.ArgumentParser) -> None:
@@ -278,6 +332,66 @@ def _archive_export(args: argparse.Namespace) -> None:
         html=render_archive_html,
         pdf=render_archive_pdf,
     )
+
+
+def _verify(args: argparse.Namespace) -> None:
+    """Verify audit-chain integrity; exit non-zero when any run fails to verify.
+
+    Single-run mode (a ``run_id`` is given) verifies just that run; window mode
+    (no ``run_id``) verifies every run in a date range, with the same
+    ``from``-inclusive / ``to``-exclusive / date-only-``to``-covers-the-day bounds
+    as ``archive`` (default the last ``--days``, 90). The JSON verdict is always
+    printed (or written to ``--output``); the process then exits 0 when every
+    checked chain verified and 1 when one or more did not - the signal a CI step
+    gates on. Bad window arguments still exit 2 (usage error).
+    """
+    from foundry.compliance.evidence import (
+        build_integrity_archive,
+        build_integrity_report,
+    )
+    from foundry.db.models import FoundryRun
+
+    _, session_factory = _session_factory()
+
+    if args.run_id is not None:
+        if args.from_ or args.to or args.days is not None:
+            print(
+                "error: a run_id and a --from/--to/--days window are mutually "
+                "exclusive",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        with session_factory() as session:
+            run = session.get(FoundryRun, args.run_id)
+            if run is None:
+                print(f"error: run not found: {args.run_id}", file=sys.stderr)
+                sys.exit(1)
+            report = build_integrity_report(session, run)
+        _emit(_dump_json(report), args.output)
+        sys.exit(0 if report["verified"] else 1)
+
+    # Window mode: same bound semantics as `archive`.
+    until = (
+        _parse_iso_bound(args.to, inclusive_day_end=True)
+        if args.to
+        else datetime.now(timezone.utc)
+    )
+    if args.from_:
+        since: datetime | None = _parse_iso_bound(args.from_, inclusive_day_end=False)
+    else:
+        window = 90 if args.days is None else args.days
+        if window < 1:
+            print("error: --days must be >= 1", file=sys.stderr)
+            sys.exit(2)
+        since = until - timedelta(days=window)
+    if since >= until:
+        print("error: --from must be before --to", file=sys.stderr)
+        sys.exit(2)
+
+    with session_factory() as session:
+        archive = build_integrity_archive(session, since=since, until=until)
+    _emit(_dump_json(archive), args.output)
+    sys.exit(0 if archive["verified"] else 1)
 
 
 def _parse_iso_bound(value: str, *, inclusive_day_end: bool) -> datetime:
