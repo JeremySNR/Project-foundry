@@ -331,6 +331,81 @@ def build_evidence_pack(
     return pack
 
 
+def build_integrity_report(
+    session: Session,
+    run: FoundryRun,
+    *,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Compact tamper-evidence verdict for one run - the *verification* half of an
+    evidence pack without the payload.
+
+    Loads the same artifacts and audit events ``build_evidence_pack`` does and runs
+    them through the *same* ``verify_integrity``, so this verdict can never drift
+    from a pack's ``integrity`` block. Intended for an audit-integrity CI gate
+    (``foundry-evidence verify``): a stable, machine-readable pass/fail per run,
+    the audit-side sibling of ``foundry-policy check``.
+    """
+    artifacts = (
+        session.query(FoundryArtifact)
+        .filter_by(run_id=run.id)
+        .order_by(FoundryArtifact.created_at, FoundryArtifact.version)
+        .all()
+    )
+    events = (
+        session.query(FoundryAuditEvent)
+        .filter_by(run_id=run.id)
+        .order_by(FoundryAuditEvent.sequence)
+        .all()
+    )
+    integrity = verify_integrity(artifacts, events)
+    return {
+        "generated_at": _iso(generated_at or datetime.now(timezone.utc)),
+        "run_id": run.id,
+        "status": run.status.value,
+        "created_at": _iso(run.created_at),
+        "verified": integrity["verified"],
+        "integrity": integrity,
+    }
+
+
+def build_integrity_archive(
+    session: Session,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Verify the audit integrity of every run in a date range.
+
+    The window twin of ``build_integrity_report``: each run in the range is
+    verified through the same path, and the archive's top-level ``verified`` flag
+    is the AND of every run's verdict (vacuously ``True`` for an empty range), with
+    ``failed`` naming the runs whose chain didn't verify. ``since``/``until`` bound
+    ``FoundryRun.created_at`` - ``since`` inclusive, ``until`` exclusive, the same
+    half-open semantics as ``build_evidence_archive`` - and either may be ``None``
+    for an open bound. This is the verdict a CI gate exits on.
+    """
+    stamp = generated_at or datetime.now(timezone.utc)
+    query = session.query(FoundryRun)
+    if since is not None:
+        query = query.filter(FoundryRun.created_at >= since)
+    if until is not None:
+        query = query.filter(FoundryRun.created_at < until)
+    runs = query.order_by(FoundryRun.created_at, FoundryRun.id).all()
+
+    reports = [build_integrity_report(session, run, generated_at=stamp) for run in runs]
+    failed = [r["run_id"] for r in reports if not r["verified"]]
+    return {
+        "generated_at": _iso(stamp),
+        "range": {"from": _iso(since), "to": _iso(until)},
+        "run_count": len(reports),
+        "verified": not failed,
+        "failed": failed,
+        "runs": reports,
+    }
+
+
 def build_evidence_archive(
     session: Session,
     *,

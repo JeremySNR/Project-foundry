@@ -15,6 +15,7 @@ import pytest
 from foundry.agents.manual import InMemoryFakeProvider
 from foundry.compliance.cli import main
 from foundry.db import create_all, make_engine, make_session_factory
+from foundry.db.models import FoundryAuditEvent
 from foundry.orchestrator import FoundryOrchestrator
 from foundry.schemas.common import PRStatus
 from foundry.schemas.pr import PullRequestState
@@ -259,3 +260,120 @@ def test_archive_rejects_bad_days(monkeypatch, db_url) -> None:
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2
+
+
+# -- verify (audit-integrity CI gate) ------------------------------------------
+
+
+def _tamper_audit_chain(db_url: str, run_id: str) -> None:
+    """Corrupt a run's stored chain hash so verification must fail."""
+    engine = make_engine(db_url)
+    sf = make_session_factory(engine)
+    with sf() as session:
+        events = (
+            session.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id)
+            .order_by(FoundryAuditEvent.sequence)
+            .all()
+        )
+        assert events, "expected a populated audit trail to tamper with"
+        target = events[len(events) // 2]
+        target.content_hash = "0" * 64  # a hash that can't recompute
+        session.add(target)
+        session.commit()
+
+
+def _run_verify(monkeypatch, db_url: str, *argv: str) -> int:
+    """Invoke `foundry-evidence verify ...`, returning the process exit code."""
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr("sys.argv", ["foundry-evidence", "verify", *argv])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    return exc.value.code
+
+
+def test_verify_single_run_ok_exits_0(monkeypatch, capsys, db_url) -> None:
+    run_id = _seed_merged_run(db_url)
+    code = _run_verify(monkeypatch, db_url, run_id)
+    verdict = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert verdict["run_id"] == run_id
+    assert verdict["verified"] is True
+    assert verdict["integrity"]["audit_chain"]["ok"] is True
+
+
+def test_verify_single_run_tampered_exits_1(monkeypatch, capsys, db_url) -> None:
+    run_id = _seed_merged_run(db_url)
+    _tamper_audit_chain(db_url, run_id)
+    code = _run_verify(monkeypatch, db_url, run_id)
+    verdict = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert verdict["verified"] is False
+    # The corrupted row (and the link after it) is reported, not swallowed.
+    assert verdict["integrity"]["audit_chain"]["broken_at"]
+
+
+def test_verify_run_not_found_exits_1(monkeypatch, capsys, db_url) -> None:
+    _orch(db_url)  # schema only, no such run
+    code = _run_verify(monkeypatch, db_url, "missing")
+    assert code == 1
+    assert "run not found" in capsys.readouterr().err
+
+
+def test_verify_window_ok_exits_0(monkeypatch, capsys, db_url) -> None:
+    run_id = _seed_merged_run(db_url)
+    code = _run_verify(monkeypatch, db_url)
+    archive = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert archive["verified"] is True
+    assert archive["run_count"] == 1
+    assert archive["runs"][0]["run_id"] == run_id
+    assert archive["failed"] == []
+
+
+def test_verify_window_tampered_exits_1(monkeypatch, capsys, db_url) -> None:
+    run_id = _seed_merged_run(db_url)
+    _tamper_audit_chain(db_url, run_id)
+    code = _run_verify(monkeypatch, db_url)
+    archive = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert archive["verified"] is False
+    assert archive["failed"] == [run_id]
+
+
+def test_verify_empty_window_is_vacuously_ok(monkeypatch, capsys, db_url) -> None:
+    _seed_merged_run(db_url)
+    # A window entirely in the past contains no runs - nothing to fail on.
+    code = _run_verify(monkeypatch, db_url, "--from", "2000-01-01", "--to", "2000-12-31")
+    archive = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert archive["run_count"] == 0
+    assert archive["verified"] is True
+
+
+def test_verify_run_id_and_window_are_mutually_exclusive(monkeypatch, db_url) -> None:
+    run_id = _seed_merged_run(db_url)
+    code = _run_verify(monkeypatch, db_url, run_id, "--days", "7")
+    assert code == 2
+
+
+def test_verify_rejects_bad_days(monkeypatch, db_url) -> None:
+    _orch(db_url)
+    code = _run_verify(monkeypatch, db_url, "--days", "0")
+    assert code == 2
+
+
+def test_verify_writes_verdict_to_output_file(
+    monkeypatch, capsys, db_url, tmp_path
+) -> None:
+    run_id = _seed_merged_run(db_url)
+    out_path = tmp_path / "verdict.json"
+    code = _run_verify(monkeypatch, db_url, run_id, "--output", str(out_path))
+    captured = capsys.readouterr()
+    assert code == 0
+    assert f"Wrote {out_path}" in captured.err
+    assert captured.out.strip() == ""
+    verdict = json.loads(out_path.read_text())
+    assert verdict["run_id"] == run_id
+    assert verdict["verified"] is True
