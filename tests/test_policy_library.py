@@ -791,3 +791,177 @@ def test_cli_check_defaults_to_text_format(
     out = capsys.readouterr().out
     assert "RESULT: PASS" in out
     assert "PASS  repo_confidence_threshold" in out
+
+
+# --------------------------------------------------------------------------- #
+# `explain`: introspect a preset OR the operator's own config
+# --------------------------------------------------------------------------- #
+# A small config that sets gate knobs distinctly from any preset, so an
+# assertion can prove `explain` read *this* config and not a default/preset.
+_OWN_CONFIG_YAML = """
+policy:
+  repo_confidence_threshold: 73
+  max_files_changed: 9
+  min_approvals: 2
+  forbidden_globs:
+    - "infra/**"
+    - "**/my-secrets/**"
+  repo_required_roles:
+    billing-service: ["security"]
+  path_required_roles:
+    "**/ledger/**": ["security"]
+remediation:
+  max_agent_retries: 1
+budget:
+  max_cost_per_run: 7.5
+"""
+
+
+def test_cli_explain_introspects_own_config_via_flag(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, _OWN_CONFIG_YAML)
+    main(["explain", "--config", config])
+    out = capsys.readouterr().out
+    # Labelled as a config (not a preset) and reflecting THIS file's knobs.
+    assert f"config '{config}'" in out
+    assert "repo_confidence_threshold : 73" in out
+    assert "min_approvals             : 2" in out
+    assert "billing-service: security" in out
+    assert "**/ledger/**: security" in out
+
+
+def test_cli_explain_accepts_a_config_path_positionally(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, _OWN_CONFIG_YAML)
+    main(["explain", config])
+    out = capsys.readouterr().out
+    assert f"config '{config}'" in out
+    assert "max_files_changed         : 9" in out
+
+
+def test_cli_explain_uses_foundry_config_env(
+    tmp_path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, _OWN_CONFIG_YAML)
+    monkeypatch.setenv("FOUNDRY_CONFIG", config)
+    main(["explain"])
+    out = capsys.readouterr().out
+    assert f"config '{config}'" in out
+    assert "repo_confidence_threshold : 73" in out
+
+
+def test_cli_explain_preset_still_labelled_as_preset(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Backward compatibility: a bare preset name is unchanged - still loaded
+    # pure and headed "preset '<name>'".
+    from foundry.policy.cli import main
+
+    main(["explain", "soc2"])
+    out = capsys.readouterr().out
+    assert "Effective policy for preset 'soc2':" in out
+
+
+def test_cli_explain_json_emits_effective_knobs(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, _OWN_CONFIG_YAML)
+    main(["explain", "--config", config, "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source"] == config
+    assert payload["kind"] == "config"
+    policy = payload["policy"]
+    assert policy["repo_confidence_threshold"] == 73
+    assert policy["min_approvals"] == 2
+    assert policy["repo_required_roles"] == {"billing-service": ["security"]}
+    assert policy["path_required_roles"] == {"**/ledger/**": ["security"]}
+    assert policy["max_cost_per_run"] == 7.5
+
+
+def test_cli_explain_json_for_a_preset_is_marked_preset(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    from foundry.policy.cli import main
+
+    main(["explain", "pci-dss", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source"] == "pci-dss"
+    assert payload["kind"] == "preset"
+    assert payload["policy"]["min_approvals"] == 2
+
+
+def test_cli_explain_errors_when_no_source(
+    monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry.policy.cli import main
+
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["explain"])
+    assert excinfo.value.code == 2
+    assert "nothing to explain" in capsys.readouterr().err.lower()
+
+
+def test_cli_explain_errors_on_unknown_target(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from foundry.policy.cli import main
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["explain", "not-a-preset-or-path"])
+    assert excinfo.value.code == 2
+    assert "not-a-preset-or-path" in capsys.readouterr().err
+
+
+def test_cli_explain_errors_when_config_missing(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry.policy.cli import main
+
+    missing = str(tmp_path / "nope.yaml")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["explain", "--config", missing])
+    assert excinfo.value.code == 2
+    assert "not found" in capsys.readouterr().err.lower()
+
+
+def test_cli_explain_json_error_on_missing_config_goes_to_stderr(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from foundry.policy.cli import main
+
+    missing = str(tmp_path / "nope.yaml")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["explain", "--config", missing, "--format", "json"])
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""  # nothing on stdout for a json consumer to parse
+    assert json.loads(captured.err)["error"]
+
+
+def test_cli_explain_rejects_both_positional_and_config(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, _OWN_CONFIG_YAML)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["explain", "soc2", "--config", config])
+    assert excinfo.value.code == 2
+    assert "not both" in capsys.readouterr().err.lower()
