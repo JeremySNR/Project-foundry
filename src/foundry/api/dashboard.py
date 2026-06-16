@@ -898,6 +898,7 @@ async function loadPolicy() {
     if (!m.configured || !p) { el.style.display = "none"; return; }  // not built from a config
     const globs = (p.forbidden_globs || []);
     const cap = p.max_cost_per_run == null ? "no cap" : "$" + p.max_cost_per_run;
+    const freezes = (p.change_freeze_windows || []);
     const rows = [
       ["policy backend", esc(m.provider || "local")],
       ["repo confidence threshold", esc(p.repo_confidence_threshold)],
@@ -908,13 +909,23 @@ async function loadPolicy() {
       ["per-repo forbidden paths", policyList(p.repo_forbidden_globs, (v) => esc((v || []).join(", ")))],
       ["per-repo required roles", policyList(p.repo_required_roles, (v) => esc((v || []).join(", ")))],
       ["per-path required roles", policyList(p.path_required_roles, (v) => esc((v || []).join(", ")))],
+      ["change-freeze windows", freezes.length ? freezes.map((w) => `<div class="kv">${esc(w)}</div>`).join("") : '<span class="kv">none</span>'],
       ["max agent retries", esc(p.max_agent_retries)],
       ["max cost per run", esc(cap)],
       ["configured approvers", esc(p.approver_count)],
     ];
     const body = rows.map(
       ([k, v]) => `<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join("");
-    el.innerHTML = `<details><summary>policy gate &mdash; what this deployment enforces (the in-app twin of <code>foundry-policy explain</code>)</summary>
+    // The one live, time-dependent signal: is a change freeze in effect right
+    // now? Evaluated server-side at request time; surfaced both in the summary
+    // (visible without expanding) and as a banner inside the panel.
+    const fz = m.active_freeze;
+    const summaryBadge = fz ? ' <span class="badge b-red">CHANGE FREEZE ACTIVE</span>' : '';
+    const freezeBanner = fz
+      ? `<div class="kv"><span class="badge b-red">CHANGE FREEZE ACTIVE</span> ${esc(fz.description)}${fz.reason ? ' &mdash; ' + esc(fz.reason) : ''} &mdash; autonomous re-dispatch is held for a human while active</div>`
+      : '';
+    el.innerHTML = `<details><summary>policy gate &mdash; what this deployment enforces (the in-app twin of <code>foundry-policy explain</code>)${summaryBadge}</summary>
+      ${freezeBanner}
       <table>${body}</table>
       <div class="kv">read-only view of the effective gate; built-ins are a non-overridable floor &mdash; config can only make it stricter</div>
     </details>`;

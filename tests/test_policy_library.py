@@ -363,6 +363,20 @@ def test_cli_explain_surfaces_n_of_m_and_path_roles(
     assert "**/cardholder/**: security" in out
 
 
+def test_cli_explain_surfaces_change_freeze_windows(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The change-management preset configures a weekend release blackout; the
+    # text `explain` must render it (it previously only appeared in --format json).
+    from foundry.policy.cli import main
+
+    main(["explain", "change-management"])
+    out = capsys.readouterr().out
+    assert "change-freeze windows" in out
+    assert "sat/sun 00:00-23:59 UTC" in out
+    assert "Weekend release blackout" in out
+
+
 def test_cli_unknown_preset_exits_nonzero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

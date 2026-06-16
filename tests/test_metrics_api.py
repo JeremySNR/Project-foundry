@@ -741,7 +741,13 @@ def test_policy_unconfigured_reports_not_configured(client) -> None:
     # Settings), so the endpoint answers "nothing to show" rather than 404 - the
     # dashboard panel hides on this.
     body = client.get("/metrics/policy", headers=AUTH).json()
-    assert body == {"configured": False, "provider": None, "policy": None}
+    assert body == {
+        "configured": False,
+        "provider": None,
+        "policy": None,
+        # No windows configured (and none could be active) => always null.
+        "active_freeze": None,
+    }
 
 
 def test_policy_reports_the_effective_gate() -> None:
@@ -796,6 +802,100 @@ def test_app_from_settings_wires_the_effective_policy() -> None:
     assert body["configured"] is True
     assert body["provider"] == settings.policy_provider
     assert body["policy"] == effective_policy_summary(settings)
+
+
+# --- GET /metrics/policy: the live "is a change freeze active now" signal (#31) ---
+
+
+def _saturday_freeze():
+    from foundry.policy.freeze import ChangeFreezeWindow
+
+    return ChangeFreezeWindow(
+        reason="weekend release blackout",
+        weekdays=("sat", "sun"),
+        start="00:00",
+        end="23:59",
+        tz="UTC",
+    )
+
+
+def test_policy_reports_no_active_freeze_when_none_configured() -> None:
+    # With no windows configured the field is present and null - so the dashboard
+    # has a stable shape to read and never shows a freeze banner by accident.
+    summary = {"min_approvals": 1, "forbidden_globs": []}
+    api = _client_with(effective_policy=summary)
+    body = api.get("/metrics/policy", headers=AUTH).json()
+    assert body["active_freeze"] is None
+
+
+def test_policy_reports_active_freeze_at_request_time() -> None:
+    # A Saturday clock falls inside a sat/sun window => the endpoint names the
+    # active window (description + reason), evaluated at request time against the
+    # injected clock, exactly as the orchestrator decides to hold a re-dispatch.
+    from datetime import datetime, timezone
+
+    saturday = datetime(2026, 6, 13, 12, 0, tzinfo=timezone.utc)  # a Saturday
+    api = _client_with(
+        effective_policy={"min_approvals": 1, "forbidden_globs": []},
+        change_freeze_windows=[_saturday_freeze()],
+        clock=lambda: saturday,
+    )
+    body = api.get("/metrics/policy", headers=AUTH).json()
+    assert body["active_freeze"] is not None
+    assert body["active_freeze"]["reason"] == "weekend release blackout"
+    assert "sat/sun" in body["active_freeze"]["description"]
+
+
+def test_policy_reports_no_active_freeze_outside_the_window() -> None:
+    # A Wednesday clock is outside the sat/sun window => null even though a window
+    # is configured. The window is still surfaced statically in `policy`.
+    from datetime import datetime, timezone
+
+    wednesday = datetime(2026, 6, 17, 12, 0, tzinfo=timezone.utc)  # a Wednesday
+    api = _client_with(
+        effective_policy={"min_approvals": 1, "forbidden_globs": []},
+        change_freeze_windows=[_saturday_freeze()],
+        clock=lambda: wednesday,
+    )
+    body = api.get("/metrics/policy", headers=AUTH).json()
+    assert body["active_freeze"] is None
+
+
+def test_app_from_settings_wires_active_freeze_windows(tmp_path) -> None:
+    # The real entrypoint hands the parsed windows from the live config to the
+    # endpoint, so the live signal works on a deployment config, not just a
+    # hand-built create_app.
+    from datetime import datetime, timezone
+
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+
+    config = tmp_path / "foundry.yaml"
+    config.write_text(
+        "policy:\n"
+        "  change_freeze_windows:\n"
+        "    - reason: weekend release blackout\n"
+        "      weekdays: [sat, sun]\n"
+        "      start: '00:00'\n"
+        "      end: '23:59'\n"
+        "      tz: UTC\n",
+        encoding="utf-8",
+    )
+    settings = Settings.load(
+        config,
+        env={
+            "FOUNDRY_LINEAR_WEBHOOK_SECRET": SECRET,
+            "FOUNDRY_API_TOKEN": API_TOKEN,
+        },
+    )
+    saturday = datetime(2026, 6, 13, 12, 0, tzinfo=timezone.utc)
+    api = TestClient(app_from_settings(settings))
+    api.app.state.clock = lambda: saturday
+    body = api.get("/metrics/policy", headers=AUTH).json()
+    assert body["active_freeze"] is not None
+    assert body["active_freeze"]["reason"] == "weekend release blackout"
+    # And the window is also surfaced statically in the effective gate.
+    assert any("sat/sun" in w for w in body["policy"]["change_freeze_windows"])
 
 
 # --- GET /metrics/policy/check: the compliance verdict vs a baseline (issue #31) ---
