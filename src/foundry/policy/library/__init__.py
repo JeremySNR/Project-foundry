@@ -34,6 +34,8 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
+from foundry.policy.freeze import describe_window, window_key
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from foundry.config import Settings
 
@@ -182,6 +184,12 @@ def effective_policy_summary(settings: "Settings") -> dict[str, Any]:
         "path_required_roles": {
             glob: list(roles) for glob, roles in settings.path_required_roles
         },
+        # Change-freeze / maintenance windows (issue #31, "time windows"): the
+        # times when an autonomous re-dispatch is held for a human. Rendered as
+        # human-readable one-liners so explain / the dashboard can print them.
+        "change_freeze_windows": [
+            describe_window(window) for window in settings.change_freeze_windows
+        ],
         "max_agent_retries": settings.max_agent_retries,
         "retry_on": list(settings.retry_on),
         "max_cost_per_run": settings.max_cost_per_run,
@@ -414,6 +422,31 @@ def compare_policy_strictness(
             "; ".join(path_role_gaps)
             if path_role_gaps
             else _none_or_covered(baseline.path_required_roles_map),
+        )
+    )
+
+    # --- change-freeze windows (superset by canonical identity) --------- #
+    # The subject must freeze at least everything the baseline freezes (it may
+    # add more). Windows are compared on their canonical key (time, not their
+    # human label), so a re-worded reason does not read as a gap.
+    s_freeze = {window_key(w) for w in subject.change_freeze_windows}
+    freeze_gaps = [
+        describe_window(w)
+        for w in baseline.change_freeze_windows
+        if window_key(w) not in s_freeze
+    ]
+    findings.append(
+        PolicyCheckFinding(
+            "change_freeze_windows",
+            not freeze_gaps,
+            f"missing {freeze_gaps}"
+            if freeze_gaps
+            else (
+                "baseline requires none"
+                if not baseline.change_freeze_windows
+                else f"covers all {len(baseline.change_freeze_windows)} baseline "
+                "window(s)"
+            ),
         )
     )
 

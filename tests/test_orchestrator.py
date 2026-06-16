@@ -826,6 +826,75 @@ def test_changes_requested_review_triggers_remediation(session_factory) -> None:
     assert orch.record_pr(run_id, review) is RunStatus.AGENT_RUNNING
 
 
+# -- change-freeze windows (issue #31, "time windows") --------------------------
+def _weekend_freeze():
+    from foundry.policy.freeze import ChangeFreezeWindow
+
+    return [
+        ChangeFreezeWindow(
+            reason="Weekend release blackout",
+            weekdays=("sat", "sun"),
+            start="00:00",
+            end="23:59",
+            tz="UTC",
+        )
+    ]
+
+
+def test_change_freeze_holds_autonomous_redispatch(session_factory) -> None:
+    """During an active freeze, a failing PR is parked for a human instead of
+    being auto-retried - no new agent job, and the escalation is audited."""
+    import json
+    from datetime import datetime, timezone
+
+    from foundry.db.models import AuditEventType, FoundryAuditEvent
+
+    tracker = InMemoryIssueTracker()
+    # 2026-06-20 is a Saturday -> inside the weekend freeze.
+    saturday = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory,
+        issue_tracker=tracker,
+        change_freeze_windows=_weekend_freeze(),
+        clock=lambda: saturday,
+    )
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+
+    failing = _pr(files_changed=[], ci_status=CIStatus.FAILING, summary="2 failed")
+    assert orch.record_pr(run_id, failing) is RunStatus.REVIEW_REQUIRED
+    # No remediation job was dispatched (only the original dispatch exists).
+    assert _job_count(session_factory, run_id) == 1
+    # The hold is on the audit trail as a change_freeze escalation.
+    with session_factory() as s:
+        events = (
+            s.query(FoundryAuditEvent)
+            .filter_by(run_id=run_id, event_type=AuditEventType.RISK_ESCALATED)
+            .all()
+        )
+        metas = [json.loads(e.metadata_json or "{}") for e in events]
+        assert any(m.get("category") == "change_freeze" for m in metas)
+    # And the human is told why on the issue.
+    assert any("change-freeze" in c for c in tracker.comments["i-1"])
+
+
+def test_change_freeze_inactive_allows_redispatch(session_factory) -> None:
+    """The same window outside its hours leaves the auto-retry byte-for-byte
+    unchanged - the freeze is a one-way ratchet, not a global off-switch."""
+    from datetime import datetime, timezone
+
+    # 2026-06-17 is a Wednesday -> outside the weekend freeze.
+    wednesday = datetime(2026, 6, 17, 12, 0, tzinfo=timezone.utc)
+    orch, run_id, _provider = _dispatched_with_provider(
+        session_factory,
+        change_freeze_windows=_weekend_freeze(),
+        clock=lambda: wednesday,
+    )
+    assert orch.record_pr(run_id, _pr()) is RunStatus.PR_OPEN
+    failing = _pr(files_changed=[], ci_status=CIStatus.FAILING, summary="2 failed")
+    assert orch.record_pr(run_id, failing) is RunStatus.AGENT_RUNNING
+    assert _job_count(session_factory, run_id) == 2
+
+
 def test_pr_opened_emitted_once_across_remediation(session_factory) -> None:
     """PR_OPENED fires only on the first observation; later events (including
     pushes during remediation, when the status is AGENT_RUNNING again) emit

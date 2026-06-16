@@ -44,6 +44,18 @@ policy:
     platform-infra: ["engineering"]
     deploy-tools: ["engineering"]
 
+  # Change-freeze windows: a weekend release blackout. During an active window
+  # Foundry will NOT auto-retry a failing PR (the one autonomous mid-run action);
+  # it parks the run for human review instead, so nothing ships unattended over
+  # the weekend. Strictly additive - a freeze only ever holds work for a human.
+  # Adjust the timezone to your change calendar's.
+  change_freeze_windows:
+    - reason: "Weekend release blackout"
+      weekdays: ["sat", "sun"]
+      start: "00:00"
+      end: "23:59"
+      tz: "UTC"
+
 remediation:
   # One retry, and only for CI failures: a reviewer requesting changes on a
   # change-managed run should bring a human back into the loop, not trigger
