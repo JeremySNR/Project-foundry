@@ -13,6 +13,10 @@ Usage::
     foundry-memory approvals
     foundry-memory executions
     foundry-memory reviews
+    foundry-memory delivery [--days D]
+    foundry-memory delivery-trends [--bucket week|day] [--days D]
+    foundry-memory delivery-by-repo [--days D]
+    foundry-memory delivery-by-repo-trends [--bucket week|day] [--days D]
 
 ``backfill`` derives outcome rows for terminal runs that finished before the
 ``foundry_run_outcomes`` table existed (or that a fail-soft hook missed);
@@ -45,6 +49,18 @@ currently parked in that state, oldest first, with its age and (when the matchin
 engineer can answer "what is the oldest thing waiting, and is it overdue?" from the
 command line. Like ``fleet``/``failures`` they call the same ``memory/metrics.py``
 derivations the endpoints serve, so the CLI and API verdicts can't drift.
+
+``delivery``, ``delivery-trends``, ``delivery-by-repo`` and
+``delivery-by-repo-trends`` are the offline twins of the **delivery** metrics
+endpoints (``GET /metrics/delivery`` / ``/metrics/delivery/trends`` /
+``/metrics/delivery/by-repo`` / ``/metrics/delivery/by-repo/trends``) - the
+org-wide "where work ships, stalls and spends" cut and its trend / per-repo
+dimensions. They answer "what did we ship in the window, where, and at what
+cost?" and "is throughput trending up or down?" offline. Same ``--days`` (default
+90) and ``--bucket`` (default ``week``) defaults as the endpoints, calling the
+same ``memory/metrics.py`` derivations, so the CLI and API verdicts can't drift.
+(``delivery`` omits the ``top_priors`` block the endpoint carries - that is what
+``show-priors`` already prints offline.)
 
 Settings come from ``FOUNDRY_CONFIG`` and the usual environment variable
 overrides.
@@ -155,6 +171,54 @@ def main() -> None:
         "GET /metrics/reviews).",
     )
 
+    def _add_days(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--days",
+            type=int,
+            default=90,
+            help="Only consider runs that finished in the last N days (default: 90).",
+        )
+
+    def _add_bucket(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--bucket",
+            default="week",
+            choices=("day", "week"),
+            help="Time bucket for the trend (default: week).",
+        )
+
+    _add_days(
+        sub.add_parser(
+            "delivery",
+            help="Print org-wide delivery metrics (offline twin of "
+            "GET /metrics/delivery).",
+        )
+    )
+
+    deliv_trends_p = sub.add_parser(
+        "delivery-trends",
+        help="Print delivery outcomes bucketed over time (offline twin of "
+        "GET /metrics/delivery/trends).",
+    )
+    _add_bucket(deliv_trends_p)
+    _add_days(deliv_trends_p)
+
+    _add_days(
+        sub.add_parser(
+            "delivery-by-repo",
+            help="Print delivery outcomes grouped by routed repo (offline twin of "
+            "GET /metrics/delivery/by-repo).",
+        )
+    )
+
+    deliv_repo_trends_p = sub.add_parser(
+        "delivery-by-repo-trends",
+        help="Print per-repo delivery outcomes bucketed over time (offline twin of "
+        "GET /metrics/delivery/by-repo/trends).",
+    )
+    _add_bucket(deliv_repo_trends_p)
+    _add_days(deliv_repo_trends_p)
+
     args = parser.parse_args()
     if args.command == "backfill":
         _run_backfill(args)
@@ -176,6 +240,14 @@ def main() -> None:
         _run_executions()
     elif args.command == "reviews":
         _run_reviews()
+    elif args.command == "delivery":
+        _run_delivery(args)
+    elif args.command == "delivery-trends":
+        _run_delivery_trends(args)
+    elif args.command == "delivery-by-repo":
+        _run_delivery_by_repo(args)
+    elif args.command == "delivery-by-repo-trends":
+        _run_delivery_by_repo_trends(args)
 
 
 def _session_factory():
@@ -382,6 +454,23 @@ def _fmt_age(seconds: int | None) -> str:
     return f"{days}d{hours:02d}h"
 
 
+def _fmt_cost(cost: float | None) -> str:
+    """'$X' / '-' - None means no run reported a cost, never a conjured $0
+    (matching the delivery aggregates, which leave ``total_cost_usd`` None)."""
+    return "-" if cost is None else f"${cost}"
+
+
+def _since_from_days(days: int):
+    """The window start for a ``--days N`` flag, or exit(2) on a bad value -
+    the CLI mirror of the endpoints' ``days >= 1`` guard."""
+    from datetime import datetime, timedelta, timezone
+
+    if days < 1:
+        print("error: --days must be >= 1", file=sys.stderr)
+        sys.exit(2)
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
 def _sla_note(breaches: int, sla_seconds: int | None) -> str:
     """' (N breaching SLA)' / ' (SLA Ns)' / '' — match the dashboard strip's signal."""
     if sla_seconds is None:
@@ -568,3 +657,141 @@ def _run_reviews() -> None:
             f"{run['status']:<10} {(run['linear_issue_key'] or '-'):<14} "
             f"{run['run_id'][:12]}{breach}"
         )
+
+
+def _run_delivery(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import delivery_metrics
+
+    since = _since_from_days(args.days)
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = delivery_metrics(session, since=since)
+
+    print(
+        f"Delivery metrics (last {args.days}d): "
+        f"{report['runs_finished']} runs finished\n"
+    )
+    print(f"  PRs shipped       {report['prs_shipped']}")
+    print(f"  blocked           {report['blocked']}")
+    print(f"  rejected          {report['rejected']}")
+    print(f"  failed            {report['failed']}")
+    print(f"  needs clarif.     {report['needs_clarification']}")
+    print(f"  retries consumed  {report['retries_consumed']}")
+    print(f"  escalations       {report['escalations']}")
+    print(f"  CI failures       {report['ci_failures']}")
+    print(f"  spend             {_fmt_cost(report['total_cost_usd'])}")
+    ttm = report["time_to_merge_seconds"]
+    if ttm["count"]:
+        print(
+            f"  time-to-merge     median {_fmt_age(ttm['median'])}, "
+            f"p90 {_fmt_age(ttm['p90'])} (n={ttm['count']})"
+        )
+    else:
+        print("  time-to-merge     - (no merges)")
+
+    if report["blocks_by_reason"]:
+        print("\n  blocks by reason:")
+        for reason, count in sorted(report["blocks_by_reason"].items()):
+            print(f"    {reason:<28} {count}")
+        # How many of those blocks a later merged rerun on the same issue
+        # superseded (a human fixed the input) - the "was the block justified?"
+        # signal the endpoint carries alongside the reason breakdown.
+        print(
+            f"    {'(superseded by later merge)':<28} "
+            f"{report['blocked_superseded_by_merged_run']}"
+        )
+
+    if report["precision_by_confidence_band"]:
+        print("\n  routing precision by confidence band:")
+        for band in report["precision_by_confidence_band"]:
+            print(
+                f"    {band['band']:<8} {band['merged']}/{band['routed']} merged "
+                f"(precision {band['precision']})"
+            )
+
+
+def _run_delivery_trends(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import delivery_trends
+
+    since = _since_from_days(args.days)
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = delivery_trends(session, since=since, bucket=args.bucket)
+
+    periods = report["periods"]
+    if not periods:
+        print(f"No runs finished in the last {args.days}d.")
+        return
+
+    label = "week of" if args.bucket == "week" else "day"
+    print(f"Delivery by {args.bucket} (last {args.days}d):\n")
+    for period in periods:
+        print(
+            f"  {label} {period['period_start'][:10]}  "
+            f"shipped {period['prs_shipped']:>3}  blocked {period['blocked']:>3}  "
+            f"runs {period['runs_finished']:>3}  retries {period['retries_consumed']:>3}  "
+            f"spend {_fmt_cost(period['total_cost_usd'])}"
+        )
+
+
+def _run_delivery_by_repo(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import delivery_by_repo
+
+    since = _since_from_days(args.days)
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = delivery_by_repo(session, since=since)
+
+    repos = report["repos"]
+    if not repos:
+        print(f"No runs finished in the last {args.days}d.")
+        return
+
+    print(
+        f"Delivery by repo (last {args.days}d): {report['runs_finished']} runs "
+        f"finished across {len(repos)} repo(s) (most-shipping first):\n"
+    )
+    print(
+        f"{'repo':<40} {'shipped':<8} {'blocked':<8} {'merge%':<7} "
+        f"{'retries':<8} {'spend':<9} ttm median"
+    )
+    for repo in repos:
+        ttm = repo["time_to_merge_seconds"]
+        print(
+            f"{repo['repo']:<40} {repo['prs_shipped']:<8} {repo['blocked']:<8} "
+            f"{repo['merge_rate']:<7} {repo['retries_consumed']:<8} "
+            f"{_fmt_cost(repo['total_cost_usd']):<9} {_fmt_age(ttm['median'])}"
+        )
+
+
+def _run_delivery_by_repo_trends(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import delivery_by_repo_trends
+
+    since = _since_from_days(args.days)
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = delivery_by_repo_trends(session, since=since, bucket=args.bucket)
+
+    repos = report["repos"]
+    if not repos:
+        print(f"No runs finished in the last {args.days}d.")
+        return
+
+    periods = report["periods"]
+    label = "week of" if args.bucket == "week" else "day"
+    print(
+        f"Per-repo delivery by {args.bucket} (last {args.days}d, "
+        f"most-shipping first):\n"
+    )
+    for repo in repos:
+        print(
+            f"{repo['repo']}: {repo['prs_shipped']}/{repo['runs_finished']} merged "
+            f"(rate {repo['merge_rate']}), {repo['retries_consumed']} retries, "
+            f"{_fmt_cost(repo['total_cost_usd'])}"
+        )
+        for period_iso, cell in zip(periods, repo["series"]):
+            print(
+                f"    {label} {period_iso[:10]}  shipped {cell['prs_shipped']:>3}  "
+                f"blocked {cell['blocked']:>3}  runs {cell['runs_finished']:>3}"
+            )
+        print()
