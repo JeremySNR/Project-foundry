@@ -165,6 +165,13 @@ class Settings:
     oidc_redirect_uri: str | None = None
     oidc_scopes: tuple[str, ...] = ("openid", "email")
     oidc_session_ttl_seconds: int = 8 * 60 * 60
+    # Sliding-session refresh (issue #34). When set, session_ttl_seconds becomes
+    # the *idle* timeout and this is the absolute cap: each authenticated request
+    # slides the session cookie forward, but never past the original login + this
+    # value, so total session age is bounded and a real re-login is forced
+    # periodically. None (default) => sliding off, the cookie keeps its fixed TTL
+    # (byte-for-byte the prior behaviour). Must be >= session_ttl_seconds.
+    oidc_session_max_lifetime_seconds: int | None = None
     # Mark the login/session cookies Secure (HTTPS-only). Defaults on; set false
     # only for a local plain-HTTP deployment.
     oidc_cookie_secure: bool = True
@@ -748,6 +755,22 @@ class Settings:
                     "oidc.session_ttl_seconds must be > 0, got "
                     f"{self.oidc_session_ttl_seconds}"
                 )
+            if self.oidc_session_max_lifetime_seconds is not None:
+                if self.oidc_session_max_lifetime_seconds <= 0:
+                    raise ValueError(
+                        "oidc.session_max_lifetime_seconds must be > 0, got "
+                        f"{self.oidc_session_max_lifetime_seconds}"
+                    )
+                if (
+                    self.oidc_session_max_lifetime_seconds
+                    < self.oidc_session_ttl_seconds
+                ):
+                    raise ValueError(
+                        "oidc.session_max_lifetime_seconds (the absolute cap) "
+                        "must be >= session_ttl_seconds (the idle timeout), got "
+                        f"{self.oidc_session_max_lifetime_seconds} < "
+                        f"{self.oidc_session_ttl_seconds}"
+                    )
         # RP-initiated logout is consumed only by the logout route, which requires
         # the browser-login config; an end_session_endpoint without it would be
         # silently inert. Fail-closed at load rather than ship a half-built logout.
@@ -761,6 +784,15 @@ class Settings:
             raise ValueError(
                 "oidc.post_logout_redirect_uri is only meaningful with "
                 "end_session_endpoint set"
+            )
+        # Sliding-session refresh is consumed only by the browser-login session
+        # path; a cap without that config would be silently inert. Fail-closed at
+        # load rather than ship a knob that does nothing.
+        if self.oidc_session_max_lifetime_seconds is not None and not set_login:
+            raise ValueError(
+                "oidc.session_max_lifetime_seconds requires the browser-login "
+                "config (client_id, authorization_endpoint, token_endpoint, "
+                "redirect_uri) to be set as well"
             )
 
     @classmethod
@@ -1071,6 +1103,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["oidc_scopes"] = tuple(str(s) for s in (oidc["scopes"] or []))
     if "session_ttl_seconds" in oidc:
         out["oidc_session_ttl_seconds"] = int(oidc["session_ttl_seconds"])
+    if "session_max_lifetime_seconds" in oidc:
+        out["oidc_session_max_lifetime_seconds"] = int(
+            oidc["session_max_lifetime_seconds"]
+        )
     if "cookie_secure" in oidc:
         out["oidc_cookie_secure"] = _bool(oidc["cookie_secure"])
     if "end_session_endpoint" in oidc:
@@ -1170,6 +1206,10 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         )
     if "FOUNDRY_OIDC_SESSION_TTL_SECONDS" in env:
         out["oidc_session_ttl_seconds"] = int(env["FOUNDRY_OIDC_SESSION_TTL_SECONDS"])
+    if "FOUNDRY_OIDC_SESSION_MAX_LIFETIME_SECONDS" in env:
+        out["oidc_session_max_lifetime_seconds"] = int(
+            env["FOUNDRY_OIDC_SESSION_MAX_LIFETIME_SECONDS"]
+        )
     if "FOUNDRY_OIDC_COOKIE_SECURE" in env:
         out["oidc_cookie_secure"] = _bool(env["FOUNDRY_OIDC_COOKIE_SECURE"])
     if "FOUNDRY_OIDC_ALGORITHMS" in env:

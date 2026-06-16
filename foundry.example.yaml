@@ -421,6 +421,16 @@ auth:
   #   redirect_uri: "https://foundry.example.com/dashboard/auth/callback"
   #   scopes: ["openid", "email"]    # what the login requests from the IdP
   #   session_ttl_seconds: 28800     # how long a signed-in session lasts (8h)
+  #   #
+  #   # Sliding-session refresh (issue #34): when set, session_ttl_seconds becomes
+  #   # the *idle* timeout and this is the absolute cap. Each authenticated request
+  #   # slides the session forward, but never past the original login + this value,
+  #   # so an active operator is not logged out mid-task while an abandoned session
+  #   # still expires - and a real re-login (re-checking the IdP) is forced
+  #   # periodically. Must be >= session_ttl_seconds. Unset (default) = sliding off
+  #   # (fixed-TTL cookie, re-login on expiry). Env:
+  #   # FOUNDRY_OIDC_SESSION_MAX_LIFETIME_SECONDS.
+  #   session_max_lifetime_seconds: 86400   # absolute cap (24h)
   #   cookie_secure: true            # mark cookies Secure; false only for local HTTP
   #   #
   #   # RP-Initiated Logout (federated logout): when set, /dashboard/logout

@@ -408,6 +408,40 @@ def create_app(
         response.headers["X-RateLimit-Remaining"] = str(result.remaining)
         return response
 
+    @app.middleware("http")
+    async def _refresh_session(request: Request, call_next):
+        """Slide the dashboard SSO session cookie forward on activity (issue #34).
+
+        When sliding sessions are configured (``oidc.session_max_lifetime_seconds``
+        set), an authenticated request re-mints the session cookie with a fresh
+        idle window - capped at the original login + max lifetime by
+        ``OidcLogin.renew_session`` - so an active operator is not logged out
+        mid-task while an abandoned session still expires. Opt-in and fail-closed:
+        with sliding off (the default), or no session cookie on the request, this
+        is a no-op. It deliberately skips any response that itself sets/clears the
+        session cookie (the login callback / logout) so a just-cleared cookie is
+        never resurrected.
+        """
+        response = await call_next(request)
+        login: OidcLogin | None = app.state.oidc_login
+        if login is None or login.session_max_lifetime_seconds is None:
+            return response
+        cookie = request.cookies.get(SESSION_COOKIE)
+        if not cookie or _response_sets_session_cookie(response):
+            return response
+        renewed = login.renew_session(cookie)
+        if renewed is not None:
+            response.set_cookie(
+                SESSION_COOKIE,
+                renewed,
+                max_age=login.session_ttl_seconds,
+                httponly=True,
+                samesite="lax",
+                secure=login.cookie_secure,
+                path="/",
+            )
+        return response
+
     def _submit_decision(
         run_id: str,
         *,
@@ -1602,6 +1636,20 @@ def _auth_configured(app: FastAPI) -> bool:
     return bool(app.state.api_token) or app.state.oidc_verifier is not None
 
 
+def _response_sets_session_cookie(response: Response) -> bool:
+    """True when ``response`` already emits a ``Set-Cookie`` for the session.
+
+    Lets the sliding-session middleware (issue #34) skip the login callback (which
+    mints a fresh cookie) and the logout route (which clears it) so it never
+    re-mints over - or resurrects - a cookie the response is deliberately setting.
+    """
+    prefix = SESSION_COOKIE.encode("latin-1") + b"="
+    return any(
+        key == b"set-cookie" and value.lstrip().startswith(prefix)
+        for key, value in response.raw_headers
+    )
+
+
 def _session_identity(app: FastAPI, request: Request) -> str | None:
     """The verified subject from a dashboard SSO session cookie, or ``None``.
 
@@ -2234,6 +2282,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
             subject_claim=settings.oidc_subject_claim,
             scopes=settings.oidc_scopes,
             session_ttl_seconds=settings.oidc_session_ttl_seconds,
+            session_max_lifetime_seconds=settings.oidc_session_max_lifetime_seconds,
             cookie_secure=settings.oidc_cookie_secure,
             end_session_endpoint=settings.oidc_end_session_endpoint,
             post_logout_redirect_uri=settings.oidc_post_logout_redirect_uri,

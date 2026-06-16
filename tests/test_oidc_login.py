@@ -332,6 +332,137 @@ def test_end_session_url_appends_to_existing_query():
 
 
 # --------------------------------------------------------------------------- #
+# Sliding-session refresh - renew_session unit tests (issue #34)
+# --------------------------------------------------------------------------- #
+
+
+def test_complete_stamps_origin_login_time():
+    """The session payload carries the original login time so renewals can cap
+    total session age."""
+    priv, jwks = _keypair()
+    clock = {"t": 5000.0}
+    login, holder = _make_login(
+        priv, jwks, signer=SessionSigner("session-secret", clock=lambda: clock["t"])
+    )
+    state, cookie = _begin_and_arm(login, holder)
+    session = login.complete(code="c", state=state, login_cookie=cookie)
+    assert login.signer.read(session)["iat"] == 5000
+
+
+def test_renew_session_none_when_sliding_off():
+    """Default (no cap configured) => never renews, the cookie keeps its TTL."""
+    priv, jwks = _keypair()
+    login, _ = _make_login(priv, jwks)  # session_max_lifetime_seconds=None
+    cookie = login.signer.mint({"sub": "a", "iat": 100}, ttl_seconds=60)
+    assert login.renew_session(cookie) is None
+
+
+def test_renew_session_slides_expiry_forward():
+    priv, jwks = _keypair()
+    clock = {"t": 1000.0}
+    signer = SessionSigner("session-secret", clock=lambda: clock["t"])
+    login, _ = _make_login(
+        priv, jwks, signer=signer, session_ttl_seconds=100,
+        session_max_lifetime_seconds=10_000,
+    )
+    cookie = signer.mint({"sub": "alice@example.com", "iat": 1000}, ttl_seconds=100)
+    clock["t"] = 1050  # half-way through the idle window
+    renewed = login.renew_session(cookie)
+    assert renewed is not None
+    payload = signer.read(renewed)
+    assert payload["sub"] == "alice@example.com"
+    assert payload["iat"] == 1000  # origin preserved across the re-mint
+    assert payload["exp"] == 1050 + 100  # slid forward a fresh idle window
+
+
+def test_renew_session_caps_ttl_at_absolute_deadline():
+    """Near the absolute cap, the renewed window is clamped so exp never exceeds
+    iat + max_lifetime."""
+    priv, jwks = _keypair()
+    clock = {"t": 1000.0}
+    signer = SessionSigner("session-secret", clock=lambda: clock["t"])
+    login, _ = _make_login(
+        priv, jwks, signer=signer, session_ttl_seconds=100,
+        session_max_lifetime_seconds=250,
+    )
+    # Mint at t=1200 (so the current cookie is still valid) but with an origin
+    # 200s in the past, leaving only 50s to the cap (1000 + 250 = 1250).
+    clock["t"] = 1200
+    cookie = signer.mint({"sub": "a", "iat": 1000}, ttl_seconds=100)
+    payload = signer.read(login.renew_session(cookie))
+    assert payload["exp"] == 1250  # clamped to the cap, not 1200 + 100
+
+
+def test_renew_session_none_at_absolute_cap():
+    priv, jwks = _keypair()
+    clock = {"t": 1000.0}
+    signer = SessionSigner("session-secret", clock=lambda: clock["t"])
+    login, _ = _make_login(
+        priv, jwks, signer=signer, session_ttl_seconds=100,
+        session_max_lifetime_seconds=250,
+    )
+    # A still-valid cookie (minted now) whose origin is exactly the cap away:
+    # the slide is refused because there is no lifetime left to grant.
+    clock["t"] = 1250  # exactly at the cap (iat 1000 + 250)
+    cookie = signer.mint({"sub": "a", "iat": 1000}, ttl_seconds=100)
+    assert login.renew_session(cookie) is None
+
+
+def test_renew_session_ignores_legacy_cookie_without_iat():
+    """A session minted before this feature (no 'iat') is left alone, not renewed
+    indefinitely without an enforceable cap."""
+    priv, jwks = _keypair()
+    signer = SessionSigner("session-secret")
+    login, _ = _make_login(
+        priv, jwks, signer=signer, session_max_lifetime_seconds=10_000
+    )
+    legacy = signer.mint({"sub": "a"}, ttl_seconds=100)  # no iat
+    assert login.renew_session(legacy) is None
+
+
+def test_renew_session_none_for_invalid_cookie():
+    priv, jwks = _keypair()
+    login, _ = _make_login(priv, jwks, session_max_lifetime_seconds=10_000)
+    assert login.renew_session(None) is None
+    assert login.renew_session("garbage") is None
+
+
+def test_session_max_lifetime_config_from_env():
+    s = Settings.load(
+        env={
+            **_BEARER_ENV,
+            **_LOGIN_ENV,
+            "FOUNDRY_OIDC_SESSION_TTL_SECONDS": "3600",
+            "FOUNDRY_OIDC_SESSION_MAX_LIFETIME_SECONDS": "86400",
+        }
+    )
+    assert s.oidc_session_max_lifetime_seconds == 86400
+
+
+def test_session_max_lifetime_below_idle_ttl_rejected():
+    with pytest.raises(ValueError, match="must be >= session_ttl_seconds"):
+        Settings.load(
+            env={
+                **_BEARER_ENV,
+                **_LOGIN_ENV,
+                "FOUNDRY_OIDC_SESSION_TTL_SECONDS": "3600",
+                "FOUNDRY_OIDC_SESSION_MAX_LIFETIME_SECONDS": "60",
+            }
+        )
+
+
+def test_session_max_lifetime_without_login_config_rejected():
+    with pytest.raises(ValueError, match="session_max_lifetime_seconds requires"):
+        Settings.load(
+            env={**_BEARER_ENV, "FOUNDRY_OIDC_SESSION_MAX_LIFETIME_SECONDS": "86400"}
+        )
+
+
+def test_default_has_no_session_max_lifetime():
+    assert Settings.load().oidc_session_max_lifetime_seconds is None
+
+
+# --------------------------------------------------------------------------- #
 # API integration (TestClient drives the real routes + cookie jar)
 # --------------------------------------------------------------------------- #
 
@@ -633,3 +764,84 @@ def test_app_from_settings_fails_loud_without_secrets(tmp_path):
     s = Settings.load(env=env)
     with pytest.raises(OidcConfigError, match="session signing secret"):
         app_from_settings(s)
+
+
+# --------------------------------------------------------------------------- #
+# Sliding-session refresh - middleware integration (issue #34)
+# --------------------------------------------------------------------------- #
+
+
+def _sliding_client(clock, *, ttl=100, cap=10_000):
+    """A TestClient whose session signer is driven by ``clock`` and whose login
+    has sliding sessions enabled (cap configured)."""
+    signer = SessionSigner("session-secret", clock=lambda: clock["t"])
+    return _client(
+        login_kwargs={
+            "signer": signer,
+            "session_ttl_seconds": ttl,
+            "session_max_lifetime_seconds": cap,
+        }
+    )
+
+
+def test_sliding_off_by_default_emits_no_refresh_cookie():
+    """With no cap configured a read does not re-mint the cookie (byte-for-byte
+    the prior fixed-TTL behaviour)."""
+    client, holder = _client()
+    _drive_login(client, holder)
+    resp = client.get("/metrics/delivery")
+    assert resp.status_code == 200
+    assert "set-cookie" not in {k.lower() for k in resp.headers}
+
+
+def test_active_reads_slide_session_past_idle_window():
+    clock = {"t": 1000.0}
+    client, holder = _sliding_client(clock, ttl=100, cap=10_000)
+    _drive_login(client, holder)  # session minted at t=1000, exp=1100
+    # An active read half-way through the idle window renews the cookie...
+    clock["t"] = 1050
+    resp = client.get("/metrics/delivery")
+    assert resp.status_code == 200
+    assert any(
+        v.startswith(f"{SESSION_COOKIE}=") for k, v in resp.headers.items()
+        if k.lower() == "set-cookie"
+    )
+    # ...so at t=1140 - past the *original* 1100 idle expiry - the session is
+    # still alive because activity kept sliding it forward.
+    clock["t"] = 1140
+    assert client.get("/metrics/delivery").status_code == 200
+
+
+def test_idle_session_expires_without_activity():
+    clock = {"t": 1000.0}
+    client, holder = _sliding_client(clock, ttl=100, cap=10_000)
+    _drive_login(client, holder)  # exp=1100, nothing renews it
+    clock["t"] = 1101  # one second past the idle window
+    assert client.get("/metrics/delivery").status_code == 401
+
+
+def test_session_dies_at_absolute_cap_despite_activity():
+    clock = {"t": 1000.0}
+    client, holder = _sliding_client(clock, ttl=100, cap=250)
+    _drive_login(client, holder)  # iat=1000, cap deadline = 1250
+    # Continuous activity keeps it alive right up to the cap...
+    for t in (1090, 1180, 1240):
+        clock["t"] = t
+        assert client.get("/metrics/delivery").status_code == 200
+    # ...but past iat + max_lifetime the slid cookie has expired and cannot be
+    # renewed, forcing a fresh login (which re-checks the IdP).
+    clock["t"] = 1251
+    assert client.get("/metrics/delivery").status_code == 401
+
+
+def test_logout_not_resurrected_by_refresh_middleware():
+    """The refresh middleware must skip a response that clears the cookie, so a
+    logged-out session is not silently re-minted from the request's stale cookie."""
+    clock = {"t": 1000.0}
+    client, holder = _sliding_client(clock, ttl=100, cap=10_000)
+    _drive_login(client, holder)
+    clock["t"] = 1050
+    assert client.get("/metrics/delivery").status_code == 200
+    resp = client.get("/dashboard/logout", follow_redirects=False)
+    assert resp.status_code == 302
+    assert client.get("/metrics/delivery").status_code == 401

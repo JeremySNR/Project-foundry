@@ -113,6 +113,14 @@ class OidcLogin:
     session_ttl_seconds: int = _DEFAULT_SESSION_TTL
     login_ttl_seconds: int = _DEFAULT_LOGIN_TTL
     cookie_secure: bool = True
+    # Sliding-session refresh (issue #34). When set, ``session_ttl_seconds`` is
+    # the *idle* timeout and this is the absolute cap: each authenticated request
+    # slides the cookie's expiry forward (see ``renew_session``) but never past
+    # ``original login + session_max_lifetime_seconds``, so total session age is
+    # bounded and a real re-login (re-checking the IdP) is forced periodically.
+    # ``None`` (the default) => sliding off: the cookie keeps its fixed TTL and
+    # the login path is byte-for-byte unchanged.
+    session_max_lifetime_seconds: int | None = None
     # RP-Initiated Logout 1.0: the IdP's end-session endpoint and (optionally)
     # where it returns the browser afterwards. Both None => no federated logout
     # (the logout route just clears the local cookie). See ``end_session_url``.
@@ -201,7 +209,47 @@ class OidcLogin:
         identity = identity_from_claims(claims, self.subject_claim)
         if identity is None:
             raise OidcLoginError("id_token has no usable subject claim")
-        return self.signer.mint({"sub": identity}, ttl_seconds=self.session_ttl_seconds)
+        # Stamp the original login time so sliding renewals (``renew_session``)
+        # can enforce the absolute max-lifetime cap across re-mints. Harmless
+        # when sliding is off - the field is just unread.
+        return self.signer.mint(
+            {"sub": identity, "iat": int(self.signer.clock())},
+            ttl_seconds=self.session_ttl_seconds,
+        )
+
+    def renew_session(self, cookie: str | None) -> str | None:
+        """Return a refreshed session cookie with a slid expiry, or ``None``.
+
+        Sliding sessions are enabled only when ``session_max_lifetime_seconds``
+        is set (the absolute cap); ``session_ttl_seconds`` is then the *idle*
+        timeout. Each authenticated request slides the cookie forward by a fresh
+        idle window, but never past the original login (``iat``) plus the cap -
+        so an abandoned session still expires after the idle window, an active
+        one is kept alive, and a real re-login (re-checking the IdP) is forced
+        once the absolute cap is reached.
+
+        Returns ``None`` (no renewal, leave the current cookie alone) when:
+        sliding is off; the cookie is missing/tampered/expired; it predates this
+        feature (no ``iat``); or the absolute cap has been reached - in which
+        case the current cookie simply rides out its own remaining TTL and then
+        forces a fresh login. Never raises on bad input.
+        """
+        if self.session_max_lifetime_seconds is None:
+            return None
+        payload = self.signer.read(cookie)
+        if payload is None:
+            return None
+        sub = payload.get("sub")
+        iat = payload.get("iat")
+        if not (isinstance(sub, str) and sub) or not isinstance(iat, (int, float)):
+            return None
+        remaining_to_cap = int(iat) + self.session_max_lifetime_seconds - self.signer.clock()
+        if remaining_to_cap <= 0:
+            return None
+        ttl = min(self.session_ttl_seconds, int(remaining_to_cap))
+        if ttl < 1:
+            return None
+        return self.signer.mint({"sub": sub, "iat": int(iat)}, ttl_seconds=ttl)
 
     def end_session_url(self) -> str | None:
         """The IdP RP-initiated logout URL, or ``None`` if not configured.
