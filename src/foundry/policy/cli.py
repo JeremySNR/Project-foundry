@@ -263,7 +263,11 @@ def _run_check(config_path: str | None, against: str, fmt: str = "text") -> None
     from pathlib import Path
 
     from foundry.config import Settings
-    from foundry.policy.library import compare_policy_strictness, resolve_settings
+    from foundry.policy.library import (
+        compare_policy_strictness,
+        comparison_to_dict,
+        resolve_settings,
+    )
 
     def _fail(message: str) -> NoReturn:
         # Usage / config errors exit 2 - distinct from a clean "weaker" verdict
@@ -293,16 +297,9 @@ def _run_check(config_path: str | None, against: str, fmt: str = "text") -> None
     comparison = compare_policy_strictness(subject, baseline)
 
     if fmt == "json":
-        payload = {
-            "config": source,
-            "baseline": against,
-            "ok": comparison.ok,
-            "findings": [
-                {"knob": finding.knob, "ok": finding.ok, "detail": finding.detail}
-                for finding in comparison.findings
-            ],
-            "weaknesses": [finding.knob for finding in comparison.weaknesses],
-        }
+        # config/baseline label the run; the verdict body is the shared serialiser
+        # the in-app GET /metrics/policy/check uses, so the two can't drift.
+        payload = {"config": source, "baseline": against, **comparison_to_dict(comparison)}
         json.dump(payload, sys.stdout, indent=2)
         sys.stdout.write("\n")
         if not comparison.ok:

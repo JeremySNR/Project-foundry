@@ -427,6 +427,25 @@ def _none_or_covered(baseline_map: Mapping[str, Any]) -> str:
     return f"covers all {len(baseline_map)} baseline entr(y/ies)"
 
 
+def comparison_to_dict(comparison: PolicyComparison) -> dict[str, Any]:
+    """Serialise a :class:`PolicyComparison` to a plain JSON-able dict.
+
+    One definition shared by every machine-readable consumer of the strictness
+    check - the ``foundry-policy check --format json`` CLI output and the in-app
+    ``GET /metrics/policy/check`` endpoint - so the verdict surfaced on a
+    dashboard can't drift from the verdict a CI step exits on. Read-only: it just
+    reshapes an already-computed comparison, it changes no gate.
+    """
+    return {
+        "ok": comparison.ok,
+        "findings": [
+            {"knob": finding.knob, "ok": finding.ok, "detail": finding.detail}
+            for finding in comparison.findings
+        ],
+        "weaknesses": [finding.knob for finding in comparison.weaknesses],
+    }
+
+
 __all__ = [
     "PolicyPreset",
     "PolicyCheckFinding",
@@ -439,4 +458,5 @@ __all__ = [
     "resolve_settings",
     "effective_policy_summary",
     "compare_policy_strictness",
+    "comparison_to_dict",
 ]

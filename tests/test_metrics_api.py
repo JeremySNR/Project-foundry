@@ -796,3 +796,126 @@ def test_app_from_settings_wires_the_effective_policy() -> None:
     assert body["configured"] is True
     assert body["provider"] == settings.policy_provider
     assert body["policy"] == effective_policy_summary(settings)
+
+
+# --- GET /metrics/policy/check: the compliance verdict vs a baseline (issue #31) ---
+
+
+def test_policy_check_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/policy/check").status_code == 401
+    assert (
+        client.get(
+            "/metrics/policy/check", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_policy_check_unconfigured_reports_not_configured(client) -> None:
+    # No baseline configured (the default fixture): the endpoint answers "nothing
+    # to check" rather than 404, and the dashboard panel hides on this.
+    body = client.get("/metrics/policy/check", headers=AUTH).json()
+    assert body == {
+        "configured": False,
+        "baseline": None,
+        "ok": None,
+        "findings": [],
+        "weaknesses": [],
+    }
+
+
+def test_policy_check_reports_the_verdict() -> None:
+    # The endpoint serves whatever pre-computed verdict create_app was handed -
+    # app_from_settings computes it from compare_policy_strictness (covered below).
+    check = {
+        "baseline": "soc2",
+        "ok": False,
+        "findings": [
+            {"knob": "min_approvals", "ok": True, "detail": "2 (baseline requires >= 2)"},
+            {"knob": "forbidden_globs", "ok": False, "detail": "missing ['**/secrets/**']"},
+        ],
+        "weaknesses": ["forbidden_globs"],
+    }
+    api = _client_with(policy_check=check)
+    body = api.get("/metrics/policy/check", headers=AUTH).json()
+    assert body["configured"] is True
+    assert body["baseline"] == "soc2"
+    assert body["ok"] is False
+    assert body["weaknesses"] == ["forbidden_globs"]
+    assert body["findings"] == check["findings"]
+
+
+def test_policy_check_is_copied_not_aliased() -> None:
+    # A caller mutating the dict it passed in must not change what the endpoint
+    # serves - create_app copies it at build time.
+    check = {"baseline": "soc2", "ok": True, "findings": [], "weaknesses": []}
+    api = _client_with(policy_check=check)
+    check["ok"] = False
+    body = api.get("/metrics/policy/check", headers=AUTH).json()
+    assert body["ok"] is True
+
+
+def test_app_from_settings_wires_a_passing_compliance_check(tmp_path) -> None:
+    # A config that adopts the soc2 preset wholesale must check as at least as
+    # strict as the soc2 baseline (it IS the baseline), computed from the same
+    # compare_policy_strictness the `foundry-policy check` CLI exits on.
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+    from foundry.policy.library import load_preset_yaml
+
+    config = tmp_path / "foundry.yaml"
+    config.write_text(load_preset_yaml("soc2"), encoding="utf-8")
+    settings = Settings.load(
+        config,
+        env={
+            "FOUNDRY_LINEAR_WEBHOOK_SECRET": SECRET,
+            "FOUNDRY_API_TOKEN": API_TOKEN,
+            "FOUNDRY_POLICY_BASELINE": "soc2",
+        },
+    )
+    api = TestClient(app_from_settings(settings))
+    body = api.get("/metrics/policy/check", headers=AUTH).json()
+    assert body["configured"] is True
+    assert body["baseline"] == "soc2"
+    assert body["ok"] is True
+    assert body["weaknesses"] == []
+
+
+def test_app_from_settings_flags_a_weaker_config() -> None:
+    # A bare config (built-in defaults) is weaker than the soc2 baseline on the
+    # knobs soc2 tightens, so the in-app verdict reports it - the same FAIL the
+    # CLI `check` would exit non-zero on.
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+
+    settings = Settings.from_env(
+        {
+            "FOUNDRY_LINEAR_WEBHOOK_SECRET": SECRET,
+            "FOUNDRY_API_TOKEN": API_TOKEN,
+            "FOUNDRY_POLICY_BASELINE": "soc2",
+        }
+    )
+    api = TestClient(app_from_settings(settings))
+    body = api.get("/metrics/policy/check", headers=AUTH).json()
+    assert body["configured"] is True
+    assert body["baseline"] == "soc2"
+    assert body["ok"] is False
+    assert body["weaknesses"]  # at least one control falls short
+
+
+def test_app_from_settings_fails_loud_on_unresolvable_baseline() -> None:
+    # A typo'd baseline must fail at startup, not silently serve no signal - a
+    # compliance check that quietly "passes" on a bad baseline is the misleading
+    # outcome this must avoid.
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+
+    settings = Settings.from_env(
+        {
+            "FOUNDRY_LINEAR_WEBHOOK_SECRET": SECRET,
+            "FOUNDRY_API_TOKEN": API_TOKEN,
+            "FOUNDRY_POLICY_BASELINE": "no-such-preset",
+        }
+    )
+    with pytest.raises(ValueError, match="policy_baseline is misconfigured"):
+        app_from_settings(settings)

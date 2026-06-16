@@ -21,6 +21,7 @@ from foundry.policy import LocalPolicyEngine, PolicyInput
 from foundry.policy.library import (
     available_preset_names,
     compare_policy_strictness,
+    comparison_to_dict,
     effective_policy_summary,
     get_preset,
     list_presets,
@@ -412,6 +413,33 @@ budget:
 
 def _finding(comparison, knob):
     return next(f for f in comparison.findings if f.knob == knob)
+
+
+def test_comparison_to_dict_shape() -> None:
+    # The shared serialiser the CLI `check --format json` and the in-app
+    # GET /metrics/policy/check both use, so the two verdicts can't drift.
+    weaker = Settings.from_env({})  # built-in defaults
+    baseline = load_preset_settings("soc2")
+    comparison = compare_policy_strictness(weaker, baseline)
+    payload = comparison_to_dict(comparison)
+    assert set(payload) == {"ok", "findings", "weaknesses"}
+    assert payload["ok"] == comparison.ok
+    assert payload["ok"] is False  # defaults are weaker than soc2
+    assert all(
+        {"knob", "ok", "detail"} == finding.keys() for finding in payload["findings"]
+    )
+    # weaknesses is exactly the not-ok knobs, order-preserved.
+    assert payload["weaknesses"] == [
+        f["knob"] for f in payload["findings"] if not f["ok"]
+    ]
+    assert payload["weaknesses"]  # at least one control falls short
+
+
+def test_comparison_to_dict_all_pass() -> None:
+    settings = load_preset_settings("soc2")
+    payload = comparison_to_dict(compare_policy_strictness(settings, settings))
+    assert payload["ok"] is True
+    assert payload["weaknesses"] == []
 
 
 def test_check_identical_preset_passes() -> None:

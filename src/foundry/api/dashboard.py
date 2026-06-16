@@ -217,6 +217,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="repo-trends"></div>
 <div id="epics"></div>
 <div id="policy"></div>
+<div id="policy-check"></div>
 <main>
   <div id="runs"></div>
   <div id="detail"><div class="empty">Select a run to see its full decision timeline.</div></div>
@@ -923,6 +924,43 @@ async function loadPolicy() {
   }
 }
 
+// The compliance verdict of the live gate against the configured baseline
+// (issue #31) - the always-on, in-app twin of `foundry-policy check --against`.
+// Read-only; shows whether the gate is at least as strict as the committed
+// compliance baseline (and where it has drifted below it), so an auditor sees
+// drift on the dashboard without running the CLI in CI.
+async function loadPolicyCheck() {
+  const el = $("#policy-check");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/policy/check", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    if (!m.configured) { el.style.display = "none"; return; }  // no baseline configured
+    const findings = m.findings || [];
+    const verdict = m.ok
+      ? '<span class="badge b-green">PASS</span>'
+      : `<span class="badge b-red">FAIL</span> <span class="kv">weaker on ${(m.weaknesses || []).length} control(s)</span>`;
+    const body = findings.map((f) => {
+      const mark = f.ok
+        ? '<span class="badge b-green">PASS</span>'
+        : '<span class="badge b-red">FAIL</span>';
+      return `<tr><td>${mark}</td><td>${esc(f.knob)}</td><td class="kv">${esc(f.detail)}</td></tr>`;
+    }).join("");
+    el.innerHTML = `<details><summary>compliance check &mdash; is the gate at least as strict as baseline <code>${esc(m.baseline)}</code>? (the in-app twin of <code>foundry-policy check</code>)</summary>
+      <div style="padding:6px 0">result: ${verdict}</div>
+      <table>${body}</table>
+      <div class="kv">read-only continuous compliance verdict; higher/lower/superset is "stricter" per the gate's direction &mdash; the check labels drift, it blocks no run</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 function refresh() {
   loadRuns();
   loadFleet();
@@ -937,6 +975,7 @@ function refresh() {
   loadRepoTrends();
   loadEpics();
   loadPolicy();
+  loadPolicyCheck();
 }
 
 $("#save").addEventListener("click", () => {
