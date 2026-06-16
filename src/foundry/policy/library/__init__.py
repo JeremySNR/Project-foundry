@@ -248,6 +248,22 @@ class PolicyCheckFinding:
       ``None`` for collection knobs, where a single number does not apply.
     - ``missing`` - for the **collection** knobs, the baseline items the subject
       fails to cover (empty when the control passes); always empty for scalars.
+    - ``missing_items`` - the same shortfall as ``missing`` but **structured**,
+      so a consumer never has to parse the ``"<key>: <items>"`` prose. One dict
+      per shortfall, shaped by the knob's kind:
+
+      - **map -> list knobs** (``repo_forbidden_globs`` / ``repo_required_roles``
+        / ``path_required_roles``): ``{"key": <repo|glob>, "items": [<missing
+        glob/role>, ...]}`` per shortfall key.
+      - **``repo_min_approvals``** (numeric): ``{"key": <repo>, "subject": <int>,
+        "baseline": <int>}`` per shortfall repo.
+      - **flat list knobs** (``forbidden_globs`` / ``change_freeze_windows``):
+        ``{"item": <glob|window>}`` per missing baseline item.
+      - **scalar knobs**: always empty (the ``subject``/``baseline`` numbers
+        already carry the comparison).
+
+      Derived from the *same* gap data as ``detail`` and ``missing``, so the
+      three can't drift.
     """
 
     knob: str
@@ -257,6 +273,7 @@ class PolicyCheckFinding:
     subject: Any = None
     baseline: Any = None
     missing: tuple[str, ...] = ()
+    missing_items: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -389,87 +406,101 @@ def compare_policy_strictness(
             else f"covers all {len(set(baseline.forbidden_globs))} baseline path(s)",
             comparator="superset",
             missing=tuple(missing_globs),
+            missing_items=tuple({"item": glob} for glob in missing_globs),
         )
     )
 
     # --- per-repo forbidden globs (superset, accounting for the global set) #
     s_repo_forbidden = subject.repo_forbidden_map
-    repo_glob_gaps: list[str] = []
+    repo_glob_gaps: list[tuple[str, list[str]]] = []
     for repo, globs in baseline.repo_forbidden_map.items():
         # The orchestrator protects a repo with the global globs PLUS its
         # per-repo extras, so compare against that merged effective set.
         effective = subject_globs | set(s_repo_forbidden.get(repo, ()))
         gap = _missing(globs, effective)
         if gap:
-            repo_glob_gaps.append(f"{repo}: {gap}")
+            repo_glob_gaps.append((repo, gap))
     findings.append(
         PolicyCheckFinding(
             "repo_forbidden_globs",
             not repo_glob_gaps,
-            "; ".join(repo_glob_gaps)
+            "; ".join(f"{repo}: {gap}" for repo, gap in repo_glob_gaps)
             if repo_glob_gaps
             else _none_or_covered(baseline.repo_forbidden_map),
             comparator="superset",
-            missing=tuple(repo_glob_gaps),
+            missing=tuple(f"{repo}: {gap}" for repo, gap in repo_glob_gaps),
+            missing_items=tuple(
+                {"key": repo, "items": list(gap)} for repo, gap in repo_glob_gaps
+            ),
         )
     )
 
     # --- per-repo required roles (superset) ----------------------------- #
     s_repo_roles = subject.repo_required_roles_map
-    repo_role_gaps: list[str] = []
+    repo_role_gaps: list[tuple[str, list[str]]] = []
     for repo, roles in baseline.repo_required_roles_map.items():
         gap = _missing(roles, set(s_repo_roles.get(repo, ())))
         if gap:
-            repo_role_gaps.append(f"{repo}: {gap}")
+            repo_role_gaps.append((repo, gap))
     findings.append(
         PolicyCheckFinding(
             "repo_required_roles",
             not repo_role_gaps,
-            "; ".join(repo_role_gaps)
+            "; ".join(f"{repo}: {gap}" for repo, gap in repo_role_gaps)
             if repo_role_gaps
             else _none_or_covered(baseline.repo_required_roles_map),
             comparator="superset",
-            missing=tuple(repo_role_gaps),
+            missing=tuple(f"{repo}: {gap}" for repo, gap in repo_role_gaps),
+            missing_items=tuple(
+                {"key": repo, "items": list(gap)} for repo, gap in repo_role_gaps
+            ),
         )
     )
 
     # --- per-repo minimum approvers (effective max(global, per-repo)) ---- #
     s_repo_min = subject.repo_min_approvals_map
     b_repo_min = baseline.repo_min_approvals_map
-    repo_min_gaps: list[str] = []
+    repo_min_gaps: list[tuple[str, int, int]] = []
     for repo in b_repo_min:
         s_eff = max(s_min, s_repo_min.get(repo, 0))
         b_eff = max(b_min, b_repo_min[repo])
         if s_eff < b_eff:
-            repo_min_gaps.append(f"{repo}: {s_eff} < {b_eff}")
+            repo_min_gaps.append((repo, s_eff, b_eff))
     findings.append(
         PolicyCheckFinding(
             "repo_min_approvals",
             not repo_min_gaps,
-            "; ".join(repo_min_gaps)
+            "; ".join(f"{repo}: {s} < {b}" for repo, s, b in repo_min_gaps)
             if repo_min_gaps
             else _none_or_covered(b_repo_min),
             comparator=">=",
-            missing=tuple(repo_min_gaps),
+            missing=tuple(f"{repo}: {s} < {b}" for repo, s, b in repo_min_gaps),
+            missing_items=tuple(
+                {"key": repo, "subject": s, "baseline": b}
+                for repo, s, b in repo_min_gaps
+            ),
         )
     )
 
     # --- per-path required roles (superset, keyed on the exact glob) ----- #
     s_path_roles = subject.path_required_roles_map
-    path_role_gaps: list[str] = []
+    path_role_gaps: list[tuple[str, list[str]]] = []
     for glob, roles in baseline.path_required_roles_map.items():
         gap = _missing(roles, set(s_path_roles.get(glob, ())))
         if gap:
-            path_role_gaps.append(f"{glob}: {gap}")
+            path_role_gaps.append((glob, gap))
     findings.append(
         PolicyCheckFinding(
             "path_required_roles",
             not path_role_gaps,
-            "; ".join(path_role_gaps)
+            "; ".join(f"{glob}: {gap}" for glob, gap in path_role_gaps)
             if path_role_gaps
             else _none_or_covered(baseline.path_required_roles_map),
             comparator="superset",
-            missing=tuple(path_role_gaps),
+            missing=tuple(f"{glob}: {gap}" for glob, gap in path_role_gaps),
+            missing_items=tuple(
+                {"key": glob, "items": list(gap)} for glob, gap in path_role_gaps
+            ),
         )
     )
 
@@ -497,6 +528,7 @@ def compare_policy_strictness(
             ),
             comparator="superset",
             missing=tuple(freeze_gaps),
+            missing_items=tuple({"item": window} for window in freeze_gaps),
         )
     )
 
@@ -520,9 +552,9 @@ def comparison_to_dict(comparison: PolicyComparison) -> dict[str, Any]:
     reshapes an already-computed comparison, it changes no gate.
 
     Each finding carries both the human ``detail`` string **and** the typed
-    ``comparator`` / ``subject`` / ``baseline`` / ``missing`` fields, so a CI
-    step can compare the numeric values (or read exactly which collection items
-    fall short) directly, without parsing the prose.
+    ``comparator`` / ``subject`` / ``baseline`` / ``missing`` / ``missing_items``
+    fields, so a CI step can compare the numeric values (or read exactly which
+    collection items fall short, by key) directly, without parsing the prose.
     """
     return {
         "ok": comparison.ok,
@@ -535,6 +567,7 @@ def comparison_to_dict(comparison: PolicyComparison) -> dict[str, Any]:
                 "subject": finding.subject,
                 "baseline": finding.baseline,
                 "missing": list(finding.missing),
+                "missing_items": [dict(item) for item in finding.missing_items],
             }
             for finding in comparison.findings
         ],

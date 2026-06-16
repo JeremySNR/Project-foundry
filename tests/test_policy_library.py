@@ -20,6 +20,7 @@ from foundry.config import DEFAULT_FORBIDDEN_GLOBS, Settings
 from foundry.policy import LocalPolicyEngine, PolicyInput
 from foundry.policy.library import (
     available_preset_names,
+    PolicyComparison,
     compare_policy_strictness,
     comparison_to_dict,
     effective_policy_summary,
@@ -440,7 +441,16 @@ def test_comparison_to_dict_shape() -> None:
     assert payload["ok"] == comparison.ok
     assert payload["ok"] is False  # defaults are weaker than soc2
     assert all(
-        {"knob", "ok", "detail", "comparator", "subject", "baseline", "missing"}
+        {
+            "knob",
+            "ok",
+            "detail",
+            "comparator",
+            "subject",
+            "baseline",
+            "missing",
+            "missing_items",
+        }
         == finding.keys()
         for finding in payload["findings"]
     )
@@ -468,6 +478,7 @@ def test_comparison_to_dict_typed_scalar_fields() -> None:
     assert thr["subject"] == weaker.repo_confidence_threshold
     assert thr["baseline"] == baseline.repo_confidence_threshold
     assert thr["missing"] == []  # scalars never populate the collection gap list
+    assert thr["missing_items"] == []  # ...nor the structured one
     # the typed verdict agrees with the boolean verdict
     assert thr["ok"] == (thr["subject"] >= thr["baseline"])
 
@@ -518,6 +529,10 @@ def test_comparison_to_dict_typed_collection_missing() -> None:
     expected_missing = set(baseline.forbidden_globs) - set(weaker.forbidden_globs)
     assert set(finding["missing"]) == expected_missing
     assert finding["missing"]  # non-empty: soc2 protects more than the floor
+    # the structured counterpart: one {"item": <glob>} per missing flat-list item,
+    # naming exactly the same globs the prose `missing` list does.
+    assert {entry["item"] for entry in finding["missing_items"]} == expected_missing
+    assert all(set(entry) == {"item"} for entry in finding["missing_items"])
 
 
 def test_comparison_to_dict_pass_has_empty_missing() -> None:
@@ -527,6 +542,64 @@ def test_comparison_to_dict_pass_has_empty_missing() -> None:
     payload = comparison_to_dict(compare_policy_strictness(settings, settings))
     assert payload["ok"] is True
     assert all(f["missing"] == [] for f in payload["findings"])
+    assert all(f["missing_items"] == [] for f in payload["findings"])
+
+
+def test_missing_items_structured_map_to_list_knobs(tmp_path) -> None:
+    # The map-valued role/glob knobs expose each shortfall as a structured
+    # {"key": <repo|glob>, "items": [...]} entry, so a CI step never has to parse
+    # the "<key>: <items>" prose the `missing` strings (and `detail`) are built
+    # from. The structured entries name exactly the same key+items.
+    baseline = _settings(
+        tmp_path / "b",
+        "policy:\n"
+        "  repo_required_roles:\n"
+        "    payments-svc: [security, engineering]\n"
+        "  path_required_roles:\n"
+        "    'infra/**': [engineering]\n",
+    )
+    # Subject covers neither requirement.
+    subject = _settings(tmp_path / "s", "policy:\n  repo_confidence_threshold: 80\n")
+    by_knob = {
+        f["knob"]: f
+        for f in comparison_to_dict(compare_policy_strictness(subject, baseline))[
+            "findings"
+        ]
+    }
+
+    repo_roles = by_knob["repo_required_roles"]
+    assert not repo_roles["ok"]
+    assert repo_roles["missing_items"] == [
+        {"key": "payments-svc", "items": ["security", "engineering"]}
+    ]
+    # the prose `missing` is derived from the same gap, so they agree
+    assert repo_roles["missing"] == ["payments-svc: ['security', 'engineering']"]
+
+    path_roles = by_knob["path_required_roles"]
+    assert not path_roles["ok"]
+    assert path_roles["missing_items"] == [
+        {"key": "infra/**", "items": ["engineering"]}
+    ]
+
+
+def test_missing_items_structured_repo_min_approvals(tmp_path) -> None:
+    # repo_min_approvals is numeric, not a list, so its structured entry carries
+    # the effective subject/baseline counts per shortfall repo rather than items.
+    baseline = _settings(
+        tmp_path / "b",
+        "policy:\n  min_approvals: 1\n  repo_min_approvals:\n    infra: 3\n",
+    )
+    subject = _settings(tmp_path / "s", "policy:\n  min_approvals: 1\n")
+    finding = _finding(
+        compare_policy_strictness(subject, baseline), "repo_min_approvals"
+    )
+    payload = comparison_to_dict(PolicyComparison(findings=(finding,)))["findings"][0]
+    assert not payload["ok"]
+    # effective subject = max(global 1, no override) = 1; baseline = max(1, 3) = 3
+    assert payload["missing_items"] == [
+        {"key": "infra", "subject": 1, "baseline": 3}
+    ]
+    assert payload["missing"] == ["infra: 1 < 3"]  # same gap, prose form
 
 
 def test_comparison_to_dict_all_pass() -> None:
