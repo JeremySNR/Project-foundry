@@ -875,6 +875,17 @@ def test_dashboard_talks_to_agent_trends_endpoint() -> None:
     assert 'fetch("metrics/agents/trends' in DASHBOARD_HTML
 
 
+def test_dashboard_renders_delivery_by_work_type_trend_strip() -> None:
+    """The by-work-type trend sparkline strip (issue #37) must fetch the
+    by-work-type/trends endpoint, have a panel to render into, and be wired
+    into the refresh loop — mirroring the per-repo trend strip."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/delivery/by-work-type/trends' in DASHBOARD_HTML
+    assert '<div id="worktype-trends"></div>' in DASHBOARD_HTML
+    assert "loadWorkTypeTrends();" in DASHBOARD_HTML
+
+
 # -- Enricher wiring via build_orchestrator ------------------------------------
 
 
