@@ -27,6 +27,11 @@ from foundry.compliance.controls import (
     ControlMapping,
     mappings_from_config,
 )
+from foundry.policy.freeze import (
+    ChangeFreezeWindow,
+    validate_windows,
+    window_from_mapping,
+)
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -348,6 +353,19 @@ class Settings:
     # policy-engine/Rego lock-step concern (invariant #2 does not apply). Role
     # names are validated against the ApprovalRole vocabulary at load.
     path_required_roles: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Change-freeze / maintenance windows (issue #31, the "time windows" policy
+    # dimension). During an active window the orchestrator holds an *autonomous*
+    # re-dispatch (a remediation retry) and escalates the run to REVIEW_REQUIRED
+    # instead, so a human decides whether code may change during the freeze. Each
+    # window is either recurring weekly (weekdays + start/end local time in an
+    # IANA tz) or an absolute calendar range (starts_at/ends_at). Enforced in the
+    # orchestrator lifecycle, like the per-path approval roles, so there is no
+    # policy-engine/Rego lock-step concern (invariant #2 does not apply); strictly
+    # additive (a freeze can only ever hold an action for a human, never release
+    # one - invariant #1), so the default empty tuple is byte-for-byte the
+    # historical behaviour. Windows are validated at load (real weekdays, a
+    # resolvable tz, well-formed times/dates), fail-closed.
+    change_freeze_windows: tuple[ChangeFreezeWindow, ...] = ()
 
     # --- remediation / feedback loop (behaviour: yaml) ---
     # When CI fails or a reviewer requests changes, Foundry can re-dispatch the
@@ -639,6 +657,12 @@ class Settings:
                         f"policy.path_required_roles path {glob!r} lists unknown "
                         f"approval roles {bad}; valid roles are {sorted(valid_roles)}"
                     )
+        # Change-freeze windows must be well-formed (issue #31): a real set of
+        # weekdays + start/end OR an absolute range, a resolvable IANA tz. A
+        # malformed window is a deploy-time error, not a silently-inert freeze
+        # that an operator believes is protecting them.
+        if self.change_freeze_windows:
+            validate_windows(self.change_freeze_windows)
         # N-of-M approval counts must be at least one sign-off (issue #31). A
         # value below 1 would be a gate weakening - never silently allowed.
         if self.min_approvals < 1:
@@ -883,6 +907,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["path_required_roles"] = tuple(
             (str(glob), tuple(str(role) for role in roles))
             for glob, roles in (policy["path_required_roles"] or {}).items()
+        )
+    if "change_freeze_windows" in policy:
+        out["change_freeze_windows"] = tuple(
+            window_from_mapping(entry)
+            for entry in (policy["change_freeze_windows"] or [])
         )
 
     remediation = data.get("remediation", {}) or {}

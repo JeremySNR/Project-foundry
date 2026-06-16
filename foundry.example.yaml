@@ -137,6 +137,27 @@ policy:
   # path_required_roles:
   #   "**/billing/**": ["security"]
   #   "services/identity/**": ["engineering", "security"]
+  # Change-freeze / maintenance windows (issue #31, the "time windows" policy
+  # dimension). During an active window Foundry holds an *autonomous* re-dispatch
+  # (the auto-retry on CI failure / changes requested) and escalates the run to
+  # "review required" instead, so no code ships unattended during the freeze. The
+  # initial, human-approved dispatch is not gated (a human is already in the loop).
+  # Each window is either recurring weekly (weekdays + start/end local time in an
+  # IANA tz) or an absolute calendar range (starts_at/ends_at, ISO-8601). An "end"
+  # earlier than "start" wraps past midnight. Strictly additive: a freeze can only
+  # ever hold work for a human, never release it. Enforced in the orchestrator
+  # lifecycle (like the forbidden-path block), so it adds no policy-engine/Rego
+  # rule. Validated at load (real weekdays, a resolvable tz, well-formed times).
+  # change_freeze_windows:
+  #   - reason: "Weekend release blackout"
+  #     weekdays: ["sat", "sun"]
+  #     start: "00:00"
+  #     end: "23:59"
+  #     tz: "UTC"
+  #   - reason: "Year-end change freeze"
+  #     starts_at: "2026-12-20T00:00:00"
+  #     ends_at: "2027-01-02T00:00:00"
+  #     tz: "America/New_York"
   # Diff-aware risk: if a PR touches these paths and the upfront (ticket-text)
   # risk pass never flagged the area, the run escalates to human review.
   # Override per area; unlisted areas keep the built-in defaults.

@@ -2015,6 +2015,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         repo_min_approvals=settings.repo_min_approvals_map,
         path_required_roles=settings.path_required_roles_map,
         sensitive_path_globs=settings.sensitive_globs_map,
+        change_freeze_windows=settings.change_freeze_windows,
         max_agent_retries=settings.max_agent_retries,
         retry_on=settings.retry_on,
         max_cost_per_run=settings.max_cost_per_run,

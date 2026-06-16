@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from sqlalchemy.exc import IntegrityError
 
@@ -77,6 +77,7 @@ from foundry.policy.engine import (
     PolicyTicket,
     required_approvals,
 )
+from foundry.policy.freeze import ChangeFreezeWindow, active_freeze, describe_window
 from foundry.schemas.agent import CodingAgentJob, CodingAgentJobInput, JobConstraints
 from foundry.schemas.analysis import TicketAnalysis
 from foundry.memory.outcomes import record_outcome
@@ -166,6 +167,8 @@ class FoundryOrchestrator:
         repo_min_approvals: Mapping[str, int] | None = None,
         path_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
+        change_freeze_windows: Sequence[ChangeFreezeWindow] | None = None,
+        clock: Callable[[], datetime] | None = None,
         max_agent_retries: int = 2,
         retry_on: tuple[str, ...] | list[str] = ("ci_failed", "changes_requested"),
         max_cost_per_run: float | None = None,
@@ -264,6 +267,17 @@ class FoundryOrchestrator:
         self._diff_risk_needs_ticket = not isinstance(
             self._diff_risk, GlobDiffRiskClassifier
         )
+        # Change-freeze / maintenance windows (issue #31, the "time windows"
+        # policy dimension). During an active window an *autonomous* re-dispatch
+        # is held and the run is escalated to REVIEW_REQUIRED for a human, like
+        # the per-path approval-role escalation - strictly additive (a freeze can
+        # only hold an action, never release one - invariant #1) and enforced in
+        # the lifecycle, not the gate, so there is no Python/Rego lock-step
+        # concern (invariant #2 does not apply). Empty = the historical behaviour
+        # byte-for-byte. ``clock`` is injectable so the freeze check tests offline
+        # (invariant #3); it defaults to wall-clock UTC.
+        self._change_freeze_windows = tuple(change_freeze_windows or ())
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_agent_retries = max_agent_retries
         self._retry_on = frozenset(retry_on)
         self._max_cost_per_run = max_cost_per_run
@@ -1672,6 +1686,49 @@ class FoundryOrchestrator:
             # retry-cap-undercount / revive-a-stopped-run bug (issue #10).
             if run.status is not RunStatus.PR_OPEN:
                 return run.status
+
+            # Change-freeze windows (issue #31, "time windows"): during an active
+            # freeze an *autonomous* re-dispatch is held and the PR is handed to a
+            # human instead of the agent being fired again. Checked here, under
+            # the row lock and before any spend/gate work, so a freeze short-
+            # circuits the retry entirely. Strictly additive: a freeze can only
+            # ever escalate to human review, never release a run (invariant #1).
+            # The initial, human-*approved* dispatch is deliberately not gated -
+            # a human is already in the loop there.
+            frozen = active_freeze(self._change_freeze_windows, self._clock())
+            if frozen is not None:
+                window = describe_window(frozen)
+                run.status = RunStatus.REVIEW_REQUIRED
+                run.current_step = "change_freeze"
+                session.add(
+                    build_audit_event(
+                        run_id=run_id,
+                        event_type=AuditEventType.RISK_ESCALATED,
+                        actor_type="foundry",
+                        metadata={
+                            "category": "change_freeze",
+                            "reason": (
+                                "an autonomous re-dispatch was held during a "
+                                "configured change-freeze window"
+                            ),
+                            "trigger": reason,
+                            "window": window,
+                            "window_reason": frozen.reason,
+                        },
+                    )
+                )
+                issue_id = run.linear_issue_id
+                session.commit()
+                self._notify_state(issue_id, RunStatus.REVIEW_REQUIRED)
+                self._notify_comment(
+                    issue_id,
+                    f"Foundry held the automatic retry "
+                    f"({reason.replace('_', ' ')}) during a change-freeze window "
+                    f"({window}). A human needs to decide whether to take this PR "
+                    "forward during the freeze.",
+                )
+                return RunStatus.REVIEW_REQUIRED
+
             ticket = self._load(session, run_id, ArtifactType.TICKET_SNAPSHOT)
             analysis = self._load(session, run_id, ArtifactType.TICKET_ANALYSIS)
             context = self._load(session, run_id, ArtifactType.CONTEXT_BUNDLE)

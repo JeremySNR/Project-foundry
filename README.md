@@ -177,6 +177,12 @@ policy:
   path_required_roles:            # per-PATH approval roles (#31/#35): diff-aware, monorepo
     "**/billing/**": ["security"]        # subtree -> role; a PR touching it that no approver
                                          # signed for escalates to REVIEW_REQUIRED (additive)
+  change_freeze_windows:          # time windows (#31): hold AUTONOMOUS retries during a freeze
+    - reason: "Weekend release blackout"  # recurring weekly (weekdays + start/end local time,
+      weekdays: ["sat", "sun"]            # IANA tz) or an absolute starts_at/ends_at range.
+      start: "00:00"                      # During an active window an auto-retry parks at
+      end: "23:59"                        # REVIEW_REQUIRED instead of re-dispatching (additive;
+      tz: "UTC"                           # the initial human-approved dispatch is not gated).
   sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
     auth: ["**/auth/**", "**/login/**", "**/sso/**"]
     payments: ["**/billing/**", "**/stripe/**"]
