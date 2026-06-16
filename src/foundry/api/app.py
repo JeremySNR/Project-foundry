@@ -1450,6 +1450,32 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **failures_by_category(session, since=since)}
 
+    @app.get("/metrics/failures/by-repo")
+    def metrics_failures_by_repo(
+        request: Request, days: int = 7
+    ) -> dict[str, Any]:
+        """Recently-failed runs **rolled up by routed repo** - the repo-axis triage
+        cut that complements ``GET /metrics/failures/by-category``. Where that cut
+        answers *what reason* runs are failing for, this answers *which repo* the
+        recent failures land in - the "is one repo the systemic blocker?" question,
+        the failure-side mirror of ``GET /metrics/delivery/by-repo``. Repos are
+        ordered most-frequent first; runs that never routed bucket under an explicit
+        ``(unrouted)`` sentinel.
+
+        Reuses the same failure-event derivation the feed and the by-category
+        roll-up serve, so the totals can't drift. Read-only, changes no gate: a
+        blocked run stays blocked (invariant #7). Token-gated and fail-closed like
+        the other metrics endpoints.
+        """
+        from foundry.memory.metrics import failures_by_repo
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **failures_by_repo(session, since=since)}
+
     @app.get("/metrics/failures/trends")
     def metrics_failures_trends(
         request: Request, days: int = 30, bucket: str = "day"

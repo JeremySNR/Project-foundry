@@ -1153,6 +1153,41 @@ def _failure_event_map(
     return result
 
 
+def _run_repo_map(session, runs: list[FoundryRun]) -> dict[str, str | None]:
+    """For each run, the repo the work landed in - the latest agent job's ``repo``.
+
+    ``FoundryRun`` carries no ``repo`` column (it lives on the per-dispatch
+    ``FoundryAgentJob``), so this mirrors the exact "latest job's repo" derivation
+    :func:`foundry.memory.outcomes.record_outcome` uses to stamp
+    ``FoundryRunOutcome.repo``: jobs ordered with unstarted (NULL ``started_at``)
+    first, then by ``started_at`` then ``id`` (deterministic on SQLite *and*
+    Postgres), and the most recent job carrying a repo wins. A run that never
+    dispatched an agent (parked / blocked at the gate before routing) has no job
+    and maps to ``None`` - correctly counted as unrouted by the caller.
+    """
+    if not runs:
+        return {}
+    jobs = (
+        session.query(FoundryAgentJob)
+        .filter(FoundryAgentJob.run_id.in_([r.id for r in runs]))
+        # Match record_outcome's backend-independent ordering exactly so the repo
+        # this picks is the same one stamped on the outcome row.
+        .order_by(
+            FoundryAgentJob.started_at.is_(None).desc(),
+            FoundryAgentJob.started_at,
+            FoundryAgentJob.id,
+        )
+        .all()
+    )
+    by_run: dict[str, list[FoundryAgentJob]] = {}
+    for job in jobs:
+        by_run.setdefault(job.run_id, []).append(job)
+    return {
+        run.id: next((j.repo for j in reversed(by_run.get(run.id, [])) if j.repo), None)
+        for run in runs
+    }
+
+
 def failure_queue(
     session, *, since: datetime, now: datetime | None = None
 ) -> dict:
@@ -1330,6 +1365,106 @@ def failures_by_category(
         "failed": failed_total,
         "distinct_categories": len(categories),
         "categories": categories,
+    }
+
+
+def failures_by_repo(
+    session, *, since: datetime, now: datetime | None = None
+) -> dict:
+    """Recently-failed runs **rolled up by routed repo** - the repo-axis triage cut
+    that complements :func:`failures_by_category`.
+
+    Where :func:`failures_by_category` answers *what reason* runs are failing for
+    (``policy_denied``, ``budget_exceeded``, ...), this answers *which repo* the
+    recent failures land in - the on-call's "is one repo the systemic blocker?"
+    question, the failure-side mirror of :func:`delivery_by_repo`. The delivery
+    surface already has both a repo and a work-type cut; the failure surface had a
+    by-category roll-up and a trend but no repo grouping until this.
+
+    Every run currently in a terminal-failure state (:data:`FAILURE_STATUSES`)
+    whose failure happened within the window (at or after ``since``) is grouped by
+    its routed repo - the latest agent job's repo, via :func:`_run_repo_map` (the
+    same "where the work landed" derivation ``record_outcome`` stamps onto
+    ``FoundryRunOutcome.repo``, since ``FoundryRun`` itself carries no repo
+    column). A run that never dispatched an agent (parked / blocked at the gate
+    before routing) buckets under :data:`UNROUTED_REPO_LABEL`, exactly as an
+    unrouted outcome does in :func:`delivery_by_repo`. Failure time and the
+    blocked/failed split come from the **same** :func:`_failure_event_map` /
+    :data:`_FAILURE_EVENTS_BY_STATUS` derivation the feed, the by-category roll-up
+    and the trend use, so the totals here can never drift from theirs.
+
+    Each repo carries its ``count`` (with a ``blocked``/``failed`` split), the
+    ``newest_failure_seconds`` / ``oldest_failure_seconds`` age span of its
+    members, and the ``last_failure`` ISO timestamp. Repos are ordered
+    **most-frequent first**, ties broken by most-recent then name - the same
+    "fix this first" order as the by-category cut.
+
+    Read-only - it surfaces what already happened and blocks/merges nothing. A
+    blocked run stays blocked (invariant #7).
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    since = _as_utc(since)
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(FAILURE_STATUSES))
+        .all()
+    )
+    failed_map = _failure_event_map(session, runs)
+    repo_map = _run_repo_map(session, runs)
+
+    buckets: dict[str, dict] = {}
+    total = blocked_total = failed_total = 0
+    for run in runs:
+        marked = failed_map.get(run.id)
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a failed run carries no marker event - same rule as the feed.
+        failed_at = _as_utc(marked[0] if marked is not None else run.created_at)
+        if failed_at < since:
+            continue  # an older incident, outside the window
+        elapsed = max(0, int((now - failed_at).total_seconds()))
+        is_blocked = run.status == RunStatus.BLOCKED
+        repo = repo_map.get(run.id) or UNROUTED_REPO_LABEL
+
+        bucket = buckets.get(repo)
+        if bucket is None:
+            bucket = buckets[repo] = {
+                "repo": repo,
+                "count": 0,
+                "blocked": 0,
+                "failed": 0,
+                "newest_failure_seconds": elapsed,
+                "oldest_failure_seconds": elapsed,
+                "last_failure": failed_at,
+            }
+        bucket["count"] += 1
+        if is_blocked:
+            bucket["blocked"] += 1
+            blocked_total += 1
+        else:
+            bucket["failed"] += 1
+            failed_total += 1
+        # Smallest elapsed = most recent; largest = oldest.
+        bucket["newest_failure_seconds"] = min(bucket["newest_failure_seconds"], elapsed)
+        bucket["oldest_failure_seconds"] = max(bucket["oldest_failure_seconds"], elapsed)
+        if failed_at > bucket["last_failure"]:
+            bucket["last_failure"] = failed_at
+        total += 1
+
+    repos = list(buckets.values())
+    # Most-frequent first; ties to the most-recently-seen (smallest newest age),
+    # then repo name for a stable, deterministic order - same as by-category.
+    repos.sort(key=lambda r: (-r["count"], r["newest_failure_seconds"], r["repo"]))
+    for r in repos:
+        r["last_failure"] = r["last_failure"].isoformat()
+
+    return {
+        "now": now.isoformat(),
+        "since": since.isoformat(),
+        "count": total,
+        "blocked": blocked_total,
+        "failed": failed_total,
+        "distinct_repos": len(repos),
+        "repos": repos,
     }
 
 

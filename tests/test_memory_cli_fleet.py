@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from foundry.db import FoundryRun, create_all, make_engine, make_session_factory
-from foundry.db.models import AuditEventType, FoundryAuditEvent
+from foundry.db.models import AuditEventType, FoundryAgentJob, FoundryAuditEvent
 from foundry.memory.cli import main
 from foundry.schemas.common import OverallRisk, RunStatus
 
@@ -34,6 +34,7 @@ def _add_run(
     created_at: datetime,
     risk: OverallRisk | None = None,
     current_step: str | None = None,
+    repo: str | None = None,
 ) -> str:
     global _counter
     _counter += 1
@@ -51,6 +52,19 @@ def _add_run(
             updated_at=created_at,
         )
     )
+    # FoundryRun has no repo column; the repo lives on the agent job. Attach a
+    # dispatched job so the run is routed (matching record_outcome's derivation).
+    if repo is not None:
+        _counter += 1
+        session.add(
+            FoundryAgentJob(
+                id=f"j-{_counter}",
+                run_id=rid,
+                provider="fake",
+                repo=repo,
+                started_at=created_at,
+            )
+        )
     return rid
 
 
@@ -269,6 +283,67 @@ def test_failures_by_category_rejects_bad_window(monkeypatch, db_url) -> None:
     monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
     monkeypatch.setattr(
         "sys.argv", ["foundry-memory", "failures-by-category", "--days", "0"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+
+
+# --- failures-by-repo ------------------------------------------------------
+
+
+def test_failures_by_repo_empty_database(monkeypatch, capsys, db_url) -> None:
+    _seed(db_url)
+    _run_cli(monkeypatch, db_url, "failures-by-repo")
+    assert "No runs failed in the last 7d" in capsys.readouterr().out
+
+
+def test_failures_by_repo_rolls_up_by_repo(monkeypatch, capsys, db_url) -> None:
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        for hours in (1, 2):  # two runs in the same repo
+            rid = _add_run(
+                session,
+                status=RunStatus.BLOCKED,
+                created_at=now - timedelta(hours=hours),
+                repo="org/api",
+            )
+            _add_event(
+                session,
+                rid,
+                AuditEventType.RUN_BLOCKED,
+                now - timedelta(hours=hours),
+                metadata_json='{"category": "policy_denied"}',
+            )
+        rid = _add_run(
+            session,
+            status=RunStatus.EXECUTION_FAILED,
+            created_at=now - timedelta(hours=3),
+            repo="org/web",
+        )
+        _add_event(
+            session,
+            rid,
+            AuditEventType.AGENT_FAILED,
+            now - timedelta(hours=3),
+            metadata_json='{"reason": "agent error"}',
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "failures-by-repo")
+    out = capsys.readouterr().out
+    assert "3 total across 2 repo(s), 2 blocked, 1 execution-failed" in out
+    # Most-frequent first: org/api (2) before org/web (1).
+    assert out.index("org/api") < out.index("org/web")
+
+
+def test_failures_by_repo_rejects_bad_window(monkeypatch, db_url) -> None:
+    _seed(db_url)
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr(
+        "sys.argv", ["foundry-memory", "failures-by-repo", "--days", "0"]
     )
     with pytest.raises(SystemExit) as exc:
         main()
