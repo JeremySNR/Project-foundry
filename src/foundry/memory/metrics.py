@@ -1333,6 +1333,97 @@ def failures_by_category(
     }
 
 
+def _empty_failure_period() -> dict:
+    """A fresh per-period accumulator for :func:`failure_trends` - the failure
+    count with its blocked/execution-failed split."""
+    return {"count": 0, "blocked": 0, "failed": 0}
+
+
+def _render_failure_period(period_start: datetime, agg: dict | None) -> dict:
+    """Render a failure-trend period to its public shape (``None`` agg = an
+    empty, zero-filled bucket so a sparkline reads as a continuous series)."""
+    agg = agg or _empty_failure_period()
+    return {
+        "period_start": period_start.isoformat(),
+        "count": agg["count"],
+        "blocked": agg["blocked"],
+        "failed": agg["failed"],
+    }
+
+
+def failure_trends(
+    session, *, since: datetime, bucket: str = "day", now: datetime | None = None
+) -> dict:
+    """Recently-failed runs **bucketed over time** - the direction-of-travel cut
+    that complements the per-run :func:`failure_queue` feed and the point-in-time
+    :func:`failures_by_category` roll-up.
+
+    Those two answer "what is failing *right now*" (the recent incidents, and the
+    top reasons). This answers the question neither can - *"are we failing more
+    than usual; is something spiking?"* - by bucketing the same recently-failed
+    runs by **when they failed** onto one zero-filled time axis, so a rising (or
+    falling) failure rate is visible at a glance. It is to the failure surface
+    what :func:`delivery_trends` is to the delivery surface.
+
+    Every run currently in a terminal-failure state (:data:`FAILURE_STATUSES`)
+    whose failure happened within the window (at or after ``since``) is bucketed
+    by ``bucket_start`` of its failure time - dated from the same
+    :func:`_failure_event_map` derivation (the ``RUN_BLOCKED``/``AGENT_FAILED``
+    marker) the feed and the by-category roll-up use, so the totals here can never
+    drift from theirs. Each period carries its ``count`` with a
+    ``blocked``/``failed`` split; empty periods inside the span are zero-filled so
+    the series reads as continuous rather than sparse (the same shape and shared
+    :func:`_delivery_axis` the delivery trends use - the axis spans the first to
+    the last *populated* period, so the series is a pure function of the rows).
+
+    Read-only - it surfaces what already happened and blocks/merges nothing. A
+    blocked run stays blocked (invariant #7).
+    """
+    if bucket not in TREND_BUCKETS:
+        raise ValueError(f"bucket must be one of {TREND_BUCKETS}, got {bucket!r}")
+
+    now = _as_utc(now or datetime.now(timezone.utc))
+    since = _as_utc(since)
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(FAILURE_STATUSES))
+        .all()
+    )
+    failed_map = _failure_event_map(session, runs)
+
+    periods: dict[datetime, dict] = {}
+    total = blocked_total = failed_total = 0
+    for run in runs:
+        marked = failed_map.get(run.id)
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a failed run carries no marker event - same rule as the feed.
+        failed_at = _as_utc(marked[0] if marked is not None else run.created_at)
+        if failed_at < since:
+            continue  # an older incident, outside the window
+        agg = periods.setdefault(
+            bucket_start(failed_at, bucket), _empty_failure_period()
+        )
+        agg["count"] += 1
+        if run.status == RunStatus.BLOCKED:
+            agg["blocked"] += 1
+            blocked_total += 1
+        else:
+            agg["failed"] += 1
+            failed_total += 1
+        total += 1
+
+    axis = _delivery_axis(list(periods), bucket)
+    return {
+        "now": now.isoformat(),
+        "since": since.isoformat(),
+        "bucket": bucket,
+        "count": total,
+        "blocked": blocked_total,
+        "failed": failed_total,
+        "periods": [_render_failure_period(start, periods.get(start)) for start in axis],
+    }
+
+
 def fleet_status(
     session,
     *,
