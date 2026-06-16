@@ -12,7 +12,8 @@ the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
 (where work ships, stalls, and spends) with a per-repo trend sparkline strip
-(is each repo speeding up or stalling?), an epic board (multi-repo
+(is each repo speeding up or stalling?), a delivery-by-work-type table (do bugs
+ship while features stall?), an epic board (multi-repo
 runs rolled up, issue #35), a policy-gate panel (the effective gate this
 deployment enforces - the in-app twin of ``foundry-policy explain``, issue #31),
 the run list (with an approval-queue filter) and,
@@ -22,6 +23,7 @@ agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/failures``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
+``GET /metrics/delivery/by-work-type``,
 ``GET /metrics/agents``,
 ``GET /metrics/agents/trends``, ``GET /metrics/policy``, ``GET /epics`` and
 ``GET /runs/{id}/timeline``; the calls carry the bearer token the user pastes
@@ -218,6 +220,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="agents"></div>
 <div id="agent-trends"></div>
 <div id="repo-delivery"></div>
+<div id="worktype-delivery"></div>
 <div id="repo-trends"></div>
 <div id="epics"></div>
 <div id="policy"></div>
@@ -784,6 +787,44 @@ async function loadRepoDelivery() {
   }
 }
 
+async function loadWorkTypeDelivery() {
+  const el = $("#worktype-delivery");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/delivery/by-work-type?days=90", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const types = m.work_types || [];
+    if (!types.length) { el.style.display = "none"; return; }
+    const rows = types.map((t) => {
+      const cost = t.total_cost_usd == null ? "-" : "$" + t.total_cost_usd;
+      const ttm = t.time_to_merge_seconds || {};
+      return `<tr>
+        <td>${esc(t.work_type)}</td>
+        <td class="num">${t.prs_shipped}</td>
+        <td class="num">${t.blocked}</td>
+        <td class="num">${t.runs_finished}</td>
+        <td class="num">${Math.round(t.merge_rate * 100)}%</td>
+        <td class="num">${t.retries_consumed}</td>
+        <td class="num">${dur(ttm.median)}</td>
+        <td class="num">${cost}</td>
+      </tr>`;
+    }).join("");
+    el.innerHTML = `<details><summary>delivery by work type (90d) &mdash; do bugs ship while features stall?</summary>
+      <table><tr><th>work type</th><th>shipped</th><th>blocked</th><th>finished</th>
+        <th>merge rate</th><th>retries</th><th>median to merge</th><th>spend</th></tr>${rows}</table>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadRepoTrends() {
   const el = $("#repo-trends");
   if (!hasAuth()) {
@@ -1017,6 +1058,7 @@ function refresh() {
   loadAgents();
   loadAgentTrends();
   loadRepoDelivery();
+  loadWorkTypeDelivery();
   loadRepoTrends();
   loadEpics();
   loadPolicy();

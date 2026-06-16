@@ -1165,6 +1165,26 @@ def create_app(
                 **delivery_by_repo_trends(session, since=since, bucket=bucket),
             }
 
+    @app.get("/metrics/delivery/by-work-type")
+    def metrics_delivery_by_work_type(
+        request: Request, days: int = 90
+    ) -> dict[str, Any]:
+        """Delivery outcomes grouped by work type (PRs shipped, blocks, merge
+        rate, spend, time-to-merge per type) - the work-type dimension the
+        org-wide ``/metrics/delivery`` and the per-repo ``/metrics/delivery/by-repo``
+        can't show: do bugs ship while features stall, where does the spend go
+        by category of work? Token-gated and fail-closed like the other metrics
+        endpoints.
+        """
+        from foundry.memory.metrics import delivery_by_work_type
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **delivery_by_work_type(session, since=since)}
+
     @app.get("/metrics/agents")
     def metrics_agents(request: Request, days: int = 90) -> dict[str, Any]:
         """Per-provider agent scorecards: merge rate, retries and spend, broken

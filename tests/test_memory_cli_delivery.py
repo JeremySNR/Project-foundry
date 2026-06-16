@@ -42,6 +42,7 @@ def _add_outcome(
     *,
     outcome: str,
     repo: str | None = "payments-service",
+    work_type: str | None = None,
     completed_at: datetime = NOW,
     jobs_count: int = 1,
     cost_usd: float | None = None,
@@ -71,6 +72,7 @@ def _add_outcome(
             issue_key_prefix="ENG",
             outcome=outcome,
             repo=repo,
+            work_type=work_type,
             routed_confidence=routed_confidence,
             trigger_type="label",
             created_at_run=completed_at - timedelta(hours=1),
@@ -224,6 +226,48 @@ def test_delivery_by_repo_groups_and_orders(monkeypatch, capsys, db_url) -> None
     assert "(unrouted)" in out
     # Most-shipping repo (payments-service, 2) is listed before web-frontend (1).
     assert out.index("payments-service") < out.index("web-frontend")
+
+
+# --- delivery-by-work-type ------------------------------------------------
+
+
+def test_delivery_by_work_type_empty_database(monkeypatch, capsys, db_url) -> None:
+    _seed(db_url)
+    _run_cli(monkeypatch, db_url, "delivery-by-work-type")
+    assert "No runs finished in the last 90d." in capsys.readouterr().out
+
+
+def test_delivery_by_work_type_groups_and_orders(monkeypatch, capsys, db_url) -> None:
+    sf = _seed(db_url)
+    with sf() as session:
+        # bug ships 2, feature ships 1 => bug first (most-shipping).
+        _add_outcome(session, outcome="merged", work_type="bug", cost_usd=1.0)
+        _add_outcome(session, outcome="merged", work_type="bug")
+        _add_outcome(session, outcome="merged", work_type="feature")
+        # An unclassified block buckets under the sentinel.
+        _add_outcome(session, outcome="blocked", work_type=None)
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "delivery-by-work-type")
+    out = capsys.readouterr().out
+    assert "across 3 type(s)" in out
+    assert "bug" in out
+    assert "feature" in out
+    assert "(unclassified)" in out
+    # Most-shipping type (bug, 2) is listed before feature (1).
+    assert out.index("bug") < out.index("feature")
+
+
+def test_delivery_by_work_type_rejects_bad_window(monkeypatch, db_url) -> None:
+    _seed(db_url)
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr(
+        "sys.argv", ["foundry-memory", "delivery-by-work-type", "--days", "0"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
 
 
 # --- delivery-by-repo-trends ----------------------------------------------
