@@ -440,13 +440,93 @@ def test_comparison_to_dict_shape() -> None:
     assert payload["ok"] == comparison.ok
     assert payload["ok"] is False  # defaults are weaker than soc2
     assert all(
-        {"knob", "ok", "detail"} == finding.keys() for finding in payload["findings"]
+        {"knob", "ok", "detail", "comparator", "subject", "baseline", "missing"}
+        == finding.keys()
+        for finding in payload["findings"]
     )
     # weaknesses is exactly the not-ok knobs, order-preserved.
     assert payload["weaknesses"] == [
         f["knob"] for f in payload["findings"] if not f["ok"]
     ]
     assert payload["weaknesses"]  # at least one control falls short
+
+
+def test_comparison_to_dict_typed_scalar_fields() -> None:
+    # Scalar knobs carry the numeric subject/baseline values and the gate's
+    # comparison direction, so a CI step can compare them without parsing prose.
+    weaker = Settings.from_env({})  # built-in defaults
+    baseline = load_preset_settings("soc2")
+    by_knob = {
+        f["knob"]: f for f in comparison_to_dict(
+            compare_policy_strictness(weaker, baseline)
+        )["findings"]
+    }
+
+    # higher-is-stricter scalar
+    thr = by_knob["repo_confidence_threshold"]
+    assert thr["comparator"] == ">="
+    assert thr["subject"] == weaker.repo_confidence_threshold
+    assert thr["baseline"] == baseline.repo_confidence_threshold
+    assert thr["missing"] == []  # scalars never populate the collection gap list
+    # the typed verdict agrees with the boolean verdict
+    assert thr["ok"] == (thr["subject"] >= thr["baseline"])
+
+    # lower-is-stricter scalar
+    files = by_knob["max_files_changed"]
+    assert files["comparator"] == "<="
+    assert files["subject"] == weaker.max_files_changed
+    assert files["baseline"] == baseline.max_files_changed
+    assert files["ok"] == (files["subject"] <= files["baseline"])
+
+
+def test_comparison_to_dict_typed_cost_nullable() -> None:
+    # max_cost_per_run is nullable: None means "no cap" on either side, and the
+    # typed fields surface that as a JSON null rather than a prose word.
+    no_cap = Settings.from_env({})
+    capped = load_preset_settings("soc2")
+    finding = next(
+        f
+        for f in comparison_to_dict(compare_policy_strictness(no_cap, capped))[
+            "findings"
+        ]
+        if f["knob"] == "max_cost_per_run"
+    )
+    assert finding["comparator"] == "<="
+    assert finding["subject"] == no_cap.max_cost_per_run
+    assert finding["baseline"] == capped.max_cost_per_run
+
+
+def test_comparison_to_dict_typed_collection_missing() -> None:
+    # Collection knobs carry "superset" plus the exact baseline items the
+    # subject fails to cover, so a consumer reads the gap as a list, not prose.
+    weaker = Settings.from_env({})  # no forbidden globs configured
+    baseline = load_preset_settings("soc2")
+    finding = next(
+        f
+        for f in comparison_to_dict(compare_policy_strictness(weaker, baseline))[
+            "findings"
+        ]
+        if f["knob"] == "forbidden_globs"
+    )
+    assert finding["comparator"] == "superset"
+    assert finding["subject"] is None  # numeric fields don't apply to collections
+    assert finding["baseline"] is None
+    assert not finding["ok"]
+    # the missing list names exactly the baseline globs the subject doesn't cover
+    # (the default config ships a built-in forbidden-glob floor, so this is the
+    # baseline set minus that floor, not the whole baseline).
+    expected_missing = set(baseline.forbidden_globs) - set(weaker.forbidden_globs)
+    assert set(finding["missing"]) == expected_missing
+    assert finding["missing"]  # non-empty: soc2 protects more than the floor
+
+
+def test_comparison_to_dict_pass_has_empty_missing() -> None:
+    # When a config meets its own floor, every collection knob's gap list is
+    # empty (the typed counterpart to `ok=True`).
+    settings = load_preset_settings("soc2")
+    payload = comparison_to_dict(compare_policy_strictness(settings, settings))
+    assert payload["ok"] is True
+    assert all(f["missing"] == [] for f in payload["findings"])
 
 
 def test_comparison_to_dict_all_pass() -> None:
@@ -801,6 +881,36 @@ def test_cli_check_json_fails_exits_one_and_names_weaknesses(
         f for f in payload["findings"] if f["knob"] == "repo_confidence_threshold"
     )
     assert weak["ok"] is False
+
+
+def test_cli_check_json_carries_typed_finding_values(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The CLI json output exposes the typed comparator/subject/baseline/missing
+    # per finding, so a CI step can compare values directly instead of scraping
+    # the prose `detail`.
+    import json
+
+    from foundry.policy.cli import main
+
+    config = _write_config(tmp_path, "policy:\n  repo_confidence_threshold: 50\n")
+    with pytest.raises(SystemExit):
+        main(["check", "--config", config, "--against", "soc2", "--format", "json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    by_knob = {f["knob"]: f for f in payload["findings"]}
+
+    # the weak scalar knob carries its numeric values and the gate's direction
+    thr = by_knob["repo_confidence_threshold"]
+    assert thr["comparator"] == ">="
+    assert thr["subject"] == 50
+    assert thr["baseline"] > 50  # soc2 demands more, hence the FAIL
+    assert thr["ok"] is False
+
+    # a collection knob carries "superset" and a (possibly empty) missing list
+    globs = by_knob["forbidden_globs"]
+    assert globs["comparator"] == "superset"
+    assert isinstance(globs["missing"], list)
 
 
 def test_cli_check_json_emits_structured_error_on_unknown_baseline(
