@@ -1228,6 +1228,111 @@ def failure_queue(
     }
 
 
+# The bucket a failure with no parseable reason lands in - an explicit sentinel
+# (mirroring ``(unrouted)`` / ``(unclassified)`` in the delivery cuts) so a NULL
+# category is a visible row in the breakdown, never silently dropped.
+UNKNOWN_FAILURE_CATEGORY = "(unknown)"
+
+
+def failures_by_category(
+    session, *, since: datetime, now: datetime | None = None
+) -> dict:
+    """Recently-failed runs **rolled up by reason** - the aggregate triage cut that
+    complements the per-run :func:`failure_queue` feed.
+
+    Where ``failure_queue`` is a recency-ordered *feed* (every recent incident,
+    newest first), this answers the prioritisation question that feed can't: *what
+    are the top reasons runs are blocking/failing, and how many of each?* - so a
+    spiking systemic blocker (``policy_denied``, ``budget_exceeded``,
+    ``forbidden_path``, ...) is visible at a glance instead of buried in a scroll.
+
+    Every run currently in a terminal-failure state (:data:`FAILURE_STATUSES`)
+    whose failure happened within the window (at or after ``since``) is grouped by
+    its failure ``reason`` (the ``category``/``reason`` from the
+    ``RUN_BLOCKED``/``AGENT_FAILED`` audit metadata, via the same
+    :func:`_failure_event_map` derivation the feed uses, so the two can't drift).
+    Runs with no parseable reason bucket under :data:`UNKNOWN_FAILURE_CATEGORY`.
+
+    Each category carries its ``count`` (with a ``blocked``/``failed`` split), the
+    ``newest_failure_seconds`` / ``oldest_failure_seconds`` age span of its
+    members, and the ``last_failure`` ISO timestamp. Categories are ordered
+    **most-frequent first**, ties broken by most-recent then name - the on-call's
+    "fix this first" order.
+
+    Read-only - it surfaces what already happened and blocks/merges nothing. A
+    blocked run stays blocked (invariant #7).
+    """
+    now = _as_utc(now or datetime.now(timezone.utc))
+    since = _as_utc(since)
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(FAILURE_STATUSES))
+        .all()
+    )
+    failed_map = _failure_event_map(session, runs)
+
+    buckets: dict[str, dict] = {}
+    total = blocked_total = failed_total = 0
+    for run in runs:
+        marked = failed_map.get(run.id)
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a failed run carries no marker event; the reason is unknown.
+        if marked is not None:
+            failed_at, reason = marked
+        else:
+            failed_at, reason = run.created_at, None
+        failed_at = _as_utc(failed_at)
+        if failed_at < since:
+            continue  # an older incident, outside the window
+        elapsed = max(0, int((now - failed_at).total_seconds()))
+        is_blocked = run.status == RunStatus.BLOCKED
+        category = reason or UNKNOWN_FAILURE_CATEGORY
+
+        bucket = buckets.get(category)
+        if bucket is None:
+            bucket = buckets[category] = {
+                "category": category,
+                "count": 0,
+                "blocked": 0,
+                "failed": 0,
+                "newest_failure_seconds": elapsed,
+                "oldest_failure_seconds": elapsed,
+                "last_failure": failed_at,
+            }
+        bucket["count"] += 1
+        if is_blocked:
+            bucket["blocked"] += 1
+            blocked_total += 1
+        else:
+            bucket["failed"] += 1
+            failed_total += 1
+        # Smallest elapsed = most recent; largest = oldest.
+        bucket["newest_failure_seconds"] = min(bucket["newest_failure_seconds"], elapsed)
+        bucket["oldest_failure_seconds"] = max(bucket["oldest_failure_seconds"], elapsed)
+        if failed_at > bucket["last_failure"]:
+            bucket["last_failure"] = failed_at
+        total += 1
+
+    categories = list(buckets.values())
+    # Most-frequent first; ties to the most-recently-seen (smallest newest age),
+    # then category name for a stable, deterministic order.
+    categories.sort(
+        key=lambda c: (-c["count"], c["newest_failure_seconds"], c["category"])
+    )
+    for c in categories:
+        c["last_failure"] = c["last_failure"].isoformat()
+
+    return {
+        "now": now.isoformat(),
+        "since": since.isoformat(),
+        "count": total,
+        "blocked": blocked_total,
+        "failed": failed_total,
+        "distinct_categories": len(categories),
+        "categories": categories,
+    }
+
+
 def fleet_status(
     session,
     *,
