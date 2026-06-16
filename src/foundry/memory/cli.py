@@ -18,6 +18,7 @@ Usage::
     foundry-memory delivery-by-repo [--days D]
     foundry-memory delivery-by-work-type [--days D]
     foundry-memory delivery-by-repo-trends [--bucket week|day] [--days D]
+    foundry-memory delivery-by-work-type-trends [--bucket week|day] [--days D]
 
 ``backfill`` derives outcome rows for terminal runs that finished before the
 ``foundry_run_outcomes`` table existed (or that a fail-soft hook missed);
@@ -52,10 +53,12 @@ command line. Like ``fleet``/``failures`` they call the same ``memory/metrics.py
 derivations the endpoints serve, so the CLI and API verdicts can't drift.
 
 ``delivery``, ``delivery-trends``, ``delivery-by-repo``,
-``delivery-by-work-type`` and ``delivery-by-repo-trends`` are the offline twins
+``delivery-by-work-type``, ``delivery-by-repo-trends`` and
+``delivery-by-work-type-trends`` are the offline twins
 of the **delivery** metrics endpoints (``GET /metrics/delivery`` /
 ``/metrics/delivery/trends`` / ``/metrics/delivery/by-repo`` /
-``/metrics/delivery/by-work-type`` / ``/metrics/delivery/by-repo/trends``) - the
+``/metrics/delivery/by-work-type`` / ``/metrics/delivery/by-repo/trends`` /
+``/metrics/delivery/by-work-type/trends``) - the
 org-wide "where work ships, stalls and spends" cut and its trend / per-repo /
 per-work-type dimensions. They answer "what did we ship in the window, where, by
 what kind of work, and at what cost?" and "is throughput trending up or down?"
@@ -230,6 +233,14 @@ def main() -> None:
     _add_bucket(deliv_repo_trends_p)
     _add_days(deliv_repo_trends_p)
 
+    deliv_wt_trends_p = sub.add_parser(
+        "delivery-by-work-type-trends",
+        help="Print per-work-type delivery outcomes bucketed over time (offline "
+        "twin of GET /metrics/delivery/by-work-type/trends).",
+    )
+    _add_bucket(deliv_wt_trends_p)
+    _add_days(deliv_wt_trends_p)
+
     args = parser.parse_args()
     if args.command == "backfill":
         _run_backfill(args)
@@ -261,6 +272,8 @@ def main() -> None:
         _run_delivery_by_work_type(args)
     elif args.command == "delivery-by-repo-trends":
         _run_delivery_by_repo_trends(args)
+    elif args.command == "delivery-by-work-type-trends":
+        _run_delivery_by_work_type_trends(args)
 
 
 def _session_factory():
@@ -833,6 +846,39 @@ def _run_delivery_by_repo_trends(args: argparse.Namespace) -> None:
             f"{_fmt_cost(repo['total_cost_usd'])}"
         )
         for period_iso, cell in zip(periods, repo["series"]):
+            print(
+                f"    {label} {period_iso[:10]}  shipped {cell['prs_shipped']:>3}  "
+                f"blocked {cell['blocked']:>3}  runs {cell['runs_finished']:>3}"
+            )
+        print()
+
+
+def _run_delivery_by_work_type_trends(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import delivery_by_work_type_trends
+
+    since = _since_from_days(args.days)
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = delivery_by_work_type_trends(session, since=since, bucket=args.bucket)
+
+    work_types = report["work_types"]
+    if not work_types:
+        print(f"No runs finished in the last {args.days}d.")
+        return
+
+    periods = report["periods"]
+    label = "week of" if args.bucket == "week" else "day"
+    print(
+        f"Per-work-type delivery by {args.bucket} (last {args.days}d, "
+        f"most-shipping first):\n"
+    )
+    for wt in work_types:
+        print(
+            f"{wt['work_type']}: {wt['prs_shipped']}/{wt['runs_finished']} merged "
+            f"(rate {wt['merge_rate']}), {wt['retries_consumed']} retries, "
+            f"{_fmt_cost(wt['total_cost_usd'])}"
+        )
+        for period_iso, cell in zip(periods, wt["series"]):
             print(
                 f"    {label} {period_iso[:10]}  shipped {cell['prs_shipped']:>3}  "
                 f"blocked {cell['blocked']:>3}  runs {cell['runs_finished']:>3}"

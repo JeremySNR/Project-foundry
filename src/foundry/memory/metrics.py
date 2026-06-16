@@ -653,6 +653,96 @@ def delivery_by_repo_trends(session, *, since: datetime, bucket: str = "week") -
     }
 
 
+def delivery_by_work_type_trends(
+    session, *, since: datetime, bucket: str = "week"
+) -> dict:
+    """Per-work-type delivery outcomes bucketed over time — the work-type
+    dimension of :func:`delivery_trends`, the way :func:`delivery_by_work_type`
+    is to :func:`delivery_metrics` and :func:`delivery_by_repo_trends` is to
+    :func:`delivery_by_repo`.
+
+    Answers "is *this kind of work* shipping more reliably or stalling over
+    time?" — do features sail while bugs slip, is the merge rate for tech-debt
+    runs climbing? — which the single-window :func:`delivery_by_work_type` (one
+    total per type, no direction of travel) and the org-wide
+    :func:`delivery_trends` (one series across every work type) can't show on
+    their own. Pure read over ``foundry_run_outcomes`` (the same finished-run
+    rows the other delivery cuts read; ``work_type`` is a stored column), so it
+    adds no new write path and rebuilds with ``foundry-memory backfill``.
+
+    Every work type's ``series`` is aligned to one shared time axis spanning the
+    first to the last *populated* period (across all types), zero-filled so the
+    per-type sparklines line up column-for-column — the same shape
+    :func:`delivery_by_repo_trends` uses. Each type also carries its window
+    totals so a caller can label the trend without a second query. Runs whose
+    ``work_type`` was never classified (NULL) bucket under the
+    :data:`UNCLASSIFIED_WORK_TYPE_LABEL` sentinel, as in
+    :func:`delivery_by_work_type`.
+    """
+    if bucket not in TREND_BUCKETS:
+        raise ValueError(f"bucket must be one of {TREND_BUCKETS}, got {bucket!r}")
+
+    rows: list[FoundryRunOutcome] = (
+        session.query(FoundryRunOutcome)
+        .filter(FoundryRunOutcome.completed_at >= since)
+        .all()
+    )
+
+    # work_type -> period_start -> accumulator, plus a per-type window total.
+    per_period: dict[str, dict[datetime, dict]] = {}
+    totals: dict[str, dict] = {}
+    for row in rows:
+        if row.completed_at is None:
+            continue
+        key = row.work_type or UNCLASSIFIED_WORK_TYPE_LABEL
+        start = bucket_start(row.completed_at, bucket)
+        _accumulate_delivery_period(
+            per_period.setdefault(key, {}).setdefault(start, _empty_delivery_period()),
+            row,
+        )
+        _accumulate_delivery_period(totals.setdefault(key, _empty_delivery_period()), row)
+
+    # One shared axis across every work type so the per-type series align.
+    populated = [start for periods in per_period.values() for start in periods]
+    axis = _delivery_axis(populated, bucket)
+
+    out_types = []
+    for work_type, total in totals.items():
+        runs = total["runs_finished"]
+        shipped = total["prs_shipped"]
+        periods = per_period[work_type]
+        out_types.append(
+            {
+                "work_type": work_type,
+                "runs_finished": runs,
+                "prs_shipped": shipped,
+                "blocked": total["blocked"],
+                "merge_rate": round(shipped / runs, 3) if runs else 0.0,
+                "retries_consumed": total["retries_consumed"],
+                "total_cost_usd": (
+                    round(total["_cost"], 2) if total["_cost_seen"] else None
+                ),
+                "series": [
+                    _render_delivery_period(start, periods.get(start)) for start in axis
+                ],
+            }
+        )
+
+    # Most-shipping first, then most-active, with a stable name tie-break - the
+    # same ordering as delivery_by_work_type so the two work-type cuts read
+    # consistently.
+    out_types.sort(
+        key=lambda r: (-r["prs_shipped"], -r["runs_finished"], r["work_type"])
+    )
+
+    return {
+        "since": since.isoformat(),
+        "bucket": bucket,
+        "periods": [start.isoformat() for start in axis],
+        "work_types": out_types,
+    }
+
+
 def _as_utc(dt: datetime) -> datetime:
     """Normalise a stored timestamp to UTC-aware (SQLite hands them back naive)."""
     if dt.tzinfo is None:
