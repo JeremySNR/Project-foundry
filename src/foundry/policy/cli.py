@@ -5,16 +5,25 @@ Usage::
     foundry-policy presets                 # list the shipped presets
     foundry-policy show <name>             # print a preset's YAML (copy-to-adopt)
     foundry-policy explain <name>          # show the gate knobs a preset resolves to
+    foundry-policy explain --config PATH   # ...or the gate YOUR own config resolves to
+    foundry-policy explain --config PATH --format json  # machine-readable
     foundry-policy check --against <name>  # verify YOUR config meets a baseline
     foundry-policy check --against <name> --format json   # machine-readable
 
 This is decision-support and documentation only - it **never** changes a running
 deployment's policy. ``presets`` lists what the library ships; ``show`` prints a
 preset's raw YAML so you can copy it into your own ``foundry.yaml`` and adapt the
-repo names / approvers; ``explain`` loads the preset through the same
-``Settings`` validator your config uses and prints the effective gate knobs (the
+repo names / approvers; ``explain`` loads a config through the same ``Settings``
+validator your deployment uses and prints the effective gate knobs (the
 confidence threshold, protected paths, per-repo overrides and the retry/budget
-caps), so you can see a preset's effect without standing up a run.
+caps), so you can see its effect without standing up a run. ``explain`` accepts
+**either** a preset name (the reference baseline, loaded pure) **or** your own
+deployment config (``--config PATH``, a path argument, or ``$FOUNDRY_CONFIG`` -
+loaded with the process environment so ``FOUNDRY_*`` overrides are reflected),
+so you can answer "what does *my* gate actually resolve to?", not just "what
+does this preset resolve to?". It takes ``--format text`` (default) or
+``--format json`` (the same effective knobs as a machine-readable object on
+stdout, for a dashboard/CI step).
 
 ``check`` is the verification counterpart to ``explain``: it loads *your* config
 (``--config`` or ``FOUNDRY_CONFIG``) and a baseline (a preset name or a path to
@@ -55,9 +64,27 @@ def main(argv: list[str] | None = None) -> None:
     show_p.add_argument("name", help="Preset name (see 'foundry-policy presets').")
 
     explain_p = sub.add_parser(
-        "explain", help="Show the effective gate knobs a preset resolves to."
+        "explain",
+        help="Show the effective gate knobs a preset OR your own config resolves to.",
     )
-    explain_p.add_argument("name", help="Preset name (see 'foundry-policy presets').")
+    explain_p.add_argument(
+        "target",
+        nargs="?",
+        help="A preset name (e.g. 'soc2') or a path to a config file. Omit to use "
+        "--config or $FOUNDRY_CONFIG.",
+    )
+    explain_p.add_argument(
+        "--config",
+        help="Path to your own config to introspect (defaults to $FOUNDRY_CONFIG). "
+        "Loaded with the process environment so FOUNDRY_* overrides are reflected.",
+    )
+    explain_p.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format: 'text' (default, human report) or 'json' "
+        "(machine-readable effective knobs on stdout for a dashboard/CI step).",
+    )
 
     check_p = sub.add_parser(
         "check",
@@ -90,7 +117,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "show":
         _run_show(args.name)
     elif args.command == "explain":
-        _run_explain(args.name)
+        _run_explain(args.target, args.config, args.format)
     elif args.command == "check":
         _run_check(args.config, args.against, args.format)
 
@@ -118,17 +145,83 @@ def _run_show(name: str) -> None:
         sys.exit(2)
 
 
-def _run_explain(name: str) -> None:
-    from foundry.policy.library import effective_policy_summary, load_preset_settings
+def _run_explain(
+    target: str | None, config_path: str | None, fmt: str = "text"
+) -> None:
+    import json
+    import os
+    from pathlib import Path
 
-    try:
-        settings = load_preset_settings(name)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    from foundry.config import Settings
+    from foundry.policy.library import (
+        available_preset_names,
+        effective_policy_summary,
+        load_preset_settings,
+    )
+
+    def _fail(message: str) -> NoReturn:
+        # Usage / config errors exit 2, mirroring `check`. In json mode the error
+        # is a structured object on stderr so a json consumer never parses prose.
+        if fmt == "json":
+            json.dump({"error": message}, sys.stderr)
+            sys.stderr.write("\n")
+        else:
+            print(f"error: {message}", file=sys.stderr)
         sys.exit(2)
 
+    if target is not None and config_path is not None:
+        _fail("pass a preset/config positional argument OR --config, not both")
+
+    # Resolve what to introspect, distinguishing a *reference preset* (loaded pure,
+    # like `show`/the old `explain`) from the operator's *own config* (loaded with
+    # the process environment so FOUNDRY_* overrides resolve as they do at runtime).
+    kind: str
+    source: str
+    try:
+        if config_path is not None:
+            source, kind = config_path, "config"
+            if not Path(config_path).exists():
+                _fail(f"config file not found: {config_path}")
+            settings = Settings.load(config_path, env=os.environ)
+        elif target is not None and target in available_preset_names():
+            source, kind = target, "preset"
+            settings = load_preset_settings(target)
+        elif target is not None:
+            # Not a known preset, so treat it as a path to the operator's config.
+            source, kind = target, "config"
+            if not Path(target).exists():
+                _fail(
+                    f"{target!r} is neither a known preset nor an existing config "
+                    f"file; presets: {', '.join(available_preset_names())}"
+                )
+            settings = Settings.load(target, env=os.environ)
+        else:
+            env_config = os.environ.get("FOUNDRY_CONFIG")
+            if not env_config:
+                _fail(
+                    "nothing to explain; pass a preset name, a config path, "
+                    "--config PATH, or set FOUNDRY_CONFIG"
+                )
+            source, kind = env_config, "config"
+            if not Path(env_config).exists():
+                _fail(f"config file not found: {env_config}")
+            settings = Settings.load(env_config, env=os.environ)
+    except ValueError as exc:
+        _fail(str(exc))
+
     summary = effective_policy_summary(settings)
-    print(f"Effective policy for preset '{name}':\n")
+
+    if fmt == "json":
+        json.dump(
+            {"source": source, "kind": kind, "policy": summary},
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return
+
+    label = f"preset '{source}'" if kind == "preset" else f"config '{source}'"
+    print(f"Effective policy for {label}:\n")
     print(f"  repo_confidence_threshold : {summary['repo_confidence_threshold']}")
     print(f"  max_files_changed         : {summary['max_files_changed']}")
     print(f"  min_approvals             : {summary['min_approvals']}")
