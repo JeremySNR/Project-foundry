@@ -897,6 +897,18 @@ def test_dashboard_renders_failures_by_category_panel() -> None:
     assert "loadFailureCategories();" in DASHBOARD_HTML
 
 
+def test_dashboard_renders_failure_trend_panel() -> None:
+    """The failure-trend panel (issue #37) must fetch the failures/trends
+    endpoint, have a panel to render into, and be wired into the refresh loop —
+    the direction-of-travel complement to the per-run feed and the
+    by-category roll-up ("are we failing more than usual?")."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/failures/trends' in DASHBOARD_HTML
+    assert '<div id="failure-trends"></div>' in DASHBOARD_HTML
+    assert "loadFailureTrends();" in DASHBOARD_HTML
+
+
 # -- Enricher wiring via build_orchestrator ------------------------------------
 
 
