@@ -147,6 +147,16 @@ policy:
   # path_required_roles:
   #   "**/billing/**": ["security"]
   #   "services/identity/**": ["engineering", "security"]
+  # Plan-scope drift escalation: the consumer of the LLM planner's
+  # expected_files_or_areas (the plan-vs-diff check). When on (the default), a PR
+  # whose diff changes files outside *every* file/area the approved plan declared
+  # escalates the run to "review required" - the "agent strayed outside its
+  # approved scope" signal. Strictly additive (it can only ever escalate to a
+  # human, never release a run) and enforced in the orchestrator lifecycle, so it
+  # adds no policy-engine/Rego rule. Inert unless the plan actually declares
+  # expected files/areas: the default template planner declares none, so this
+  # changes nothing until you enable planner.provider: llm. Set False to disable.
+  # enforce_plan_scope: true
   # Change-freeze / maintenance windows (issue #31, the "time windows" policy
   # dimension). During an active window Foundry holds an *autonomous* re-dispatch
   # (the auto-retry on CI failure / changes requested) and escalates the run to
