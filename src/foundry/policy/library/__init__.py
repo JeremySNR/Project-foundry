@@ -235,11 +235,28 @@ class PolicyCheckFinding:
     baseline for this knob; ``detail`` is a human-readable one-liner naming the
     values (and, for collection knobs, exactly which repos/paths/globs fall
     short).
+
+    Alongside the prose ``detail`` each finding also carries a **typed,
+    machine-readable** description of the comparison so a CI step / dashboard
+    consumer can reason about it without scraping the sentence:
+
+    - ``comparator`` - the direction the gate enforces for this knob: ``">="``
+      (higher is stricter), ``"<="`` (lower is stricter), or ``"superset"``
+      (the subject must cover everything the baseline lists).
+    - ``subject`` / ``baseline`` - for the **scalar** knobs, the numeric value
+      on each side (``None`` for an absent cap, e.g. ``max_cost_per_run``); left
+      ``None`` for collection knobs, where a single number does not apply.
+    - ``missing`` - for the **collection** knobs, the baseline items the subject
+      fails to cover (empty when the control passes); always empty for scalars.
     """
 
     knob: str
     ok: bool
     detail: str
+    comparator: str | None = None
+    subject: Any = None
+    baseline: Any = None
+    missing: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -298,6 +315,9 @@ def compare_policy_strictness(
             "repo_confidence_threshold",
             s_thr >= b_thr,
             f"{s_thr} (baseline requires >= {b_thr})",
+            comparator=">=",
+            subject=s_thr,
+            baseline=b_thr,
         )
     )
 
@@ -307,6 +327,9 @@ def compare_policy_strictness(
             "max_files_changed",
             s_files <= b_files,
             f"{s_files} (baseline requires <= {b_files})",
+            comparator="<=",
+            subject=s_files,
+            baseline=b_files,
         )
     )
 
@@ -316,6 +339,9 @@ def compare_policy_strictness(
             "min_approvals",
             s_min >= b_min,
             f"{s_min} (baseline requires >= {b_min})",
+            comparator=">=",
+            subject=s_min,
+            baseline=b_min,
         )
     )
 
@@ -325,6 +351,9 @@ def compare_policy_strictness(
             "max_agent_retries",
             s_ret <= b_ret,
             f"{s_ret} (baseline requires <= {b_ret})",
+            comparator="<=",
+            subject=s_ret,
+            baseline=b_ret,
         )
     )
 
@@ -337,7 +366,16 @@ def compare_policy_strictness(
         # None on the subject means *no* cap, which is weaker than any cap.
         cap_ok = s_cap is not None and s_cap <= b_cap
         cap_detail = f"{s_cap_str} (baseline requires <= ${b_cap})"
-    findings.append(PolicyCheckFinding("max_cost_per_run", cap_ok, cap_detail))
+    findings.append(
+        PolicyCheckFinding(
+            "max_cost_per_run",
+            cap_ok,
+            cap_detail,
+            comparator="<=",
+            subject=s_cap,
+            baseline=b_cap,
+        )
+    )
 
     # --- forbidden globs (superset) ------------------------------------- #
     subject_globs = set(subject.forbidden_globs)
@@ -349,6 +387,8 @@ def compare_policy_strictness(
             f"missing {missing_globs}"
             if missing_globs
             else f"covers all {len(set(baseline.forbidden_globs))} baseline path(s)",
+            comparator="superset",
+            missing=tuple(missing_globs),
         )
     )
 
@@ -369,6 +409,8 @@ def compare_policy_strictness(
             "; ".join(repo_glob_gaps)
             if repo_glob_gaps
             else _none_or_covered(baseline.repo_forbidden_map),
+            comparator="superset",
+            missing=tuple(repo_glob_gaps),
         )
     )
 
@@ -386,6 +428,8 @@ def compare_policy_strictness(
             "; ".join(repo_role_gaps)
             if repo_role_gaps
             else _none_or_covered(baseline.repo_required_roles_map),
+            comparator="superset",
+            missing=tuple(repo_role_gaps),
         )
     )
 
@@ -405,6 +449,8 @@ def compare_policy_strictness(
             "; ".join(repo_min_gaps)
             if repo_min_gaps
             else _none_or_covered(b_repo_min),
+            comparator=">=",
+            missing=tuple(repo_min_gaps),
         )
     )
 
@@ -422,6 +468,8 @@ def compare_policy_strictness(
             "; ".join(path_role_gaps)
             if path_role_gaps
             else _none_or_covered(baseline.path_required_roles_map),
+            comparator="superset",
+            missing=tuple(path_role_gaps),
         )
     )
 
@@ -447,6 +495,8 @@ def compare_policy_strictness(
                 else f"covers all {len(baseline.change_freeze_windows)} baseline "
                 "window(s)"
             ),
+            comparator="superset",
+            missing=tuple(freeze_gaps),
         )
     )
 
@@ -468,11 +518,24 @@ def comparison_to_dict(comparison: PolicyComparison) -> dict[str, Any]:
     ``GET /metrics/policy/check`` endpoint - so the verdict surfaced on a
     dashboard can't drift from the verdict a CI step exits on. Read-only: it just
     reshapes an already-computed comparison, it changes no gate.
+
+    Each finding carries both the human ``detail`` string **and** the typed
+    ``comparator`` / ``subject`` / ``baseline`` / ``missing`` fields, so a CI
+    step can compare the numeric values (or read exactly which collection items
+    fall short) directly, without parsing the prose.
     """
     return {
         "ok": comparison.ok,
         "findings": [
-            {"knob": finding.knob, "ok": finding.ok, "detail": finding.detail}
+            {
+                "knob": finding.knob,
+                "ok": finding.ok,
+                "detail": finding.detail,
+                "comparator": finding.comparator,
+                "subject": finding.subject,
+                "baseline": finding.baseline,
+                "missing": list(finding.missing),
+            }
             for finding in comparison.findings
         ],
         "weaknesses": [finding.knob for finding in comparison.weaknesses],
