@@ -5,7 +5,9 @@ strip (runs in flight / approval queue / execution queue / review queue / spend
 in flight, from the current run states), an approval-queue panel, an
 execution-queue panel (in-flight agent runs with run-time age + SLA, issue #37)
 and a review-queue panel (open PRs with review-latency age + a "stale since last
-push" age, each with its own SLA, issue #37),
+push" age, each with its own SLA, issue #37), a failure/triage panel (recently
+blocked or execution-failed runs with how long ago they failed and why, newest
+first, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
@@ -17,6 +19,7 @@ the run list (with an approval-queue filter) and,
 per run, the full decision timeline (artifacts, audit events, policy decisions,
 agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/approvals``, ``GET /metrics/executions``, ``GET /metrics/reviews``,
+``GET /metrics/failures``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
 ``GET /metrics/agents``,
@@ -209,6 +212,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="queue"></div>
 <div id="exec-queue"></div>
 <div id="review-queue"></div>
+<div id="failure-queue"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -602,6 +606,35 @@ async function loadReviews() {
   }
 }
 
+async function loadFailures() {
+  const el = $("#failure-queue");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/failures?days=7", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const q = await resp.json();
+    const runs = q.runs || [];
+    if (!runs.length) { el.style.display = "none"; return; }  // nothing failed recently: hide
+    const rows = runs.map((r) => `
+      <div class="run breach" data-id="${esc(r.run_id)}" title="open timeline">
+        <span class="key">${esc(r.linear_issue_key)}</span>${badge(r.status)}
+        <span class="age bad">${dur(r.failed_seconds)} ago</span>
+        <div class="meta">${esc(r.run_id)} &middot; ${esc(r.reason || "no reason recorded")}
+          &middot; ${esc(r.risk_level || "unclassified")} risk</div>
+      </div>`).join("");
+    el.innerHTML = `<details open><summary>needs triage &mdash; ${q.count} run${q.count === 1 ? "" : "s"} failed in the last ${q.days}d (${q.blocked} blocked, ${q.failed} execution-failed), newest first</summary>${rows}</details>`;
+    el.style.display = "block";
+    el.querySelectorAll(".run[data-id]").forEach((node) => {
+      node.addEventListener("click", () => loadTimeline(node.dataset.id));
+    });
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadMetrics() {
   const el = $("#metrics");
   if (!hasAuth()) {
@@ -978,6 +1011,7 @@ function refresh() {
   loadApprovals();
   loadExecutions();
   loadReviews();
+  loadFailures();
   loadMetrics();
   loadTrends();
   loadAgents();

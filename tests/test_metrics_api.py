@@ -1019,3 +1019,59 @@ def test_app_from_settings_fails_loud_on_unresolvable_baseline() -> None:
     )
     with pytest.raises(ValueError, match="policy_baseline is misconfigured"):
         app_from_settings(settings)
+
+
+# -- GET /metrics/failures (failure-side triage feed, issue #37) -------------
+
+
+def _run_to_blocked(client, issue_id="issue-b", key="LIN-900") -> str:
+    """Drive a run to BLOCKED via a human stop: ready ticket -> approve isn't
+    needed; a stop on the parked run blocks it (RUN_BLOCKED, human_stopped)."""
+    _post_webhook(client, _ready_payload(issue_id, key), delivery=f"d-{issue_id}")
+    run_id = _latest_run_id(client)
+    resp = client.post(
+        f"/runs/{run_id}/approval",
+        json={"user": "lead@example.com", "text": "/foundry stop"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    return run_id
+
+
+def test_failures_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/failures").status_code == 401
+    assert (
+        client.get(
+            "/metrics/failures", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_failures_rejects_bad_window(client) -> None:
+    assert client.get("/metrics/failures?days=0", headers=AUTH).status_code == 422
+
+
+def test_failures_empty_database(client) -> None:
+    body = client.get("/metrics/failures", headers=AUTH).json()
+    assert body["days"] == 7
+    assert body["count"] == 0
+    assert body["runs"] == []
+    assert body["newest_failure_seconds"] is None
+    assert body["oldest_failure_seconds"] is None
+    assert body["blocked"] == 0
+    assert body["failed"] == 0
+
+
+def test_failures_lists_blocked_run(client) -> None:
+    run_id = _run_to_blocked(client)
+    body = client.get("/metrics/failures", headers=AUTH).json()
+    assert body["count"] == 1
+    entry = body["runs"][0]
+    assert entry["run_id"] == run_id
+    assert entry["status"] == "blocked"
+    assert entry["failed_seconds"] >= 0
+    # The reason is read from the RUN_BLOCKED event's metadata.
+    assert entry["reason"] == "human_stopped"
+    assert body["blocked"] == 1
+    assert body["failed"] == 0

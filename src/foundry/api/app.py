@@ -1316,6 +1316,31 @@ def create_app(
                 stale_sla_seconds=app.state.review_stale_sla_seconds,
             )
 
+    @app.get("/metrics/failures")
+    def metrics_failures(request: Request, days: int = 7) -> dict[str, Any]:
+        """Recently-failed runs needing triage - the incident feed behind the
+        fleet strip's blocked/failed counts, the failure-side complement to
+        ``GET /metrics/approvals`` / ``/executions`` / ``/reviews``. Every run in a
+        terminal-failure state (``blocked`` or ``execution_failed``) whose failure
+        happened in the last ``days`` (default 7), newest first, each with how long
+        ago it failed and why (the reason read from its audit metadata).
+
+        Unlike the three waiting queues - which age runs still in flight and order
+        oldest-first - a failed run is terminal and never leaves the state, so this
+        is a recency-ordered incident feed bounded to a recent window. Read-only,
+        changes no gate: a blocked run stays blocked (invariant #7), re-triggering
+        the ticket starts a fresh run. Token-gated and fail-closed like the other
+        metrics endpoints.
+        """
+        from foundry.memory.metrics import failure_queue
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {"days": days, **failure_queue(session, since=since)}
+
     @app.get("/metrics/policy")
     def metrics_policy(request: Request) -> dict[str, Any]:
         """The effective policy gate this deployment resolves to - the read-only,
