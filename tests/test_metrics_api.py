@@ -272,6 +272,41 @@ def test_by_repo_groups_a_merge_and_a_block(client) -> None:
     assert web["time_to_merge_seconds"]["count"] == 1
 
 
+def test_by_work_type_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/delivery/by-work-type").status_code == 401
+
+
+def test_by_work_type_rejects_bad_window(client) -> None:
+    assert (
+        client.get(
+            "/metrics/delivery/by-work-type?days=0", headers=AUTH
+        ).status_code
+        == 422
+    )
+
+
+def test_by_work_type_empty_database(client) -> None:
+    body = client.get("/metrics/delivery/by-work-type", headers=AUTH).json()
+    assert body["runs_finished"] == 0
+    assert body["work_types"] == []
+
+
+def test_by_work_type_groups_a_merged_run(client) -> None:
+    _run_to_merged(client)
+
+    body = client.get("/metrics/delivery/by-work-type?days=30", headers=AUTH).json()
+    assert body["days"] == 30
+    assert body["runs_finished"] == 1
+    # "Add customer favourites" classifies as a feature.
+    types = {t["work_type"]: t for t in body["work_types"]}
+    assert "feature" in types
+    feat = types["feature"]
+    assert feat["runs_finished"] == 1
+    assert feat["prs_shipped"] == 1
+    assert feat["merge_rate"] == 1.0
+    assert feat["time_to_merge_seconds"]["count"] == 1
+
+
 def test_by_repo_trends_requires_bearer_token(client) -> None:
     assert client.get("/metrics/delivery/by-repo/trends").status_code == 401
 

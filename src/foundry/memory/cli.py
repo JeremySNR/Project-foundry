@@ -16,6 +16,7 @@ Usage::
     foundry-memory delivery [--days D]
     foundry-memory delivery-trends [--bucket week|day] [--days D]
     foundry-memory delivery-by-repo [--days D]
+    foundry-memory delivery-by-work-type [--days D]
     foundry-memory delivery-by-repo-trends [--bucket week|day] [--days D]
 
 ``backfill`` derives outcome rows for terminal runs that finished before the
@@ -50,13 +51,15 @@ engineer can answer "what is the oldest thing waiting, and is it overdue?" from 
 command line. Like ``fleet``/``failures`` they call the same ``memory/metrics.py``
 derivations the endpoints serve, so the CLI and API verdicts can't drift.
 
-``delivery``, ``delivery-trends``, ``delivery-by-repo`` and
-``delivery-by-repo-trends`` are the offline twins of the **delivery** metrics
-endpoints (``GET /metrics/delivery`` / ``/metrics/delivery/trends`` /
-``/metrics/delivery/by-repo`` / ``/metrics/delivery/by-repo/trends``) - the
-org-wide "where work ships, stalls and spends" cut and its trend / per-repo
-dimensions. They answer "what did we ship in the window, where, and at what
-cost?" and "is throughput trending up or down?" offline. Same ``--days`` (default
+``delivery``, ``delivery-trends``, ``delivery-by-repo``,
+``delivery-by-work-type`` and ``delivery-by-repo-trends`` are the offline twins
+of the **delivery** metrics endpoints (``GET /metrics/delivery`` /
+``/metrics/delivery/trends`` / ``/metrics/delivery/by-repo`` /
+``/metrics/delivery/by-work-type`` / ``/metrics/delivery/by-repo/trends``) - the
+org-wide "where work ships, stalls and spends" cut and its trend / per-repo /
+per-work-type dimensions. They answer "what did we ship in the window, where, by
+what kind of work, and at what cost?" and "is throughput trending up or down?"
+offline. Same ``--days`` (default
 90) and ``--bucket`` (default ``week``) defaults as the endpoints, calling the
 same ``memory/metrics.py`` derivations, so the CLI and API verdicts can't drift.
 (``delivery`` omits the ``top_priors`` block the endpoint carries - that is what
@@ -211,6 +214,14 @@ def main() -> None:
         )
     )
 
+    _add_days(
+        sub.add_parser(
+            "delivery-by-work-type",
+            help="Print delivery outcomes grouped by work type (offline twin of "
+            "GET /metrics/delivery/by-work-type).",
+        )
+    )
+
     deliv_repo_trends_p = sub.add_parser(
         "delivery-by-repo-trends",
         help="Print per-repo delivery outcomes bucketed over time (offline twin of "
@@ -246,6 +257,8 @@ def main() -> None:
         _run_delivery_trends(args)
     elif args.command == "delivery-by-repo":
         _run_delivery_by_repo(args)
+    elif args.command == "delivery-by-work-type":
+        _run_delivery_by_work_type(args)
     elif args.command == "delivery-by-repo-trends":
         _run_delivery_by_repo_trends(args)
 
@@ -761,6 +774,36 @@ def _run_delivery_by_repo(args: argparse.Namespace) -> None:
             f"{repo['repo']:<40} {repo['prs_shipped']:<8} {repo['blocked']:<8} "
             f"{repo['merge_rate']:<7} {repo['retries_consumed']:<8} "
             f"{_fmt_cost(repo['total_cost_usd']):<9} {_fmt_age(ttm['median'])}"
+        )
+
+
+def _run_delivery_by_work_type(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import delivery_by_work_type
+
+    since = _since_from_days(args.days)
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = delivery_by_work_type(session, since=since)
+
+    work_types = report["work_types"]
+    if not work_types:
+        print(f"No runs finished in the last {args.days}d.")
+        return
+
+    print(
+        f"Delivery by work type (last {args.days}d): {report['runs_finished']} "
+        f"runs finished across {len(work_types)} type(s) (most-shipping first):\n"
+    )
+    print(
+        f"{'work type':<16} {'shipped':<8} {'blocked':<8} {'merge%':<7} "
+        f"{'retries':<8} {'spend':<9} ttm median"
+    )
+    for wt in work_types:
+        ttm = wt["time_to_merge_seconds"]
+        print(
+            f"{wt['work_type']:<16} {wt['prs_shipped']:<8} {wt['blocked']:<8} "
+            f"{wt['merge_rate']:<7} {wt['retries_consumed']:<8} "
+            f"{_fmt_cost(wt['total_cost_usd']):<9} {_fmt_age(ttm['median'])}"
         )
 
 

@@ -267,6 +267,12 @@ def delivery_metrics(session, *, since: datetime) -> dict:
 # explicit sentinel rather than being silently dropped from the per-repo cut.
 UNROUTED_REPO_LABEL = "(unrouted)"
 
+# Group label for finished runs whose work type was never classified (NULL
+# ``work_type`` - e.g. rejected-at-intake before analysis settled). Like the
+# unrouted-repo sentinel, they carry real signal (intake-stage attrition), so
+# they bucket under an explicit label rather than being silently dropped.
+UNCLASSIFIED_WORK_TYPE_LABEL = "(unclassified)"
+
 
 def delivery_by_repo(session, *, since: datetime) -> dict:
     """Delivery outcomes grouped by routed repo - the per-repo cut of
@@ -353,6 +359,103 @@ def delivery_by_repo(session, *, since: datetime) -> dict:
         "since": since.isoformat(),
         "runs_finished": len(rows),
         "repos": out_repos,
+    }
+
+
+def delivery_by_work_type(session, *, since: datetime) -> dict:
+    """Delivery outcomes grouped by work type - the per-work-type cut of
+    :func:`delivery_metrics`, the way :func:`delivery_by_repo` is the per-repo
+    cut.
+
+    Answers "which *kinds* of work do we ship reliably, which stall, and where
+    does the spend go?" - do bugs sail through while features stall, is the
+    retry/escalation budget eaten by tech-debt runs? - the work-type dimension
+    the org-wide ``delivery_metrics`` and the per-repo cut don't surface. Read
+    at request time from ``foundry_run_outcomes`` (the same denormalized rows
+    the other delivery cuts read; ``work_type`` is a stored, indexed column),
+    so it adds no new write path and rebuilds with ``foundry-memory backfill``.
+
+    Runs whose ``work_type`` was never classified (NULL) bucket under the
+    explicit :data:`UNCLASSIFIED_WORK_TYPE_LABEL` sentinel rather than being
+    dropped, mirroring how :func:`delivery_by_repo` handles unrouted runs.
+    """
+    rows: list[FoundryRunOutcome] = (
+        session.query(FoundryRunOutcome)
+        .filter(FoundryRunOutcome.completed_at >= since)
+        .all()
+    )
+
+    # Per-work-type accumulators. ``cost_seen`` tracks whether *any* row for the
+    # type reported a cost, so a type whose runs never reported cost yields
+    # ``total_cost_usd: None`` (never a conjured $0) - same rule as the org-wide,
+    # per-repo and trend aggregates.
+    types: dict[str, dict] = {}
+    for row in rows:
+        key = row.work_type or UNCLASSIFIED_WORK_TYPE_LABEL
+        agg = types.get(key)
+        if agg is None:
+            agg = types[key] = {
+                "outcomes": {},
+                "retries": 0,
+                "escalations": 0,
+                "ci_failures": 0,
+                "total_cost": 0.0,
+                "cost_seen": False,
+                "merge_times": [],
+                "runs_finished": 0,
+            }
+        agg["runs_finished"] += 1
+        agg["outcomes"][row.outcome] = agg["outcomes"].get(row.outcome, 0) + 1
+        agg["retries"] += max(row.jobs_count - 1, 0)
+        agg["escalations"] += row.escalations_count
+        agg["ci_failures"] += row.ci_failures_count
+        if row.cost_usd is not None:
+            agg["total_cost"] += row.cost_usd
+            agg["cost_seen"] = True
+        if row.time_to_merge_seconds is not None:
+            agg["merge_times"].append(row.time_to_merge_seconds)
+
+    out_types = []
+    for work_type, agg in types.items():
+        merge_times = sorted(agg["merge_times"])
+        runs = agg["runs_finished"]
+        shipped = agg["outcomes"].get("merged", 0)
+        out_types.append(
+            {
+                "work_type": work_type,
+                "runs_finished": runs,
+                "outcomes": agg["outcomes"],
+                "prs_shipped": shipped,
+                "blocked": agg["outcomes"].get("blocked", 0),
+                "rejected": agg["outcomes"].get("rejected", 0),
+                "failed": agg["outcomes"].get("failed", 0),
+                "needs_clarification": agg["outcomes"].get("needs_clarification", 0),
+                "merge_rate": round(shipped / runs, 3) if runs else 0.0,
+                "retries_consumed": agg["retries"],
+                "escalations": agg["escalations"],
+                "ci_failures": agg["ci_failures"],
+                "total_cost_usd": (
+                    round(agg["total_cost"], 2) if agg["cost_seen"] else None
+                ),
+                "time_to_merge_seconds": {
+                    "count": len(merge_times),
+                    "median": _percentile(merge_times, 0.5),
+                    "p90": _percentile(merge_times, 0.9),
+                },
+            }
+        )
+
+    # Most-shipping first, then most-active, with a stable name tie-break so the
+    # board ordering is deterministic across requests - same order as the
+    # per-repo cut.
+    out_types.sort(
+        key=lambda r: (-r["prs_shipped"], -r["runs_finished"], r["work_type"])
+    )
+
+    return {
+        "since": since.isoformat(),
+        "runs_finished": len(rows),
+        "work_types": out_types,
     }
 
 
