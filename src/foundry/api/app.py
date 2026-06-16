@@ -243,6 +243,8 @@ def create_app(
     execution_sla_seconds: int | None = None,
     review_sla_seconds: int | None = None,
     review_stale_sla_seconds: int | None = None,
+    effective_policy: Mapping[str, Any] | None = None,
+    policy_provider: str | None = None,
 ) -> FastAPI:
     if session_factory is None:
         engine = make_engine()
@@ -327,6 +329,17 @@ def create_app(
     # last push" signal, distinct from review_sla_seconds (total open time). None =
     # no SLA (no breach signal); read-only, blocks no run.
     app.state.review_stale_sla_seconds = review_stale_sla_seconds
+    # The effective policy gate this deployment resolves to (issue #31): the
+    # read-only `effective_policy_summary` of the live config, plus which backend
+    # (`local`/`opa`) enforces it. Surfaced at GET /metrics/policy and on the
+    # dashboard so an operator/auditor can see *what the gate enforces* without
+    # CLI access - the in-app twin of `foundry-policy explain`. None when the app
+    # is built without a Settings (e.g. a bare create_app in tests); read-only,
+    # changes no gate. Copied so a caller's mapping can't mutate it post-build.
+    app.state.effective_policy = (
+        dict(effective_policy) if effective_policy is not None else None
+    )
+    app.state.policy_provider = policy_provider
     app.state.clock = clock or (lambda: datetime.now(timezone.utc))
     app.state.deduplicator = WebhookDeduplicator(
         session_factory,
@@ -1279,6 +1292,27 @@ def create_app(
                 stale_sla_seconds=app.state.review_stale_sla_seconds,
             )
 
+    @app.get("/metrics/policy")
+    def metrics_policy(request: Request) -> dict[str, Any]:
+        """The effective policy gate this deployment resolves to - the read-only,
+        in-app twin of ``foundry-policy explain --config``. Returns the gate-relevant
+        knobs the live config enforces (confidence threshold, protected paths,
+        per-repo/per-path required roles, the N-of-M approval counts, retry/budget
+        caps) and which backend (``local``/``opa``) enforces them, so an operator or
+        auditor can see *what the gate is* on the dashboard without CLI access.
+
+        ``configured`` is False (and ``policy`` null) when the app was built without
+        a Settings (e.g. a bare ``create_app`` in tests). Token-gated and fail-closed
+        like the other metrics endpoints; read-only, changes no gate.
+        """
+        _require_api_token(app, request)
+        policy = app.state.effective_policy
+        return {
+            "configured": policy is not None,
+            "provider": app.state.policy_provider,
+            "policy": policy,
+        }
+
     @app.post("/runs/{run_id}/approval")
     def approval(
         run_id: str,
@@ -1950,6 +1984,8 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
 
 
 def app_from_settings(settings: Settings) -> FastAPI:
+    from foundry.policy.library import effective_policy_summary
+
     engine = make_engine(settings.database_url)
     init_schema(engine)
     session_factory = make_session_factory(engine)
@@ -2052,6 +2088,12 @@ def app_from_settings(settings: Settings) -> FastAPI:
         execution_sla_seconds=settings.execution_sla_seconds,
         review_sla_seconds=settings.review_sla_seconds,
         review_stale_sla_seconds=settings.review_stale_sla_seconds,
+        # The effective gate this config resolves to, surfaced read-only at
+        # GET /metrics/policy + the dashboard (issue #31). Computed from the same
+        # `effective_policy_summary` `foundry-policy explain` uses, so the in-app
+        # view can't drift from the CLI's.
+        effective_policy=effective_policy_summary(settings),
+        policy_provider=settings.policy_provider,
     )
 
 

@@ -721,3 +721,78 @@ def test_final_summary_appears_in_timeline(client) -> None:
     ]
     assert len(summaries) == 1
     assert summaries[0]["content"]["outcome"] == "merged"
+
+
+# --- GET /metrics/policy: the effective gate, surfaced read-only (issue #31) ---
+
+
+def test_policy_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/policy").status_code == 401
+    assert (
+        client.get(
+            "/metrics/policy", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_policy_unconfigured_reports_not_configured(client) -> None:
+    # The default fixture builds create_app without an effective_policy (no
+    # Settings), so the endpoint answers "nothing to show" rather than 404 - the
+    # dashboard panel hides on this.
+    body = client.get("/metrics/policy", headers=AUTH).json()
+    assert body == {"configured": False, "provider": None, "policy": None}
+
+
+def test_policy_reports_the_effective_gate() -> None:
+    summary = {
+        "repo_confidence_threshold": 80,
+        "max_files_changed": 50,
+        "forbidden_globs": ["**/secrets/**"],
+        "repo_forbidden_globs": {"payments": ["**/keys/**"]},
+        "repo_required_roles": {"payments": ["security"]},
+        "min_approvals": 2,
+        "repo_min_approvals": {"payments": 3},
+        "path_required_roles": {"**/billing/**": ["security"]},
+        "max_agent_retries": 1,
+        "retry_on": ["ci_failure"],
+        "max_cost_per_run": 5.0,
+        "estimated_cost_per_dispatch": 1.0,
+        "approver_count": 2,
+    }
+    api = _client_with(effective_policy=summary, policy_provider="opa")
+    body = api.get("/metrics/policy", headers=AUTH).json()
+    assert body["configured"] is True
+    assert body["provider"] == "opa"
+    assert body["policy"] == summary
+
+
+def test_policy_summary_is_copied_not_aliased() -> None:
+    # A caller mutating the dict it passed in must not change what the endpoint
+    # serves - create_app copies it at build time.
+    summary = {"min_approvals": 1, "forbidden_globs": []}
+    api = _client_with(effective_policy=summary)
+    summary["min_approvals"] = 99
+    body = api.get("/metrics/policy", headers=AUTH).json()
+    assert body["policy"]["min_approvals"] == 1
+
+
+def test_app_from_settings_wires_the_effective_policy() -> None:
+    # The real entrypoint computes the summary from the live config with the same
+    # `effective_policy_summary` `foundry-policy explain` uses, so the in-app view
+    # can't drift from the CLI's.
+    from foundry.api import app_from_settings
+    from foundry.config import Settings
+    from foundry.policy.library import effective_policy_summary
+
+    settings = Settings.from_env(
+        {
+            "FOUNDRY_LINEAR_WEBHOOK_SECRET": SECRET,
+            "FOUNDRY_API_TOKEN": API_TOKEN,
+        }
+    )
+    api = TestClient(app_from_settings(settings))
+    body = api.get("/metrics/policy", headers=AUTH).json()
+    assert body["configured"] is True
+    assert body["provider"] == settings.policy_provider
+    assert body["policy"] == effective_policy_summary(settings)

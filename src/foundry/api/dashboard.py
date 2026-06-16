@@ -11,14 +11,16 @@ strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
 (where work ships, stalls, and spends) with a per-repo trend sparkline strip
 (is each repo speeding up or stalling?), an epic board (multi-repo
-runs rolled up, issue #35), the run list (with an approval-queue filter) and,
+runs rolled up, issue #35), a policy-gate panel (the effective gate this
+deployment enforces - the in-app twin of ``foundry-policy explain``, issue #31),
+the run list (with an approval-queue filter) and,
 per run, the full decision timeline (artifacts, audit events, policy decisions,
 agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/approvals``, ``GET /metrics/executions``, ``GET /metrics/reviews``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
 ``GET /metrics/agents``,
-``GET /metrics/agents/trends``, ``GET /epics`` and
+``GET /metrics/agents/trends``, ``GET /metrics/policy``, ``GET /epics`` and
 ``GET /runs/{id}/timeline``; the calls carry the bearer token the user pastes
 once (kept in localStorage, never sent anywhere but this API).
 
@@ -214,6 +216,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="repo-delivery"></div>
 <div id="repo-trends"></div>
 <div id="epics"></div>
+<div id="policy"></div>
 <main>
   <div id="runs"></div>
   <div id="detail"><div class="empty">Select a run to see its full decision timeline.</div></div>
@@ -870,6 +873,56 @@ async function loadEpics() {
   }
 }
 
+// The effective policy gate this deployment resolves to (issue #31) - the
+// in-app twin of `foundry-policy explain`. Read-only; surfaces what the gate
+// enforces (threshold, protected paths, required-approval roles/counts, caps)
+// so an auditor can see the gate without CLI access.
+function policyList(obj, render) {
+  const keys = Object.keys(obj || {});
+  if (!keys.length) return '<span class="kv">none</span>';
+  return keys.map((k) => `<div class="kv">${esc(k)}: ${render(obj[k])}</div>`).join("");
+}
+
+async function loadPolicy() {
+  const el = $("#policy");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/policy", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const p = m.policy;
+    if (!m.configured || !p) { el.style.display = "none"; return; }  // not built from a config
+    const globs = (p.forbidden_globs || []);
+    const cap = p.max_cost_per_run == null ? "no cap" : "$" + p.max_cost_per_run;
+    const rows = [
+      ["policy backend", esc(m.provider || "local")],
+      ["repo confidence threshold", esc(p.repo_confidence_threshold)],
+      ["max files changed", p.max_files_changed == null ? "no cap" : esc(p.max_files_changed)],
+      ["min approvals (two-person rule)", esc(p.min_approvals)],
+      ["per-repo min approvals", policyList(p.repo_min_approvals, (v) => esc(v))],
+      ["forbidden paths", `${globs.length} &mdash; ` + (globs.map(esc).join(", ") || "none")],
+      ["per-repo forbidden paths", policyList(p.repo_forbidden_globs, (v) => esc((v || []).join(", ")))],
+      ["per-repo required roles", policyList(p.repo_required_roles, (v) => esc((v || []).join(", ")))],
+      ["per-path required roles", policyList(p.path_required_roles, (v) => esc((v || []).join(", ")))],
+      ["max agent retries", esc(p.max_agent_retries)],
+      ["max cost per run", esc(cap)],
+      ["configured approvers", esc(p.approver_count)],
+    ];
+    const body = rows.map(
+      ([k, v]) => `<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join("");
+    el.innerHTML = `<details><summary>policy gate &mdash; what this deployment enforces (the in-app twin of <code>foundry-policy explain</code>)</summary>
+      <table>${body}</table>
+      <div class="kv">read-only view of the effective gate; built-ins are a non-overridable floor &mdash; config can only make it stricter</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 function refresh() {
   loadRuns();
   loadFleet();
@@ -883,6 +936,7 @@ function refresh() {
   loadRepoDelivery();
   loadRepoTrends();
   loadEpics();
+  loadPolicy();
 }
 
 $("#save").addEventListener("click", () => {
