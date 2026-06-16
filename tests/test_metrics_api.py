@@ -1215,3 +1215,72 @@ def test_failures_by_category_matches_feed_totals(client) -> None:
     assert agg["distinct_categories"] == 1
     assert agg["categories"][0]["count"] == 2
     assert sum(c["count"] for c in agg["categories"]) == feed["count"]
+
+
+# -- GET /metrics/failures/trends (failure over-time cut, issue #37) ----------
+
+
+def test_failures_trends_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/failures/trends").status_code == 401
+    assert (
+        client.get(
+            "/metrics/failures/trends", headers={"Authorization": "Bearer wrong"}
+        ).status_code
+        == 401
+    )
+
+
+def test_failures_trends_rejects_bad_window(client) -> None:
+    assert client.get("/metrics/failures/trends?days=0", headers=AUTH).status_code == 422
+
+
+def test_failures_trends_rejects_bad_bucket(client) -> None:
+    assert (
+        client.get("/metrics/failures/trends?bucket=month", headers=AUTH).status_code
+        == 422
+    )
+
+
+def test_failures_trends_empty_database(client) -> None:
+    body = client.get("/metrics/failures/trends", headers=AUTH).json()
+    assert body["days"] == 30
+    assert body["bucket"] == "day"  # the failure-trend default
+    assert body["count"] == 0
+    assert body["blocked"] == 0
+    assert body["failed"] == 0
+    assert body["periods"] == []
+
+
+def test_failures_trends_buckets_blocked_run(client) -> None:
+    _run_to_blocked(client)
+    body = client.get("/metrics/failures/trends", headers=AUTH).json()
+    assert body["count"] == 1
+    assert body["blocked"] == 1
+    assert body["failed"] == 0
+    # The single block lands in exactly one (today's) bucket.
+    assert len(body["periods"]) == 1
+    period = body["periods"][0]
+    assert period["count"] == 1
+    assert period["blocked"] == 1
+    assert period["failed"] == 0
+
+
+def test_failures_trends_matches_feed_totals(client) -> None:
+    # The over-time cut must agree with the per-run feed it sits beside: same
+    # runs, same window, same derivation - the totals can't drift.
+    _run_to_blocked(client, issue_id="issue-t1", key="LIN-911")
+    _run_to_blocked(client, issue_id="issue-t2", key="LIN-912")
+    feed = client.get("/metrics/failures", headers=AUTH).json()
+    trend = client.get("/metrics/failures/trends", headers=AUTH).json()
+    assert feed["count"] == trend["count"] == 2
+    assert feed["blocked"] == trend["blocked"]
+    assert sum(p["count"] for p in trend["periods"]) == feed["count"]
+
+
+def test_failures_trends_accepts_week_bucket(client) -> None:
+    _run_to_blocked(client)
+    body = client.get(
+        "/metrics/failures/trends?bucket=week", headers=AUTH
+    ).json()
+    assert body["bucket"] == "week"
+    assert body["count"] == 1

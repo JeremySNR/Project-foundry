@@ -1450,6 +1450,42 @@ def create_app(
         with app.state.session_factory() as session:
             return {"days": days, **failures_by_category(session, since=since)}
 
+    @app.get("/metrics/failures/trends")
+    def metrics_failures_trends(
+        request: Request, days: int = 30, bucket: str = "day"
+    ) -> dict[str, Any]:
+        """Recently-failed runs **bucketed over time** - the direction-of-travel
+        cut that complements the per-run ``GET /metrics/failures`` feed and the
+        point-in-time ``GET /metrics/failures/by-category`` roll-up. Where those
+        answer "what is failing right now", this answers *"are we failing more
+        than usual - is something spiking?"*: the same recently-failed runs
+        bucketed by when they failed onto one zero-filled time axis (``day`` or
+        ``week``), each period carrying its count with a ``blocked``/``failed``
+        split, plus window totals.
+
+        It is to the failure surface what ``/metrics/delivery/trends`` is to the
+        delivery surface, and reuses the same failure-event derivation the feed
+        and the by-category roll-up serve, so the totals can't drift. Read-only,
+        changes no gate: a blocked run stays blocked (invariant #7). Token-gated
+        and fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS, failure_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **failure_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/policy")
     def metrics_policy(request: Request) -> dict[str, Any]:
         """The effective policy gate this deployment resolves to - the read-only,

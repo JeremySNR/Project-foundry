@@ -173,6 +173,24 @@ def main() -> None:
         help="Only count runs that failed in the last N days (default: 7).",
     )
 
+    fail_trends_p = sub.add_parser(
+        "failures-trends",
+        help="Print recent failures bucketed over time, oldest period first "
+        "(offline twin of GET /metrics/failures/trends).",
+    )
+    fail_trends_p.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Only count runs that failed in the last N days (default: 30).",
+    )
+    fail_trends_p.add_argument(
+        "--bucket",
+        default="day",
+        choices=("day", "week"),
+        help="Time bucket for the trend (default: day).",
+    )
+
     sub.add_parser(
         "approvals",
         help="Print runs awaiting human approval, oldest first (offline twin of "
@@ -270,6 +288,8 @@ def main() -> None:
         _run_failures(args)
     elif args.command == "failures-by-category":
         _run_failures_by_category(args)
+    elif args.command == "failures-trends":
+        _run_failures_trends(args)
     elif args.command == "approvals":
         _run_approvals()
     elif args.command == "executions":
@@ -624,6 +644,34 @@ def _run_failures_by_category(args: argparse.Namespace) -> None:
             f"{cat['count']:<7} {cat['blocked']:<8} {cat['failed']:<7} "
             f"{_fmt_age(cat['newest_failure_seconds']):<9} "
             f"{_fmt_age(cat['oldest_failure_seconds']):<9} {cat['category']}"
+        )
+
+
+def _run_failures_trends(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import failure_trends
+
+    since = _since_from_days(args.days)
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = failure_trends(session, since=since, bucket=args.bucket)
+
+    periods = report["periods"]
+    if not periods:
+        print(f"No runs failed in the last {args.days}d - nothing to triage.")
+        return
+
+    label = "week of" if args.bucket == "week" else "day"
+    print(
+        f"Failures by {args.bucket} (last {args.days}d): {report['count']} total, "
+        f"{report['blocked']} blocked, {report['failed']} execution-failed "
+        f"(oldest period first):\n"
+    )
+    for period in periods:
+        print(
+            f"  {label} {period['period_start'][:10]}  "
+            f"failures {period['count']:>3}  blocked {period['blocked']:>3}  "
+            f"execution-failed {period['failed']:>3}"
         )
 
 
