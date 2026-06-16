@@ -8,6 +8,8 @@ Usage::
     foundry-memory show-scorecard-trends [--bucket week|day] [--days D]
     foundry-memory recommend-agent [--work-type T] [--repo R] [--candidates a,b]
                                    [--min-samples N] [--days D]
+    foundry-memory fleet
+    foundry-memory failures [--days D]
 
 ``backfill`` derives outcome rows for terminal runs that finished before the
 ``foundry_run_outcomes`` table existed (or that a fail-soft hook missed);
@@ -18,7 +20,20 @@ per-provider merge rate bucketed over time (is an agent improving or sliding?);
 ``recommend-agent`` turns those scorecards into
 a single, explainable provider recommendation for a piece of work (the
 decision-support read behind the future ``agent.provider: auto`` - reporting
-only). Settings come from ``FOUNDRY_CONFIG`` and the usual environment variable
+only).
+
+``fleet`` and ``failures`` are the **offline twins** of the operational fleet
+metrics endpoints (``GET /metrics/fleet`` / ``GET /metrics/failures``): they read
+the DB directly and call the same ``memory/metrics.py`` derivations the API
+serves, so an on-call engineer or auditor with DB access but no running API /
+bearer token can still answer "is everything healthy right now?" (``fleet`` - the
+live snapshot, honouring the same ``dashboard.*_sla_seconds`` knobs) and "what
+just broke and needs a human?" (``failures`` - recently blocked/execution-failed
+runs, newest first, bounded to a recent window). Mirrors how ``foundry-evidence``
+is the offline twin of the evidence endpoints. Both are read-only and block
+nothing.
+
+Settings come from ``FOUNDRY_CONFIG`` and the usual environment variable
 overrides.
 """
 
@@ -94,6 +109,23 @@ def main() -> None:
         help="Only consider outcomes from the last N days (default: all history).",
     )
 
+    sub.add_parser(
+        "fleet",
+        help="Print the live fleet snapshot (offline twin of GET /metrics/fleet).",
+    )
+
+    fail_p = sub.add_parser(
+        "failures",
+        help="Print recently-failed runs needing triage (offline twin of "
+        "GET /metrics/failures).",
+    )
+    fail_p.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Only show runs that failed in the last N days (default: 7).",
+    )
+
     args = parser.parse_args()
     if args.command == "backfill":
         _run_backfill(args)
@@ -105,6 +137,10 @@ def main() -> None:
         _run_show_scorecard_trends(args)
     elif args.command == "recommend-agent":
         _run_recommend(args)
+    elif args.command == "fleet":
+        _run_fleet()
+    elif args.command == "failures":
+        _run_failures(args)
 
 
 def _session_factory():
@@ -293,3 +329,107 @@ def _run_recommend(args: argparse.Namespace) -> None:
                 f"{card['provider']:<20} {tally:<12} {conf:<5} {cost:<8} "
                 f"{'yes' if card['eligible'] else 'no'}"
             )
+
+
+def _fmt_age(seconds: int | None) -> str:
+    """Human-readable elapsed time, '-' when no value (no run in that state)."""
+    if seconds is None:
+        return "-"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours:02d}h"
+
+
+def _sla_note(breaches: int, sla_seconds: int | None) -> str:
+    """' (N breaching SLA)' / ' (SLA Ns)' / '' — match the dashboard strip's signal."""
+    if sla_seconds is None:
+        return ""
+    if breaches:
+        return f"  ({breaches} breaching SLA {sla_seconds}s)"
+    return f"  (SLA {sla_seconds}s, none breaching)"
+
+
+def _run_fleet() -> None:
+    from foundry.memory.metrics import fleet_status
+
+    settings, session_factory = _session_factory()
+    with session_factory() as session:
+        snap = fleet_status(
+            session,
+            sla_seconds=settings.approval_sla_seconds,
+            execution_sla_seconds=settings.execution_sla_seconds,
+            review_sla_seconds=settings.review_sla_seconds,
+            review_stale_sla_seconds=settings.review_stale_sla_seconds,
+        )
+
+    cost = "-" if snap["active_cost_usd"] is None else f"${snap['active_cost_usd']}"
+    print("Fleet snapshot (live):\n")
+    print(f"  runs total      {snap['total_runs']}")
+    print(f"  runs active     {snap['runs_active']}")
+    print(f"  runs terminal   {snap['runs_terminal']}")
+    print(
+        f"  awaiting human  {snap['awaiting_human']}  "
+        f"(oldest wait {_fmt_age(snap['oldest_wait_seconds'])})"
+        f"{_sla_note(snap['approvals_breaching_sla'], snap['approval_sla_seconds'])}"
+    )
+    print(
+        f"  agents running  {snap['agents_running']}  "
+        f"(oldest run {_fmt_age(snap['oldest_execution_seconds'])})"
+        f"{_sla_note(snap['executions_breaching_sla'], snap['execution_sla_seconds'])}"
+    )
+    print(
+        f"  PRs open        {snap['prs_open']}  "
+        f"(oldest review {_fmt_age(snap['oldest_review_seconds'])})"
+        f"{_sla_note(snap['reviews_breaching_sla'], snap['review_sla_seconds'])}"
+    )
+    print(
+        f"  PRs stale       oldest inactive {_fmt_age(snap['oldest_inactive_seconds'])}"
+        f"{_sla_note(snap['reviews_stale'], snap['review_stale_sla_seconds'])}"
+    )
+    print(f"  spend committed {cost}")
+
+    if snap["by_status"]:
+        print("\n  by status:")
+        for status, count in sorted(snap["by_status"].items()):
+            print(f"    {status:<22} {count}")
+
+
+def _run_failures(args: argparse.Namespace) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from foundry.memory.metrics import failure_queue
+
+    if args.days < 1:
+        print("error: --days must be >= 1", file=sys.stderr)
+        sys.exit(2)
+    since = datetime.now(timezone.utc) - timedelta(days=args.days)
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = failure_queue(session, since=since)
+
+    runs = report["runs"]
+    if not runs:
+        print(f"No runs failed in the last {args.days}d - nothing to triage.")
+        return
+
+    print(
+        f"Failed runs needing triage (last {args.days}d): "
+        f"{report['count']} total, {report['blocked']} blocked, "
+        f"{report['failed']} execution-failed (newest first):\n"
+    )
+    print(f"{'failed':<9} {'status':<18} {'issue':<14} {'run':<14} reason")
+    for run in runs:
+        issue = run["linear_issue_key"] or "-"
+        reason = run["reason"] or "(unknown)"
+        print(
+            f"{_fmt_age(run['failed_seconds']):<9} {run['status']:<18} "
+            f"{issue:<14} {run['run_id'][:12]:<14} {reason}"
+        )
