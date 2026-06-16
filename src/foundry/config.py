@@ -370,6 +370,19 @@ class Settings:
     # policy-engine/Rego lock-step concern (invariant #2 does not apply). Role
     # names are validated against the ApprovalRole vocabulary at load.
     path_required_roles: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Plan-scope drift escalation: the consumer of the LLM planner's
+    # ``DeliveryPlan.expected_files_or_areas`` (the long-promised plan-vs-diff
+    # check). When on (the default), a PR whose diff changes files outside
+    # *every* file/area the approved plan declared escalates the run to
+    # REVIEW_REQUIRED - the "agent strayed outside its approved scope" signal.
+    # Enforced diff-aware in the orchestrator re-check, alongside the
+    # forbidden-path block and the per-path approval-role escalation, so there
+    # is no policy-engine/Rego lock-step concern (invariant #2 does not apply);
+    # strictly additive (it can only ever *escalate* to human review, never
+    # release a run - invariant #1). Inert unless the plan actually declares
+    # expected files/areas (the template planner declares none), so for the
+    # default template planner this changes nothing; set False to disable.
+    enforce_plan_scope: bool = True
     # Change-freeze / maintenance windows (issue #31, the "time windows" policy
     # dimension). During an active window the orchestrator holds an *autonomous*
     # re-dispatch (a remediation retry) and escalates the run to REVIEW_REQUIRED
@@ -974,6 +987,8 @@ def _from_yaml(path: Path) -> dict[str, Any]:
             (str(glob), tuple(str(role) for role in roles))
             for glob, roles in (policy["path_required_roles"] or {}).items()
         )
+    if "enforce_plan_scope" in policy:
+        out["enforce_plan_scope"] = bool(policy["enforce_plan_scope"])
     if "change_freeze_windows" in policy:
         out["change_freeze_windows"] = tuple(
             window_from_mapping(entry)

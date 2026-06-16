@@ -64,6 +64,7 @@ from foundry.engines.risk import (
     GlobDiffRiskClassifier,
     HeuristicRiskClassifier,
     RiskClassifier,
+    files_outside_scope,
     glob_match,
     merge_sensitive_keywords,
 )
@@ -167,6 +168,7 @@ class FoundryOrchestrator:
         min_approvals: int = 1,
         repo_min_approvals: Mapping[str, int] | None = None,
         path_required_roles: Mapping[str, tuple[str, ...]] | None = None,
+        enforce_plan_scope: bool = True,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         extra_sensitive_keywords: Mapping[str, Sequence[str]] | None = None,
         change_freeze_windows: Sequence[ChangeFreezeWindow] | None = None,
@@ -267,6 +269,19 @@ class FoundryOrchestrator:
             glob: [ApprovalRole(r) for r in roles]
             for glob, roles in (path_required_roles or {}).items()
         }
+        # Plan-scope drift escalation (the long-promised plan-vs-diff check, the
+        # consumer of the LLM planner's ``DeliveryPlan.expected_files_or_areas``).
+        # When a PR's diff changes files that fall outside *every* file/area the
+        # approved plan declared, the run is escalated to REVIEW_REQUIRED for a
+        # human - the "agent strayed outside its approved scope" signal. Like the
+        # per-path approval-role escalation it is strictly additive (it can only
+        # ever *escalate* to human review, never release a run - invariant #1) and
+        # enforced in the orchestrator lifecycle, not the policy gate, so there is
+        # no Python/Rego lock-step concern (invariant #2 does not apply). It is
+        # data-inert whenever the plan declares no expected files/areas (the
+        # template planner's default), so the only runs it engages are ones a
+        # code-aware planner scoped - the kill switch is this flag.
+        self._enforce_plan_scope = enforce_plan_scope
         if sensitive_path_globs is None:
             from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
 
@@ -2125,6 +2140,32 @@ class FoundryOrchestrator:
                 )
             )
             return RunStatus.REVIEW_REQUIRED
+
+        drift = self._unexpected_plan_files(
+            session, run_id, pr_state.files_changed
+        )
+        if drift:
+            # The agent's PR changed files outside the approved plan's declared
+            # scope - hand it to a human rather than letting unplanned changes
+            # ride through. Recorded as a RISK_ESCALATED event (like the other
+            # diff-aware escalations) so the trail says *why* and the
+            # approval-queue clock dates the wait from this transition.
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "category": "plan_scope_drift",
+                        "reason": (
+                            "diff changes files outside the approved plan's "
+                            "expected files/areas"
+                        ),
+                        "unexpected_files": sorted(drift),
+                    },
+                )
+            )
+            return RunStatus.REVIEW_REQUIRED
         return RunStatus.PR_OPEN
 
     def _unapproved_path_roles(
@@ -2157,6 +2198,31 @@ class FoundryOrchestrator:
                         continue
                     unapproved.setdefault(role.value, []).append(path)
         return unapproved
+
+    def _unexpected_plan_files(
+        self, session, run_id: str, files: list[str]
+    ) -> list[str]:
+        """Changed files that fall outside the approved plan's declared scope.
+
+        The consumer of the LLM planner's
+        :attr:`DeliveryPlan.expected_files_or_areas`: a diff straying outside
+        every file/area the plan named is the "agent went off-plan" signal and
+        escalates the run to a human. Returns the offending files (empty = no
+        drift). Inert - returns ``[]`` - when the kill switch is off, the plan
+        artifact is missing, or the plan declared no expected files/areas (the
+        template planner's default), so the only runs it engages are ones a
+        code-aware planner actually scoped. Strictly additive (escalate-only),
+        so it never releases a run (invariant #1).
+        """
+        if not self._enforce_plan_scope:
+            return []
+        try:
+            plan: DeliveryPlan = self._load(
+                session, run_id, ArtifactType.DELIVERY_PLAN
+            )
+        except OrchestratorError:
+            return []
+        return files_outside_scope(plan.expected_files_or_areas, files)
 
     def _unexpected_sensitive_areas(
         self, session, run_id: str, files: list[str]

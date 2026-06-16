@@ -2242,6 +2242,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         min_approvals=settings.min_approvals,
         repo_min_approvals=settings.repo_min_approvals_map,
         path_required_roles=settings.path_required_roles_map,
+        enforce_plan_scope=settings.enforce_plan_scope,
         sensitive_path_globs=settings.sensitive_globs_map,
         extra_sensitive_keywords=extra_risk_keywords,
         change_freeze_windows=settings.change_freeze_windows,

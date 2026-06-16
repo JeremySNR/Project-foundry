@@ -85,6 +85,52 @@ def glob_match(path: str, pattern: str) -> bool:
     return pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:])
 
 
+def _normalise_scope_entry(entry: str) -> str:
+    """Trim a plan ``expected_files_or_areas`` entry to a comparable form."""
+    entry = (entry or "").strip()
+    if entry.startswith("./"):
+        entry = entry[2:]
+    return entry.rstrip("/")
+
+
+def _scope_entry_covers(path: str, entry: str) -> bool:
+    """True if a single plan-scope entry covers a changed file path.
+
+    An entry may be an exact path, a glob (``*``/``**``/``?``), a directory
+    prefix (``src/api`` covers ``src/api/app.py``), or a bare area/segment name
+    (``favourites`` covers ``src/features/favourites/index.ts``).
+    """
+    if path == entry or glob_match(path, entry):
+        return True
+    if path.startswith(entry + "/"):
+        return True
+    # A bare area name (no path separator, no glob metacharacters) matches when
+    # it appears as a whole path segment - so the LLM planner naming an "area"
+    # rather than a file still scopes the diff.
+    if "/" not in entry and not any(ch in entry for ch in "*?["):
+        return entry in path.split("/")
+    return False
+
+
+def files_outside_scope(scope: Sequence[str], files: Sequence[str]) -> list[str]:
+    """Changed files that fall outside *every* declared plan-scope entry.
+
+    ``scope`` is a plan's ``expected_files_or_areas``. Matching is deliberately
+    *generous* (see :func:`_scope_entry_covers`): the drift check this powers is
+    escalate-only - it can hand a straying PR to a human but never release one -
+    so an over-broad match merely keeps today's behaviour while a missed match
+    would needlessly escalate (the safe direction). An empty/whitespace-only
+    scope returns ``[]`` (nothing to check), so the check is inert unless the
+    planner actually declared expected files/areas.
+    """
+    cleaned = [e for e in (_normalise_scope_entry(s) for s in scope) if e]
+    if not cleaned:
+        return []
+    return [
+        f for f in files if not any(_scope_entry_covers(f, e) for e in cleaned)
+    ]
+
+
 def sensitive_areas_for_paths(
     files: list[str], globs_map: Mapping[str, tuple[str, ...]]
 ) -> dict[str, list[str]]:
