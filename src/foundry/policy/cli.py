@@ -256,6 +256,22 @@ def _run_explain(
         for repo, globs in summary["repo_forbidden_globs"].items():
             print(f"      {repo}: {', '.join(globs)}")
 
+    if summary["sensitive_path_globs"]:
+        print(
+            "\n  sensitive-path globs "
+            "(a diff here escalates the run to the area's approval roles):"
+        )
+        for area, globs in summary["sensitive_path_globs"].items():
+            print(f"      {area}: {', '.join(globs)}")
+
+    if summary["extra_sensitive_keywords"]:
+        print(
+            "\n  extra sensitive keywords "
+            "(ticket text flagging an area - additive on the built-in floor):"
+        )
+        for area, keywords in summary["extra_sensitive_keywords"].items():
+            print(f"      {area}: {', '.join(keywords)}")
+
     if summary["change_freeze_windows"]:
         print(
             "\n  change-freeze windows "

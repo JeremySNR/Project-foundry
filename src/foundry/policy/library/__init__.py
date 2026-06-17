@@ -160,8 +160,10 @@ def effective_policy_summary(settings: "Settings") -> dict[str, Any]:
 
     Decision-support only: a flat, printable view of *what the gate will
     enforce* under this config - the threshold, protected paths, per-repo
-    overrides and the retry/budget caps - so an operator can see a preset's
-    effect without standing up a run.
+    overrides, the risk-escalation surface (which diff paths / ticket-text
+    keywords flag a sensitive area, and so demand its approval roles) and the
+    retry/budget caps - so an operator can see a preset's effect without
+    standing up a run.
     """
     return {
         "repo_confidence_threshold": settings.repo_confidence_threshold,
@@ -172,6 +174,20 @@ def effective_policy_summary(settings: "Settings") -> dict[str, Any]:
         },
         "repo_required_roles": {
             repo: list(roles) for repo, roles in settings.repo_required_roles
+        },
+        # Risk-escalation surface (issue #31): the diff-path globs and ticket-text
+        # keywords that flag a sensitive area (auth/payments/...), which in turn
+        # demand that area's approval roles. Both are escalate-only floors - more
+        # entries can only flag *more* areas, never fewer - so surfacing them lets
+        # an operator see *what escalates a run to human review* alongside the gate
+        # the escalation feeds. `sensitive_path_globs` carries the built-in default
+        # map; `extra_sensitive_keywords` is purely additive (default empty).
+        "sensitive_path_globs": {
+            area: list(globs) for area, globs in settings.sensitive_path_globs
+        },
+        "extra_sensitive_keywords": {
+            area: list(keywords)
+            for area, keywords in settings.extra_sensitive_keywords
         },
         # N-of-M approval matrix (issue #31): the minimum DISTINCT human sign-offs
         # a run needs, globally and per-repo (effective = max(global, per-repo)).
@@ -253,8 +269,9 @@ class PolicyCheckFinding:
       per shortfall, shaped by the knob's kind:
 
       - **map -> list knobs** (``repo_forbidden_globs`` / ``repo_required_roles``
-        / ``path_required_roles``): ``{"key": <repo|glob>, "items": [<missing
-        glob/role>, ...]}`` per shortfall key.
+        / ``path_required_roles`` / ``sensitive_path_globs`` /
+        ``extra_sensitive_keywords``): ``{"key": <repo|glob|area>, "items":
+        [<missing glob/role/keyword>, ...]}`` per shortfall key.
       - **``repo_min_approvals``** (numeric): ``{"key": <repo>, "subject": <int>,
         "baseline": <int>}`` per shortfall repo.
       - **flat list knobs** (``forbidden_globs`` / ``change_freeze_windows``):
@@ -316,12 +333,17 @@ def compare_policy_strictness(
       (and the per-repo effective ``max(global, per-repo)`` minimum);
     - **lower is stricter** - ``max_files_changed``, ``max_agent_retries``,
       ``max_cost_per_run`` (``None`` = no cap = *weakest*);
-    - **superset is stricter** - ``forbidden_globs`` and the per-repo /
-      per-path required-role and forbidden-glob maps: the subject must protect /
-      require everything the baseline does (it may add more).
+    - **superset is stricter** - ``forbidden_globs``, the per-repo / per-path
+      required-role and forbidden-glob maps, the change-freeze windows, and the
+      risk-escalation maps (``sensitive_path_globs`` / ``extra_sensitive_keywords``,
+      area -> diff-path globs / ticket-text keywords): the subject must protect /
+      require / escalate on everything the baseline does (it may add more).
 
-    The comparison only ever looks at *configured* knobs - risk-derived approval
-    roles apply identically to both sides, so they are not part of the diff.
+    The comparison only ever looks at *configured* knobs. The risk-escalation
+    maps are configured (they decide *which* runs escalate to which roles, an
+    escalate-only floor), so they are compared; the risk-*derived* approval roles
+    a flagged area then demands apply identically to both sides, so those are not
+    themselves part of the diff.
     """
     findings: list[PolicyCheckFinding] = []
 
@@ -500,6 +522,63 @@ def compare_policy_strictness(
             missing=tuple(f"{glob}: {gap}" for glob, gap in path_role_gaps),
             missing_items=tuple(
                 {"key": glob, "items": list(gap)} for glob, gap in path_role_gaps
+            ),
+        )
+    )
+
+    # --- sensitive-path globs (superset, area -> diff-path globs) -------- #
+    # A diff touching these paths escalates the run to the area's required
+    # approval roles, so dropping a baseline glob makes the gate *weaker* (a PR
+    # that should have demanded e.g. security sign-off no longer does). The
+    # subject must therefore cover at least every area->glob the baseline maps;
+    # it may add more (a one-way ratchet towards stricter). Compared against the
+    # configured default map both sides inherit when neither overrides it.
+    s_sensitive_globs = subject.sensitive_globs_map
+    sensitive_glob_gaps: list[tuple[str, list[str]]] = []
+    for area, globs in baseline.sensitive_globs_map.items():
+        gap = _missing(globs, set(s_sensitive_globs.get(area, ())))
+        if gap:
+            sensitive_glob_gaps.append((area, gap))
+    findings.append(
+        PolicyCheckFinding(
+            "sensitive_path_globs",
+            not sensitive_glob_gaps,
+            "; ".join(f"{area}: {gap}" for area, gap in sensitive_glob_gaps)
+            if sensitive_glob_gaps
+            else _none_or_covered(baseline.sensitive_globs_map),
+            comparator="superset",
+            missing=tuple(f"{area}: {gap}" for area, gap in sensitive_glob_gaps),
+            missing_items=tuple(
+                {"key": area, "items": list(gap)}
+                for area, gap in sensitive_glob_gaps
+            ),
+        )
+    )
+
+    # --- extra sensitive keywords (superset, area -> ticket-text words) -- #
+    # The ticket-text twin of `sensitive_path_globs`: extra keywords that flag a
+    # sensitive area from a ticket's title/description. Strictly additive on top
+    # of the built-in keyword floor, so more entries only ever escalate more
+    # runs - the subject must cover at least every area->keyword the baseline
+    # adds. Default empty (both sides) => "baseline requires none".
+    s_sensitive_kw = subject.extra_sensitive_keywords_map
+    sensitive_kw_gaps: list[tuple[str, list[str]]] = []
+    for area, keywords in baseline.extra_sensitive_keywords_map.items():
+        gap = _missing(keywords, set(s_sensitive_kw.get(area, ())))
+        if gap:
+            sensitive_kw_gaps.append((area, gap))
+    findings.append(
+        PolicyCheckFinding(
+            "extra_sensitive_keywords",
+            not sensitive_kw_gaps,
+            "; ".join(f"{area}: {gap}" for area, gap in sensitive_kw_gaps)
+            if sensitive_kw_gaps
+            else _none_or_covered(baseline.extra_sensitive_keywords_map),
+            comparator="superset",
+            missing=tuple(f"{area}: {gap}" for area, gap in sensitive_kw_gaps),
+            missing_items=tuple(
+                {"key": area, "items": list(gap)}
+                for area, gap in sensitive_kw_gaps
             ),
         )
     )

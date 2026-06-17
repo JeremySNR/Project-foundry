@@ -321,6 +321,38 @@ def test_effective_policy_summary_defaults_when_knobs_unset() -> None:
     assert summary["path_required_roles"] == {}
 
 
+def test_effective_policy_summary_surfaces_risk_escalation_surface(tmp_path) -> None:
+    """`explain` must reflect the risk-escalation knobs too - the diff paths and
+    ticket-text keywords that flag a sensitive area, and so demand its approval
+    roles - otherwise it under-reports what escalates a run to human review."""
+    settings = _settings(
+        tmp_path / "c",
+        "policy:\n"
+        "  sensitive_path_globs:\n"
+        "    payments: ['**/payment*/**', '**/ledger/**']\n"
+        "risk:\n"
+        "  extra_sensitive_keywords:\n"
+        "    payments: ['pan', 'cardholder']\n",
+    )
+    summary = effective_policy_summary(settings)
+    assert summary["sensitive_path_globs"] == {
+        "payments": ["**/payment*/**", "**/ledger/**"]
+    }
+    assert summary["extra_sensitive_keywords"] == {"payments": ["pan", "cardholder"]}
+
+
+def test_effective_policy_summary_reports_default_sensitive_globs() -> None:
+    """A config that overrides neither risk-escalation knob reports the built-in
+    default sensitive-path map and an empty extra-keyword map (never a missing
+    key), so `explain` always shows the live escalation surface."""
+    summary = effective_policy_summary(Settings.from_env({}))
+    # The built-in default map is surfaced as area -> globs.
+    assert "auth" in summary["sensitive_path_globs"]
+    assert "**/auth/**" in summary["sensitive_path_globs"]["auth"]
+    # Extra keywords default to empty (additive on the built-in keyword floor).
+    assert summary["extra_sensitive_keywords"] == {}
+
+
 # --------------------------------------------------------------------------- #
 # CLI smoke tests
 # --------------------------------------------------------------------------- #
@@ -600,6 +632,79 @@ def test_missing_items_structured_repo_min_approvals(tmp_path) -> None:
         {"key": "infra", "subject": 1, "baseline": 3}
     ]
     assert payload["missing"] == ["infra: 1 < 3"]  # same gap, prose form
+
+
+def test_check_sensitive_path_globs_must_be_superset(tmp_path) -> None:
+    # Dropping a sensitive-path glob the baseline maps for an area makes the gate
+    # weaker (a diff touching that path no longer escalates to the area's roles),
+    # so the subject must cover at least every area->glob the baseline maps.
+    baseline = _settings(
+        tmp_path / "b",
+        "policy:\n"
+        "  sensitive_path_globs:\n"
+        "    payments: ['**/payment*/**', '**/ledger/**']\n",
+    )
+    subject = _settings(
+        tmp_path / "s",
+        "policy:\n  sensitive_path_globs:\n    payments: ['**/payment*/**']\n",
+    )
+    finding = _finding(
+        compare_policy_strictness(subject, baseline), "sensitive_path_globs"
+    )
+    assert finding.ok is False
+    assert finding.comparator == "superset"
+    assert finding.missing == ("payments: ['**/ledger/**']",)
+    assert finding.missing_items == ({"key": "payments", "items": ["**/ledger/**"]},)
+    # The reverse direction (subject adds an area the baseline omits) is stricter.
+    assert compare_policy_strictness(baseline, subject).ok
+
+
+def test_check_extra_sensitive_keywords_must_be_superset(tmp_path) -> None:
+    # The ticket-text twin: dropping a keyword the baseline flags an area on
+    # de-escalates a class of tickets, so it too must be a superset.
+    baseline = _settings(
+        tmp_path / "b",
+        "risk:\n  extra_sensitive_keywords:\n    payments: ['pan', 'cardholder']\n",
+    )
+    subject = _settings(
+        tmp_path / "s",
+        "risk:\n  extra_sensitive_keywords:\n    payments: ['pan']\n",
+    )
+    finding = _finding(
+        compare_policy_strictness(subject, baseline), "extra_sensitive_keywords"
+    )
+    assert finding.ok is False
+    assert finding.comparator == "superset"
+    assert finding.missing_items == ({"key": "payments", "items": ["cardholder"]},)
+
+
+def test_check_sensitive_knobs_pass_when_covered(tmp_path) -> None:
+    # A subject that covers (or exceeds) the baseline's escalation surface passes
+    # both knobs cleanly, with empty missing lists.
+    baseline = _settings(
+        tmp_path / "b",
+        "policy:\n"
+        "  sensitive_path_globs:\n"
+        "    payments: ['**/payment*/**']\n"
+        "risk:\n"
+        "  extra_sensitive_keywords:\n"
+        "    payments: ['pan']\n",
+    )
+    subject = _settings(
+        tmp_path / "s",
+        "policy:\n"
+        "  sensitive_path_globs:\n"
+        "    payments: ['**/payment*/**', '**/ledger/**']\n"
+        "risk:\n"
+        "  extra_sensitive_keywords:\n"
+        "    payments: ['pan', 'cardholder']\n",
+    )
+    comparison = compare_policy_strictness(subject, baseline)
+    for knob in ("sensitive_path_globs", "extra_sensitive_keywords"):
+        finding = _finding(comparison, knob)
+        assert finding.ok, knob
+        assert finding.missing == ()
+        assert finding.missing_items == ()
 
 
 def test_comparison_to_dict_all_pass() -> None:
