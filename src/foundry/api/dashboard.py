@@ -14,7 +14,11 @@ is one repo the systemic blocker?, issue #37)
 and a failures-by-work-type panel (the same recent failures rolled up by work
 type - do bugs fail while features ship?, issue #37)
 and a failure-trend panel (the same failures bucketed by week - the
-direction-of-travel view: "are we failing more than usual?", issue #37),
+direction-of-travel view: "are we failing more than usual?", issue #37)
+and a failures-by-category trend strip (each failure reason's failures-by-week
+series as a sparkline on one shared scale - "is a *specific* blocker spiking
+or fading over time?", the in-page render of GET /metrics/failures/by-category/
+trends, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
@@ -31,6 +35,7 @@ agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/failures``, ``GET /metrics/failures/by-category``,
 ``GET /metrics/failures/by-repo``, ``GET /metrics/failures/by-work-type``,
 ``GET /metrics/failures/trends``,
+``GET /metrics/failures/by-category/trends``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
 ``GET /metrics/delivery/by-work-type``,
@@ -192,6 +197,18 @@ DASHBOARD_HTML = """<!doctype html>
     background: var(--green); border-radius: 1px;
   }
   #worktype-trends .spark i.empty { height: 2px; background: var(--border); }
+  #failure-category-trends .prov {
+    display: flex; align-items: center; gap: 12px; padding: 4px 0;
+  }
+  #failure-category-trends .prov .name { min-width: 220px; }
+  #failure-category-trends .spark {
+    display: inline-flex; align-items: flex-end; gap: 2px; height: 24px;
+  }
+  #failure-category-trends .spark i {
+    display: inline-block; width: 6px; min-height: 1px;
+    background: var(--red); border-radius: 1px;
+  }
+  #failure-category-trends .spark i.empty { height: 2px; background: var(--border); }
   #failure-trends table, #failure-categories table, #failure-repos table,
   #failure-work-types table {
     border-collapse: collapse; margin: 8px 0 2px; font-size: 12px;
@@ -268,6 +285,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="failure-repos"></div>
 <div id="failure-work-types"></div>
 <div id="failure-trends"></div>
+<div id="failure-category-trends"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -828,6 +846,50 @@ async function loadFailureTrends() {
   }
 }
 
+async function loadFailureCategoryTrends() {
+  const el = $("#failure-category-trends");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/failures/by-category/trends?days=30&bucket=week", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const cats = m.categories || [];
+    if (!cats.length) { el.style.display = "none"; return; }  // nothing failed recently: hide
+    // Scale every category's bars to one shared max (failures-per-week) so the
+    // sparklines are comparable across reasons, not each normalised to its own
+    // peak - the same shared-scale rule the delivery trend strips use, so a
+    // spiking blocker stands out against the others, in failure-red.
+    const maxCount = Math.max(1, ...cats.flatMap(
+      (c) => (c.series || []).map((p) => p.count)));
+    const rows = cats.map((c) => {
+      const bars = (c.series || []).map((p) => {
+        const when = fmtPeriod(p.period_start);
+        if (!p.count) {
+          return `<i class="empty" title="${esc(when)}: no failures"></i>`;
+        }
+        const h = Math.max(2, Math.round((p.count / maxCount) * 24));
+        return `<i style="height:${h}px" title="${esc(when)}: ${p.count} failed (${p.blocked} blocked, ${p.failed} execution-failed)"></i>`;
+      }).join("");
+      return `<div class="prov">
+        <span class="name">${esc(c.category)}
+          <span class="kv">${c.count} total &middot; ${c.blocked} blocked &middot; ${c.failed} failed</span></span>
+        <span class="spark">${bars}</span></div>`;
+    }).join("");
+    el.innerHTML = `<details><summary>failures by category, trend &mdash; failures by week (${m.days}d), is a specific blocker spiking or fading?</summary>
+      ${rows}
+      <div class="kv">each bar = one week; height = failures (shared scale across categories)</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadMetrics() {
   const el = $("#metrics");
   if (!hasAuth()) {
@@ -1292,6 +1354,7 @@ function refresh() {
   loadFailureRepos();
   loadFailureWorkTypes();
   loadFailureTrends();
+  loadFailureCategoryTrends();
   loadMetrics();
   loadTrends();
   loadAgents();
