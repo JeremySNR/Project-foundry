@@ -224,6 +224,15 @@ class Settings:
     # byte-for-byte).
     execution_sla_seconds: int | None = None
 
+    # Execution *cost* SLA: how many dollars an in-flight agent run (AGENT_RUNNING)
+    # may spend before it is flagged - the spend twin of ``execution_sla_seconds``,
+    # the "this agent has burned over $N and is still running" signal. Fired purely
+    # for human attention on the fleet strip and the GET /metrics/executions queue
+    # *before* the hard ``policy.max_cost_per_run`` budget cap (which blocks the
+    # run); it changes no gate and blocks no run. None (default) = no cost SLA
+    # configured, no breach signal (the historical behaviour, byte-for-byte).
+    execution_cost_sla_usd: float | None = None
+
     # Review SLA: how long (seconds) a run may sit at an open PR (PR_OPEN,
     # awaiting review/CI) before it is flagged as breaching - the review-latency
     # signal ("PRs sitting unreviewed for N hours"), the review-side complement
@@ -624,6 +633,14 @@ class Settings:
             raise ValueError(
                 "execution_sla_seconds must be >= 1 when set, got "
                 f"{self.execution_sla_seconds} (omit it to disable the SLA signal)"
+            )
+        if (
+            self.execution_cost_sla_usd is not None
+            and self.execution_cost_sla_usd <= 0
+        ):
+            raise ValueError(
+                "execution_cost_sla_usd must be > 0 when set, got "
+                f"{self.execution_cost_sla_usd} (omit it to disable the cost-SLA signal)"
             )
         if self.review_sla_seconds is not None and self.review_sla_seconds < 1:
             raise ValueError(
@@ -1067,6 +1084,9 @@ def _from_yaml(path: Path) -> dict[str, Any]:
     if "execution_sla_seconds" in dashboard:
         value = dashboard["execution_sla_seconds"]
         out["execution_sla_seconds"] = None if value is None else int(value)
+    if "execution_cost_sla_usd" in dashboard:
+        value = dashboard["execution_cost_sla_usd"]
+        out["execution_cost_sla_usd"] = None if value is None else float(value)
     if "review_sla_seconds" in dashboard:
         value = dashboard["review_sla_seconds"]
         out["review_sla_seconds"] = None if value is None else int(value)
@@ -1261,6 +1281,9 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
     if "FOUNDRY_EXECUTION_SLA_SECONDS" in env:
         raw = env["FOUNDRY_EXECUTION_SLA_SECONDS"].strip()
         out["execution_sla_seconds"] = None if raw == "" else int(raw)
+    if "FOUNDRY_EXECUTION_COST_SLA_USD" in env:
+        raw = env["FOUNDRY_EXECUTION_COST_SLA_USD"].strip()
+        out["execution_cost_sla_usd"] = None if raw == "" else float(raw)
     if "FOUNDRY_REVIEW_SLA_SECONDS" in env:
         raw = env["FOUNDRY_REVIEW_SLA_SECONDS"].strip()
         out["review_sla_seconds"] = None if raw == "" else int(raw)

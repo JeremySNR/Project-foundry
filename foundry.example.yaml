@@ -331,6 +331,18 @@ dashboard:
   # the current attempt.
   execution_sla_seconds: 3600  # 1h
 
+  # Execution cost SLA: how many dollars an in-flight agent run (AGENT_RUNNING)
+  # may spend before the fleet strip and GET /metrics/executions flag it - the
+  # spend twin of execution_sla_seconds, the "this agent has burned over $N and is
+  # still running" signal that turns "agents running" into "and 1 has spent over
+  # $5". It fires for a human *before* the hard policy.max_cost_per_run budget cap
+  # (which blocks the run); this is read-only and blocks no run. Omit it (the
+  # default) for no cost SLA - per-run spend is still shown, but nothing is
+  # flagged. Env override: FOUNDRY_EXECUTION_COST_SLA_USD (empty string disables
+  # it). Per-run spend is the sum of the run's agent jobs' reported cost (runs
+  # whose provider reports no cost, e.g. manual/webhook, show no figure).
+  execution_cost_sla_usd: 5.0  # $5 per run
+
   # Review SLA: how long (seconds) a run may sit at an open PR (PR_OPEN - the
   # agent shipped a PR, now awaiting review/CI) before the fleet strip and
   # GET /metrics/reviews flag it as breaching. The review-side complement to

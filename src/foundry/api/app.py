@@ -246,6 +246,7 @@ def create_app(
     auto_decompose_epics: bool = False,
     approval_sla_seconds: int | None = None,
     execution_sla_seconds: int | None = None,
+    execution_cost_sla_usd: float | None = None,
     review_sla_seconds: int | None = None,
     review_stale_sla_seconds: int | None = None,
     effective_policy: Mapping[str, Any] | None = None,
@@ -327,6 +328,11 @@ def create_app(
     # how long a run may sit in AGENT_RUNNING (agent dispatched, no PR yet)
     # before it is flagged. None = no SLA (no breach signal); read-only.
     app.state.execution_sla_seconds = execution_sla_seconds
+    # Execution *cost* SLA for the fleet strip + GET /metrics/executions (issue
+    # #37): how many dollars an in-flight agent run may spend before it is flagged
+    # for a human - the spend twin of execution_sla_seconds, fired before the hard
+    # policy.max_cost_per_run budget cap. None = no cost SLA (no breach signal).
+    app.state.execution_cost_sla_usd = execution_cost_sla_usd
     # Review SLA for the fleet strip + GET /metrics/reviews (issue #37): how long
     # a run may sit at an open PR (PR_OPEN, awaiting review/CI) before it is
     # flagged. None = no SLA (no breach signal); read-only, blocks no run.
@@ -1338,6 +1344,7 @@ def create_app(
                 session,
                 sla_seconds=app.state.approval_sla_seconds,
                 execution_sla_seconds=app.state.execution_sla_seconds,
+                execution_cost_sla_usd=app.state.execution_cost_sla_usd,
                 review_sla_seconds=app.state.review_sla_seconds,
                 review_stale_sla_seconds=app.state.review_stale_sla_seconds,
             )
@@ -1363,17 +1370,21 @@ def create_app(
         """In-flight agent runs with per-run run-time age - the drill-down behind
         the fleet strip's ``agents_running`` count, the machine-state complement
         to ``GET /metrics/approvals``. Every run dispatched to an agent and not
-        yet at a PR, oldest first, each with how long it has been running and
-        (when an execution SLA is configured) whether it has breached - the
-        hung/runaway-agent signal. Token-gated and fail-closed like the other
-        metrics endpoints; read-only, changes no gate.
+        yet at a PR, oldest first, each with how long it has been running, its
+        agent spend so far (``cost_usd``) and (when the execution time/cost SLAs
+        are configured) whether it has breached either - the hung/runaway-agent
+        signal, now with the "which agent is the expensive one" cut. Token-gated
+        and fail-closed like the other metrics endpoints; read-only, changes no
+        gate.
         """
         from foundry.memory.metrics import execution_queue
 
         _require_api_token(app, request)
         with app.state.session_factory() as session:
             return execution_queue(
-                session, sla_seconds=app.state.execution_sla_seconds
+                session,
+                sla_seconds=app.state.execution_sla_seconds,
+                cost_sla_usd=app.state.execution_cost_sla_usd,
             )
 
     @app.get("/metrics/reviews")
@@ -2557,6 +2568,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         auto_decompose_epics=settings.epics_auto_decompose,
         approval_sla_seconds=settings.approval_sla_seconds,
         execution_sla_seconds=settings.execution_sla_seconds,
+        execution_cost_sla_usd=settings.execution_cost_sla_usd,
         review_sla_seconds=settings.review_sla_seconds,
         review_stale_sla_seconds=settings.review_stale_sla_seconds,
         # The effective gate this config resolves to, surfaced read-only at

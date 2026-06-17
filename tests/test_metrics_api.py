@@ -642,6 +642,22 @@ def test_executions_empty_database(client) -> None:
     assert body["oldest_running_seconds"] is None
     assert body["sla_breaches"] == 0
     assert body["sla_seconds"] is None
+    # The spend fields default inert (issue #37): no cost SLA, no conjured $0.
+    assert body["cost_sla_usd"] is None
+    assert body["cost_breaches"] == 0
+    assert body["total_cost_usd"] is None
+    assert body["costliest_cost_usd"] is None
+
+
+def test_executions_cost_sla_flows_from_config() -> None:
+    client = _client_with(execution_cost_sla_usd=5.0)
+    body = client.get("/metrics/executions", headers=AUTH).json()
+    assert body["cost_sla_usd"] == 5.0
+    fleet = client.get("/metrics/fleet", headers=AUTH).json()
+    assert fleet["execution_cost_sla_usd"] == 5.0
+    # Nothing running yet, so the spend cut is inert on both surfaces.
+    assert fleet["executions_breaching_cost"] == 0
+    assert fleet["costliest_execution_usd"] is None
 
 
 def test_executions_lists_in_flight_agent_run(client) -> None:

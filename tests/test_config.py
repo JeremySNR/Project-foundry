@@ -348,6 +348,32 @@ def test_execution_sla_rejects_below_one() -> None:
         Settings.from_env({"FOUNDRY_EXECUTION_SLA_SECONDS": "0"})
 
 
+def test_execution_cost_sla_defaults_off() -> None:
+    assert Settings.from_env({}).execution_cost_sla_usd is None
+
+
+def test_execution_cost_sla_from_yaml_and_env(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text("dashboard:\n  execution_cost_sla_usd: 5.0\n")
+    s = Settings.load(path, env={})
+    assert s.execution_cost_sla_usd == 5.0
+    # Env overrides YAML (operational knob).
+    s2 = Settings.load(path, env={"FOUNDRY_EXECUTION_COST_SLA_USD": "12.5"})
+    assert s2.execution_cost_sla_usd == 12.5
+    # Empty env string disables it (back to no cost SLA).
+    s3 = Settings.load(path, env={"FOUNDRY_EXECUTION_COST_SLA_USD": ""})
+    assert s3.execution_cost_sla_usd is None
+
+
+def test_execution_cost_sla_rejects_non_positive() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        Settings.from_env({"FOUNDRY_EXECUTION_COST_SLA_USD": "0"})
+    with pytest.raises(ValueError):
+        Settings.from_env({"FOUNDRY_EXECUTION_COST_SLA_USD": "-1"})
+
+
 def test_review_sla_defaults_off() -> None:
     assert Settings.from_env({}).review_sla_seconds is None
 

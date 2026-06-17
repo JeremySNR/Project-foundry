@@ -13,7 +13,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from foundry.db import FoundryRun, create_all, make_engine, make_session_factory
-from foundry.db.models import AuditEventType, FoundryAuditEvent
+from foundry.db.models import (
+    AgentJobStatus,
+    AuditEventType,
+    FoundryAgentJob,
+    FoundryAuditEvent,
+)
 from foundry.memory.metrics import execution_queue, fleet_status
 from foundry.schemas.common import OverallRisk, RunStatus
 
@@ -75,6 +80,20 @@ def _add_event(
     )
 
 
+def _add_job(session, run_id: str, *, cost_usd: float | None) -> None:
+    global _counter
+    _counter += 1
+    session.add(
+        FoundryAgentJob(
+            id=f"j-{_counter}",
+            run_id=run_id,
+            provider="fake",
+            status=AgentJobStatus.RUNNING,
+            cost_usd=cost_usd,
+        )
+    )
+
+
 def test_empty_queue(session_factory) -> None:
     with session_factory() as session:
         q = execution_queue(session, now=NOW)
@@ -82,6 +101,11 @@ def test_empty_queue(session_factory) -> None:
     assert q["oldest_running_seconds"] is None
     assert q["sla_breaches"] == 0
     assert q["runs"] == []
+    # Spend fields are inert (never a conjured $0) on an empty queue.
+    assert q["cost_sla_usd"] is None
+    assert q["cost_breaches"] == 0
+    assert q["total_cost_usd"] is None
+    assert q["costliest_cost_usd"] is None
 
 
 def test_lists_in_flight_run_dated_from_agent_started(session_factory) -> None:
@@ -265,3 +289,148 @@ def test_fleet_execution_and_approval_slas_are_independent(session_factory) -> N
     assert fleet["awaiting_human"] == 0
     assert fleet["approvals_breaching_sla"] == 0
     assert fleet["approval_sla_seconds"] == 14_400
+
+
+# --- per-run spend + cost SLA (issue #37) ----------------------------------
+
+
+def test_entry_carries_summed_agent_spend(session_factory) -> None:
+    """Per-run cost_usd is the sum of the run's agent jobs' reported cost."""
+    with session_factory() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.AGENT_RUNNING,
+            updated_at=NOW - timedelta(minutes=1),
+        )
+        _add_event(session, rid, AuditEventType.AGENT_STARTED, NOW - timedelta(hours=1))
+        # Two jobs on the same run (e.g. an initial dispatch + a retry).
+        _add_job(session, rid, cost_usd=1.25)
+        _add_job(session, rid, cost_usd=2.50)
+        session.commit()
+        q = execution_queue(session, now=NOW)
+    entry = q["runs"][0]
+    assert entry["cost_usd"] == 3.75
+    assert entry["cost_breached"] is False
+    assert q["total_cost_usd"] == 3.75
+    assert q["costliest_cost_usd"] == 3.75
+
+
+def test_no_reported_cost_is_none_not_zero(session_factory) -> None:
+    """A run whose provider reported no cost shows None, never a conjured $0 -
+    matching the delivery_metrics / fleet_status spend rule."""
+    with session_factory() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.AGENT_RUNNING,
+            updated_at=NOW - timedelta(minutes=1),
+        )
+        _add_event(session, rid, AuditEventType.AGENT_STARTED, NOW - timedelta(hours=1))
+        _add_job(session, rid, cost_usd=None)  # e.g. manual / webhook provider
+        session.commit()
+        q = execution_queue(session, now=NOW, cost_sla_usd=1.0)
+    entry = q["runs"][0]
+    assert entry["cost_usd"] is None
+    assert entry["cost_breached"] is False  # None spend can never breach
+    assert q["total_cost_usd"] is None
+    assert q["costliest_cost_usd"] is None
+    assert q["cost_breaches"] == 0
+
+
+def test_cost_sla_flags_runs_over_the_ceiling(session_factory) -> None:
+    with session_factory() as session:
+        cheap = _add_run(
+            session,
+            status=RunStatus.AGENT_RUNNING,
+            updated_at=NOW - timedelta(minutes=1),
+        )
+        _add_event(session, cheap, AuditEventType.AGENT_STARTED, NOW - timedelta(hours=1))
+        _add_job(session, cheap, cost_usd=1.00)
+        pricey = _add_run(
+            session,
+            status=RunStatus.AGENT_RUNNING,
+            updated_at=NOW - timedelta(minutes=1),
+        )
+        _add_event(session, pricey, AuditEventType.AGENT_STARTED, NOW - timedelta(hours=2))
+        _add_job(session, pricey, cost_usd=7.50)
+        session.commit()
+        q = execution_queue(session, now=NOW, cost_sla_usd=5.0)
+    assert q["cost_sla_usd"] == 5.0
+    assert q["cost_breaches"] == 1
+    assert q["total_cost_usd"] == 8.5
+    assert q["costliest_cost_usd"] == 7.5
+    by_id = {r["run_id"]: r for r in q["runs"]}
+    assert by_id[pricey]["cost_breached"] is True
+    assert by_id[cheap]["cost_breached"] is False
+
+
+def test_cost_sla_is_inclusive_on_raw_spend(session_factory) -> None:
+    """The threshold compares the raw sum, not the displayed-rounded value: a
+    $4.999 run against a $5 SLA does not flip on rounding, while a run exactly at
+    the ceiling does breach (>=)."""
+    with session_factory() as session:
+        under = _add_run(
+            session, status=RunStatus.AGENT_RUNNING, updated_at=NOW
+        )
+        _add_job(session, under, cost_usd=4.999)
+        at = _add_run(session, status=RunStatus.AGENT_RUNNING, updated_at=NOW)
+        _add_job(session, at, cost_usd=5.0)
+        session.commit()
+        q = execution_queue(session, now=NOW, cost_sla_usd=5.0)
+    by_id = {r["run_id"]: r for r in q["runs"]}
+    # Displayed cost is rounded to cents, but the breach decision used the raw sum.
+    assert by_id[under]["cost_usd"] == 5.0
+    assert by_id[under]["cost_breached"] is False
+    assert by_id[at]["cost_breached"] is True
+
+
+def test_no_cost_sla_means_no_cost_breach_signal(session_factory) -> None:
+    with session_factory() as session:
+        rid = _add_run(session, status=RunStatus.AGENT_RUNNING, updated_at=NOW)
+        _add_job(session, rid, cost_usd=99.0)
+        session.commit()
+        q = execution_queue(session, now=NOW)  # no cost SLA
+    assert q["cost_sla_usd"] is None
+    assert q["cost_breaches"] == 0
+    assert q["runs"][0]["cost_breached"] is False
+    # The spend itself is still reported - useful without a configured ceiling.
+    assert q["runs"][0]["cost_usd"] == 99.0
+    assert q["costliest_cost_usd"] == 99.0
+
+
+def test_cost_only_sums_jobs_of_in_flight_runs(session_factory) -> None:
+    """A finished run's spend does not leak into the in-flight queue totals."""
+    with session_factory() as session:
+        running = _add_run(session, status=RunStatus.AGENT_RUNNING, updated_at=NOW)
+        _add_job(session, running, cost_usd=2.0)
+        done = _add_run(session, status=RunStatus.COMPLETE, updated_at=NOW)
+        _add_job(session, done, cost_usd=40.0)
+        session.commit()
+        q = execution_queue(session, now=NOW)
+    assert q["count"] == 1
+    assert q["total_cost_usd"] == 2.0
+    assert q["costliest_cost_usd"] == 2.0
+
+
+def test_fleet_status_carries_execution_cost_summary(session_factory) -> None:
+    with session_factory() as session:
+        cheap = _add_run(session, status=RunStatus.AGENT_RUNNING, updated_at=NOW)
+        _add_job(session, cheap, cost_usd=1.0)
+        pricey = _add_run(session, status=RunStatus.AGENT_RUNNING, updated_at=NOW)
+        _add_job(session, pricey, cost_usd=6.0)
+        session.commit()
+        fleet = fleet_status(session, execution_cost_sla_usd=5.0, now=NOW)
+    assert fleet["execution_cost_sla_usd"] == 5.0
+    assert fleet["executions_breaching_cost"] == 1
+    assert fleet["costliest_execution_usd"] == 6.0
+
+
+def test_fleet_status_without_execution_cost_sla(session_factory) -> None:
+    with session_factory() as session:
+        rid = _add_run(session, status=RunStatus.AGENT_RUNNING, updated_at=NOW)
+        _add_job(session, rid, cost_usd=3.0)
+        session.commit()
+        fleet = fleet_status(session, now=NOW)
+    assert fleet["execution_cost_sla_usd"] is None
+    assert fleet["executions_breaching_cost"] == 0
+    # The costliest in-flight run is still reported without a configured SLA.
+    assert fleet["costliest_execution_usd"] == 3.0
