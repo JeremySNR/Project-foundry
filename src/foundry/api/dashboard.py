@@ -1053,6 +1053,7 @@ async function loadMetrics() {
       <span class="stat"><b>${dur(ttm.median)}</b> median to merge</span>
       <span class="stat"><b>${dur(ttm.p90)}</b> p90</span>
       <span class="stat"><b>${dur(tta.median)}</b> median to approval</span>
+      <span class="stat"><b>${dur(tta.p90)}</b> p90</span>
       <span class="stat"><b>${m.total_cost_usd == null ? "-" : "$" + m.total_cost_usd}</b> agent spend</span>
       ${bands || priors ? `<details><summary>routing accuracy &amp; delivery memory</summary>
         ${bands ? `<table><tr><th>confidence band</th><th>routed</th><th>merged</th><th>precision</th></tr>${bands}</table>` : ""}
@@ -1121,9 +1122,10 @@ async function loadTrends() {
       const blockW = Math.round((p.blocked / maxFinished) * 120);
       const cost = p.total_cost_usd == null ? "-" : "$" + p.total_cost_usd;
       // Per-period approval/merge latency landed in the endpoint in #143/#145;
-      // render the medians as columns so "is sign-off / shipping getting slower
-      // week over week?" is readable down the column (the same dur() medians the
-      // by-repo / by-work-type delivery tables already show).
+      // render both the median and the p90 tail as columns so "is sign-off /
+      // shipping getting slower week over week?" is readable down the column.
+      // The median can look healthy while the p90 tail blows the SLA the
+      // dashboard.*_sla_seconds knobs track, so the tail is shown beside it.
       const tta = p.time_to_approval_seconds || {};
       const ttm = p.time_to_merge_seconds || {};
       return `<tr>
@@ -1132,15 +1134,15 @@ async function loadTrends() {
         <td class="num">${p.blocked}</td>
         <td class="num">${p.runs_finished}</td>
         <td class="num">${p.retries_consumed}</td>
-        <td class="num">${dur(tta.median)}</td>
-        <td class="num">${dur(ttm.median)}</td>
+        <td class="num">${dur(tta.median)} / ${dur(tta.p90)}</td>
+        <td class="num">${dur(ttm.median)} / ${dur(ttm.p90)}</td>
         <td class="num">${cost}</td>
         <td><span class="bar" style="width:${shipW}px"></span><span class="bar blocked" style="width:${blockW}px"></span></td>
       </tr>`;
     }).join("");
     el.innerHTML = `<details open><summary>delivery trend &mdash; PRs shipped vs blocked, with sign-off &amp; shipping latency, by week (90d)</summary>
       <table><tr><th>week of</th><th>shipped</th><th>blocked</th><th>finished</th>
-        <th>retries</th><th>median to approval</th><th>median to merge</th><th>spend</th><th></th></tr>${rows}</table>
+        <th>retries</th><th>to approval (med/p90)</th><th>to merge (med/p90)</th><th>spend</th><th></th></tr>${rows}</table>
     </details>`;
     el.style.display = "block";
   } catch (err) {
@@ -1173,14 +1175,14 @@ async function loadRepoDelivery() {
         <td class="num">${r.runs_finished}</td>
         <td class="num">${Math.round(r.merge_rate * 100)}%</td>
         <td class="num">${r.retries_consumed}</td>
-        <td class="num">${dur(ttm.median)}</td>
-        <td class="num">${dur(tta.median)}</td>
+        <td class="num">${dur(ttm.median)} / ${dur(ttm.p90)}</td>
+        <td class="num">${dur(tta.median)} / ${dur(tta.p90)}</td>
         <td class="num">${cost}</td>
       </tr>`;
     }).join("");
     el.innerHTML = `<details><summary>delivery by repo (90d) &mdash; where work ships, stalls, and spends</summary>
       <table><tr><th>repository</th><th>shipped</th><th>blocked</th><th>finished</th>
-        <th>merge rate</th><th>retries</th><th>median to merge</th><th>median to approval</th><th>spend</th></tr>${rows}</table>
+        <th>merge rate</th><th>retries</th><th>to merge (med/p90)</th><th>to approval (med/p90)</th><th>spend</th></tr>${rows}</table>
     </details>`;
     el.style.display = "block";
   } catch (err) {
@@ -1213,14 +1215,14 @@ async function loadWorkTypeDelivery() {
         <td class="num">${t.runs_finished}</td>
         <td class="num">${Math.round(t.merge_rate * 100)}%</td>
         <td class="num">${t.retries_consumed}</td>
-        <td class="num">${dur(ttm.median)}</td>
-        <td class="num">${dur(tta.median)}</td>
+        <td class="num">${dur(ttm.median)} / ${dur(ttm.p90)}</td>
+        <td class="num">${dur(tta.median)} / ${dur(tta.p90)}</td>
         <td class="num">${cost}</td>
       </tr>`;
     }).join("");
     el.innerHTML = `<details><summary>delivery by work type (90d) &mdash; do bugs ship while features stall?</summary>
       <table><tr><th>work type</th><th>shipped</th><th>blocked</th><th>finished</th>
-        <th>merge rate</th><th>retries</th><th>median to merge</th><th>median to approval</th><th>spend</th></tr>${rows}</table>
+        <th>merge rate</th><th>retries</th><th>to merge (med/p90)</th><th>to approval (med/p90)</th><th>spend</th></tr>${rows}</table>
     </details>`;
     el.style.display = "block";
   } catch (err) {
@@ -1255,11 +1257,13 @@ async function loadRepoTrends() {
         const h = Math.max(2, Math.round((c.prs_shipped / maxShipped) * 24));
         const cost = c.total_cost_usd == null ? "" : `, $${c.total_cost_usd}`;
         // Per-cell sign-off/shipping latency the trend endpoint now carries
-        // (#143/#145) - hover detail only, so a never-approved / never-merged
-        // week adds nothing rather than a conjured "-".
-        const tta = (c.time_to_approval_seconds || {}).median;
-        const ttm = (c.time_to_merge_seconds || {}).median;
-        const lat = tta == null && ttm == null ? "" : `, ${dur(tta)} to approval / ${dur(ttm)} to merge`;
+        // (#143/#145), with the p90 tail beside the median - hover detail only,
+        // so a never-approved / never-merged week adds nothing rather than a
+        // conjured "-".
+        const ttaD = c.time_to_approval_seconds || {};
+        const ttmD = c.time_to_merge_seconds || {};
+        const lat = ttaD.median == null && ttmD.median == null ? ""
+          : `, ${dur(ttaD.median)} (p90 ${dur(ttaD.p90)}) to approval / ${dur(ttmD.median)} (p90 ${dur(ttmD.p90)}) to merge`;
         return `<i style="height:${h}px" title="${esc(when)}: ${c.prs_shipped} shipped of ${c.runs_finished} finished${cost}${lat}"></i>`;
       }).join("");
       const cost = r.total_cost_usd == null ? "-" : "$" + r.total_cost_usd;
@@ -1270,7 +1274,7 @@ async function loadRepoTrends() {
     }).join("");
     el.innerHTML = `<details><summary>delivery by repo, trend &mdash; PRs shipped by week (90d), is each repo speeding up or stalling?</summary>
       ${rows}
-      <div class="kv">each bar = one week; height = PRs shipped (shared scale across repos); hover for that week's median sign-off / shipping latency</div>
+      <div class="kv">each bar = one week; height = PRs shipped (shared scale across repos); hover for that week's median &amp; p90 sign-off / shipping latency</div>
     </details>`;
     el.style.display = "block";
   } catch (err) {
@@ -1306,11 +1310,13 @@ async function loadWorkTypeTrends() {
         const h = Math.max(2, Math.round((c.prs_shipped / maxShipped) * 24));
         const cost = c.total_cost_usd == null ? "" : `, $${c.total_cost_usd}`;
         // Per-cell sign-off/shipping latency the trend endpoint now carries
-        // (#143/#145) - hover detail only, so a never-approved / never-merged
-        // week adds nothing rather than a conjured "-".
-        const tta = (c.time_to_approval_seconds || {}).median;
-        const ttm = (c.time_to_merge_seconds || {}).median;
-        const lat = tta == null && ttm == null ? "" : `, ${dur(tta)} to approval / ${dur(ttm)} to merge`;
+        // (#143/#145), with the p90 tail beside the median - hover detail only,
+        // so a never-approved / never-merged week adds nothing rather than a
+        // conjured "-".
+        const ttaD = c.time_to_approval_seconds || {};
+        const ttmD = c.time_to_merge_seconds || {};
+        const lat = ttaD.median == null && ttmD.median == null ? ""
+          : `, ${dur(ttaD.median)} (p90 ${dur(ttaD.p90)}) to approval / ${dur(ttmD.median)} (p90 ${dur(ttmD.p90)}) to merge`;
         return `<i style="height:${h}px" title="${esc(when)}: ${c.prs_shipped} shipped of ${c.runs_finished} finished${cost}${lat}"></i>`;
       }).join("");
       const cost = t.total_cost_usd == null ? "-" : "$" + t.total_cost_usd;
@@ -1321,7 +1327,7 @@ async function loadWorkTypeTrends() {
     }).join("");
     el.innerHTML = `<details><summary>delivery by work type, trend &mdash; PRs shipped by week (90d), are features speeding up or slipping vs bugs?</summary>
       ${rows}
-      <div class="kv">each bar = one week; height = PRs shipped (shared scale across work types); hover for that week's median sign-off / shipping latency</div>
+      <div class="kv">each bar = one week; height = PRs shipped (shared scale across work types); hover for that week's median &amp; p90 sign-off / shipping latency</div>
     </details>`;
     el.style.display = "block";
   } catch (err) {
