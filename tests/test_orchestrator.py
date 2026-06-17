@@ -21,6 +21,7 @@ from foundry.db import (
     make_session_factory,
 )
 from foundry.db.models import AgentJobStatus, ArtifactType, FoundryRunOutcome
+from foundry.engines.risk import CustomRiskCategory
 from foundry.orchestrator import FoundryOrchestrator, OrchestratorError
 from foundry.schemas.common import (
     ApprovalRole,
@@ -701,6 +702,199 @@ def test_forbidden_path_beats_path_required_role(session_factory) -> None:
     )
     pr = _pr(files_changed=["migrations/0003_add_index.sql"])
     assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+
+
+# -- operator-defined custom risk categories (issue #155) ------------------------
+
+
+def test_custom_category_ticket_keyword_demands_role(session_factory) -> None:
+    """A custom category whose ticket-text keyword fires demands its approval
+    role at the gate: an approver lacking it is refused, and granting it lets the
+    run advance and dispatch."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        custom_risk_categories=[
+            CustomRiskCategory(
+                name="gdpr_subject_data",
+                keywords=("favourite",),
+                required_roles=("security",),
+            )
+        ],
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    # The custom category fired (the ticket is about favourites) and demands a
+    # security sign-off the favourites ticket would not otherwise require.
+    with pytest.raises(OrchestratorError, match="security"):
+        orch.approve(run_id, user="lead@example.com")
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.SECURITY}
+    )
+    orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+
+def test_custom_category_ticket_hit_recorded_in_risk_assessment(
+    session_factory,
+) -> None:
+    """A fired ticket-text category lands cited evidence + the demanded roles on
+    the RiskAssessment artifact (auditable), without lowering risk."""
+    orch = _orch(
+        session_factory,
+        custom_risk_categories=[
+            CustomRiskCategory(
+                name="gdpr_subject_data",
+                keywords=("favourite",),
+                required_roles=("security",),
+            )
+        ],
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    with session_factory() as s:
+        from foundry.db.models import ArtifactType as _AT
+
+        orch_risk = orch._load(s, run_id, _AT.RISK_ASSESSMENT)
+    assert ApprovalRole.SECURITY in orch_risk.custom_required_approvals
+    assert any(e.area == "gdpr_subject_data" for e in orch_risk.evidence)
+    assert any("gdpr_subject_data" in r for r in orch_risk.risk_reasons)
+
+
+def test_custom_category_diff_glob_escalates(session_factory) -> None:
+    """A diff touching a custom category's path glob whose role no approver
+    granted escalates the run to human review (the diff-path twin of the
+    per-path roles)."""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={
+            "custom_risk_categories": [
+                CustomRiskCategory(
+                    name="crypto_keys",
+                    path_globs=("**/crypto/**",),
+                    required_roles=("security",),
+                )
+            ]
+        },
+    )
+    pr = _pr(files_changed=["src/crypto/signing.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
+
+
+def test_custom_category_diff_escalation_is_audited(session_factory) -> None:
+    """The diff escalation writes a risk.escalated event naming the category."""
+    import json
+
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={
+            "custom_risk_categories": [
+                CustomRiskCategory(
+                    name="crypto_keys",
+                    path_globs=("**/crypto/**",),
+                    required_roles=("security",),
+                )
+            ]
+        },
+    )
+    orch.record_pr(run_id, _pr(files_changed=["src/crypto/signing.ts"]))
+    with session_factory() as s:
+        from foundry.db import FoundryAuditEvent
+
+        events = (
+            s.query(FoundryAuditEvent)
+            .filter(FoundryAuditEvent.run_id == run_id)
+            .all()
+        )
+    escalations = [
+        json.loads(e.metadata_json or "{}")
+        for e in events
+        if e.event_type.value == "risk.escalated"
+    ]
+    custom = [m for m in escalations if m.get("category") == "custom_risk_category"]
+    assert len(custom) == 1
+    assert custom[0]["categories"] == ["crypto_keys"]
+    assert custom[0]["required_roles"] == ["security"]
+    assert custom[0]["paths"]["security"] == ["src/crypto/signing.ts"]
+
+
+def test_custom_category_diff_role_already_granted_does_not_escalate(
+    session_factory,
+) -> None:
+    """If the ticket-text trigger already forced the human to sign with the
+    category's role, touching its diff path does not re-escalate - mirroring the
+    anticipated-sensitive-area and per-path-role behaviour."""
+    provider = InMemoryFakeProvider()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        custom_risk_categories=[
+            CustomRiskCategory(
+                name="gdpr_subject_data",
+                keywords=("favourite",),
+                path_globs=("**/gdpr/**",),
+                required_roles=("security",),
+            )
+        ],
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.SECURITY}
+    )
+    job = orch.dispatch_agent(run_id)
+    provider.run(job.job_id)
+    pr = _pr(files_changed=["src/gdpr/export.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
+
+
+def test_custom_category_is_escalate_only(session_factory) -> None:
+    """A custom category only ever *adds* a required role on top of the built-in
+    risk-derived ones; it never drops a built-in area's role or lowers risk."""
+    orch = _orch(
+        session_factory,
+        custom_risk_categories=[
+            CustomRiskCategory(
+                name="gdpr_subject_data",
+                keywords=("favourite",),
+                required_roles=("product",),
+            )
+        ],
+    )
+    # An infrastructure ticket derives the built-in engineering role; the custom
+    # category adds product on top.
+    ticket = _ready_ticket(
+        title="Tune the helm chart resource limits",
+        description=READY_DESC + "\nAdjust the helm chart for the favourites service.",
+    )
+    run_id = orch.intake_and_plan(ticket, trigger_type="label")
+    with session_factory() as s:
+        from foundry.db.models import ArtifactType as _AT
+
+        risk = orch._load(s, run_id, _AT.RISK_ASSESSMENT)
+    # The built-in area is still flagged and the risk level is not lowered.
+    assert risk.sensitive_areas.infrastructure is True
+    assert risk.overall_risk.value == "medium"
+    # The built-in engineering role is *not* dropped: an approver with only the
+    # custom product role is refused for the still-required engineering role.
+    with pytest.raises(OrchestratorError, match="engineering"):
+        orch.approve(
+            run_id, user="a@example.com", granted_roles={ApprovalRole.PRODUCT}
+        )
+    # Both the built-in engineering role and the custom product role together
+    # release the run.
+    orch.approve(
+        run_id,
+        user="a@example.com",
+        granted_roles={ApprovalRole.ENGINEERING, ApprovalRole.PRODUCT},
+    )
+    assert _status(session_factory, run_id) is RunStatus.APPROVED
+
+
+def test_no_custom_categories_is_unchanged(session_factory) -> None:
+    """With no categories configured (the default) a diff into what *would* be a
+    category path is just an ordinary open PR - the feature is off by default."""
+    orch, run_id = _dispatched_run(session_factory)
+    pr = _pr(files_changed=["src/crypto/signing.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
 
 
 # -- PR correlation ---------------------------------------------------------------

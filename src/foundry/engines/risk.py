@@ -8,10 +8,16 @@ risk level, but the hard allow/deny decision is made by ``foundry.policy``.
 from __future__ import annotations
 
 import fnmatch
-from typing import Mapping, Protocol, Sequence
+from dataclasses import dataclass
+from typing import Any, Mapping, Protocol, Sequence
 
 from foundry.schemas.analysis import TicketAnalysis
-from foundry.schemas.common import AgentMode, ApprovalRole, OverallRisk
+from foundry.schemas.common import (
+    SENSITIVE_AREA_KEYS,
+    AgentMode,
+    ApprovalRole,
+    OverallRisk,
+)
 from foundry.schemas.context import ContextBundle
 from foundry.schemas.risk import (
     DiffRiskFindings,
@@ -74,6 +80,120 @@ def merge_sensitive_keywords(
         if added:
             merged[area] = (*merged[area], *added)
     return merged
+
+
+@dataclass(frozen=True)
+class CustomRiskCategory:
+    """An operator-defined risk category beyond the fixed built-in areas (#155).
+
+    The fixed seven :data:`SENSITIVE_AREA_KEYS` cover Foundry's reference risk
+    vocabulary, and operators can already *extend their triggers* without forking
+    (``risk.extra_sensitive_keywords`` for ticket text, ``policy.sensitive_path_globs``
+    for diffs). What they could not do is declare a genuinely *new*, dynamically
+    named category - e.g. ``crypto_keys`` or ``gdpr_subject_data`` - with its own
+    triggers mapping to its own approval roles. This is that category.
+
+    A category *fires* when either trigger matches:
+
+    * ``keywords`` appear in a ticket's title/description (intake), or
+    * ``path_globs`` match a changed file in a PR diff (PR push).
+
+    A fired category demands its ``required_roles`` as approval roles. It is
+    **escalate-only** (invariant #1): a category can only ever *add* a required
+    approval, never drop a built-in area's role or lower the risk level. The
+    name is validated (a slug that cannot collide with a built-in area name), so
+    a custom category can never shadow or weaken a built-in one. The roles reach
+    the gate via the resolved-roles channel both policy backends already read
+    (``PolicyInput.repo.required_roles``), so there is no new gate rule and no
+    ``foundry.rego`` change (invariant #2 stays satisfied for free).
+    """
+
+    name: str
+    keywords: tuple[str, ...] = ()
+    path_globs: tuple[str, ...] = ()
+    required_roles: tuple[str, ...] = ()
+
+    def matched_keywords(self, blob: str) -> list[str]:
+        """Keywords from this category present in a (lower-cased) ticket blob."""
+        return [kw for kw in self.keywords if kw in blob]
+
+    def matches_path(self, path: str) -> bool:
+        """True if a changed file path matches any of this category's globs."""
+        return any(glob_match(path, pattern) for pattern in self.path_globs)
+
+
+def custom_category_from_mapping(name: str, data: Any) -> CustomRiskCategory:
+    """Build a :class:`CustomRiskCategory` from a config mapping.
+
+    Coercion only - keywords are lower-cased to match :meth:`RawTicket.risk_blob`
+    (which lower-cases), mirroring the built-in keyword floor. The semantic
+    checks (real roles, a non-colliding name, at least one trigger) live in
+    :func:`validate_custom_categories` so they surface as a clear ``Settings``
+    load error.
+    """
+    if not isinstance(data, Mapping):
+        raise ValueError(
+            f"risk.custom_risk_categories entry {name!r} must be a mapping, got "
+            f"{data!r}"
+        )
+    keywords = tuple(str(kw).lower() for kw in (data.get("keywords") or ()))
+    path_globs = tuple(str(g) for g in (data.get("path_globs") or ()))
+    required_roles = tuple(str(r) for r in (data.get("required_roles") or ()))
+    return CustomRiskCategory(
+        name=str(name),
+        keywords=keywords,
+        path_globs=path_globs,
+        required_roles=required_roles,
+    )
+
+
+def validate_custom_categories(categories: Sequence[CustomRiskCategory]) -> None:
+    """Raise ``ValueError`` if any custom risk category is malformed (#155).
+
+    Fail-closed at load, like the other risk/policy knobs: a typo'd role or a
+    trigger-less category would silently never escalate, leaving an operator
+    believing a category was protecting them when it was inert. Each category
+    must (a) have a slug name that does not collide with a built-in sensitive
+    area (so it can never shadow or weaken one), (b) be unique, (c) demand at
+    least one valid approval role, and (d) declare at least one trigger.
+    """
+    valid_roles = {r.value for r in ApprovalRole}
+    builtin = set(SENSITIVE_AREA_KEYS)
+    seen: set[str] = set()
+    for category in categories:
+        name = category.name
+        if not name or not all(ch.isalnum() or ch == "_" for ch in name):
+            raise ValueError(
+                f"risk.custom_risk_categories name {name!r} must be a non-empty "
+                "slug (letters, digits, underscores)"
+            )
+        if name in builtin:
+            raise ValueError(
+                f"risk.custom_risk_categories name {name!r} collides with a "
+                f"built-in sensitive area; choose a distinct name (built-ins: "
+                f"{sorted(builtin)})"
+            )
+        if name in seen:
+            raise ValueError(
+                f"risk.custom_risk_categories lists {name!r} more than once"
+            )
+        seen.add(name)
+        if not category.required_roles:
+            raise ValueError(
+                f"risk.custom_risk_categories {name!r} must list at least one "
+                "required approval role, or it could never escalate anything"
+            )
+        bad = [r for r in category.required_roles if r not in valid_roles]
+        if bad:
+            raise ValueError(
+                f"risk.custom_risk_categories {name!r} lists unknown approval "
+                f"roles {bad}; valid roles are {sorted(valid_roles)}"
+            )
+        if not category.keywords and not category.path_globs:
+            raise ValueError(
+                f"risk.custom_risk_categories {name!r} needs at least one trigger "
+                "(keywords and/or path_globs), or it would never fire"
+            )
 
 
 def glob_match(path: str, pattern: str) -> bool:

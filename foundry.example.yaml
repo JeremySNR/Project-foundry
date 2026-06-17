@@ -34,6 +34,25 @@ risk:
   # extra_sensitive_keywords:
   #   payments: ["pan", "cardholder", "tokenisation"]
   #   customer_data: ["member record", "loyalty profile"]
+  # Operator-defined *custom* risk categories beyond the fixed seven built-in
+  # areas (issue #155). Each category has a slug name (must NOT collide with a
+  # built-in area), ticket-text `keywords` and/or diff `path_globs` triggers, and
+  # the approval `required_roles` it demands. A category that fires on the ticket
+  # text demands its roles at the policy gate (an approver lacking them is refused
+  # up front); one that fires on a PR diff path escalates the run to human review
+  # unless an approver already granted the role. Strictly additive / escalate-only:
+  # a category can only ever ADD a required approval, never drop a built-in area's
+  # role or lower risk. The roles reach the gate via the resolved-roles field both
+  # the Python engine and foundry.rego already read, so there is no new gate rule
+  # or Rego change. Valid roles: product, engineering, security, qa.
+  # custom_risk_categories:
+  #   crypto_keys:
+  #     keywords: ["signing key", "hsm", "kms"]
+  #     path_globs: ["**/crypto/**", "**/keys/**"]
+  #     required_roles: ["security", "engineering"]
+  #   gdpr_subject_data:
+  #     keywords: ["data subject", "right to erasure"]
+  #     required_roles: ["security"]
 
 planner:
   # Delivery planner backend (override with FOUNDRY_PLANNER_PROVIDER):

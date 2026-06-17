@@ -60,6 +60,7 @@ from foundry.engines.planner import (
     branch_name_for,
 )
 from foundry.engines.risk import (
+    CustomRiskCategory,
     DiffRiskClassifier,
     GlobDiffRiskClassifier,
     HeuristicRiskClassifier,
@@ -171,6 +172,7 @@ class FoundryOrchestrator:
         enforce_plan_scope: bool = True,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         extra_sensitive_keywords: Mapping[str, Sequence[str]] | None = None,
+        custom_risk_categories: Sequence[CustomRiskCategory] | None = None,
         change_freeze_windows: Sequence[ChangeFreezeWindow] | None = None,
         clock: Callable[[], datetime] | None = None,
         max_agent_retries: int = 2,
@@ -295,6 +297,16 @@ class FoundryOrchestrator:
         self._diff_risk_needs_ticket = not isinstance(
             self._diff_risk, GlobDiffRiskClassifier
         )
+        # Operator-defined custom risk categories (issue #155): named categories
+        # beyond the fixed seven built-in areas, each with ticket-text keyword
+        # and/or diff-path-glob triggers that demand approval roles. Fired on the
+        # ticket text at intake (the roles are unioned into the run's resolved
+        # required roles, so the gate enforces them) and on the diff at every PR
+        # push (an unsatisfied role escalates the run to REVIEW_REQUIRED, like
+        # the per-path roles). Strictly additive / escalate-only - validated at
+        # config load, so coercing roles here is safe. Empty by default =
+        # byte-for-byte the historical behaviour.
+        self._custom_risk_categories = list(custom_risk_categories or [])
         # Change-freeze / maintenance windows (issue #31, the "time windows"
         # policy dimension). During an active window an *autonomous* re-dispatch
         # is held and the run is escalated to REVIEW_REQUIRED for a human, like
@@ -347,6 +359,12 @@ class FoundryOrchestrator:
         analysis = self._analyzer.analyse(ticket)
         context = self._enricher.enrich(ticket, analysis)
         risk = self._risk.classify(ticket, analysis, context)
+        # Layer operator-defined custom risk categories on top of the classifier's
+        # built-in-area assessment (issue #155): a category whose ticket-text
+        # keywords fire demands its approval roles. Escalate-only - this only ever
+        # *adds* required roles and cited evidence, never lowers risk or drops a
+        # built-in's role.
+        risk = self._apply_custom_risk_categories(ticket, risk)
         plan = self._planner.plan(ticket, analysis, context, risk)
         payload = self._policy_input(PolicyAction.START_AGENT, analysis, context, risk)
         decision = self._policy.evaluate(payload)
@@ -763,11 +781,12 @@ class FoundryOrchestrator:
                     overall_risk=risk.overall_risk,
                     **risk.sensitive_areas.model_dump(),
                 ),
-                # The routed repo may demand extra roles (issue #31). Refuse an
-                # approver lacking them here, before recording, just as for the
-                # risk-derived roles - so a per-repo rule never surfaces as an
+                # The routed repo (issue #31) and any fired custom risk category
+                # (issue #155) may demand extra roles. Refuse an approver lacking
+                # them here, before recording, just as for the risk-derived roles
+                # - so a per-repo or custom-category rule never surfaces as an
                 # approve->blocked whiplash at dispatch.
-                self._repo_required_roles_for(repo),
+                self._resolved_required_roles(repo, risk),
             )
             missing = [role for role in required if role not in granted_roles]
             if missing:
@@ -2119,6 +2138,33 @@ class FoundryOrchestrator:
             )
             return RunStatus.REVIEW_REQUIRED
 
+        unapproved_custom, fired_categories = self._unapproved_custom_category_roles(
+            session, run_id, pr_state.files_changed
+        )
+        if unapproved_custom:
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "category": "custom_risk_category",
+                        "reason": (
+                            "diff touches paths in operator-defined custom risk "
+                            "categories whose approval roles the run's approvers "
+                            "did not grant"
+                        ),
+                        "categories": sorted(fired_categories),
+                        "required_roles": sorted(unapproved_custom),
+                        "paths": {
+                            role: sorted(set(paths))
+                            for role, paths in unapproved_custom.items()
+                        },
+                    },
+                )
+            )
+            return RunStatus.REVIEW_REQUIRED
+
         if len(pr_state.files_changed) > self._max_files_changed:
             # The diff is larger than the allowed cap - hand it to a human.
             # Record the escalation so the trail says *why* the run went to
@@ -2198,6 +2244,43 @@ class FoundryOrchestrator:
                         continue
                     unapproved.setdefault(role.value, []).append(path)
         return unapproved
+
+    def _unapproved_custom_category_roles(
+        self, session, run_id: str, files: list[str]
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        """Custom-category diff roles a diff demands that no approver has granted.
+
+        The diff-path twin of :meth:`_unapproved_path_roles`, for operator-defined
+        custom risk categories (issue #155): for each category, a changed file
+        matching one of its ``path_globs`` demands that category's roles. A role
+        already in the union granted across the run's approvers is *satisfied* -
+        so a category whose role the upfront ticket-text pass already forced a
+        human to sign with does **not** re-escalate, mirroring how an
+        *anticipated* sensitive area is not flagged again.
+
+        Returns ``(role -> matched paths, fired category names)``; an empty
+        mapping (the default with no categories configured) means nothing to
+        escalate. Strictly additive: it can only ever surface a role to require,
+        never drop one (invariant #1).
+        """
+        if not self._custom_risk_categories:
+            return {}, []
+        _, granted = self._approval_summary(session, run_id)
+        unapproved: dict[str, list[str]] = {}
+        fired: list[str] = []
+        for path in files:
+            for category in self._custom_risk_categories:
+                if not category.matches_path(path):
+                    continue
+                category_fired = False
+                for role in category.required_roles:
+                    if role in granted:
+                        continue
+                    unapproved.setdefault(role, []).append(path)
+                    category_fired = True
+                if category_fired and category.name not in fired:
+                    fired.append(category.name)
+        return unapproved, fired
 
     def _unexpected_plan_files(
         self, session, run_id: str, files: list[str]
@@ -2313,9 +2396,11 @@ class FoundryOrchestrator:
             repo=PolicyRepo(
                 name=repo_name,
                 confidence=best_repo.confidence if best_repo else 0,
-                # Stamp the routed repo's configured approval roles so the gate
-                # (and OPA, via the same field) requires them (issue #31).
-                required_roles=self._repo_required_roles_for(repo_name),
+                # Stamp the run's resolved extra approval roles so the gate (and
+                # OPA, via the same field) requires them: the routed repo's
+                # configured roles (issue #31) unioned with any custom risk
+                # category whose ticket-text keywords fired (issue #155).
+                required_roles=self._resolved_required_roles(repo_name, risk),
             ),
             retry=retry or PolicyRetry(),
             budget=budget or PolicyBudget(),
@@ -2334,6 +2419,80 @@ class FoundryOrchestrator:
         if not repo:
             return []
         return list(self._repo_required_roles.get(repo, []))
+
+    def _resolved_required_roles(
+        self, repo: str | None, risk: RiskAssessment
+    ) -> list[ApprovalRole]:
+        """Resolved extra approval roles for a run: per-repo plus custom-category.
+
+        The single source of the roles stamped into ``PolicyInput.repo.required_roles``
+        and pre-validated in :meth:`approve`, so the gate and the approval
+        lifecycle never disagree on what a run requires. It unions the per-repo
+        roles (``policy.repo_required_roles``) with the roles demanded by any
+        operator-defined custom risk category whose ticket-text keywords fired at
+        intake (``risk.custom_risk_categories``, issue #155). Both are strictly
+        additive - they can only *add* a required approval, never drop the
+        risk-derived ones the gate computes from the built-in area booleans
+        (invariant #1). Routing custom-category roles through this existing
+        resolved-roles field means no new gate rule and no ``foundry.rego`` change
+        (invariant #2 stays satisfied for free).
+        """
+        roles = self._repo_required_roles_for(repo)
+        for role in risk.custom_required_approvals:
+            if role not in roles:
+                roles.append(role)
+        return roles
+
+    def _apply_custom_risk_categories(
+        self, ticket: RawTicket, risk: RiskAssessment
+    ) -> RiskAssessment:
+        """Fold ticket-text custom-category hits into a RiskAssessment (#155).
+
+        For every configured custom category whose keywords appear in the
+        ticket's title/description, record its demanded approval roles in
+        :attr:`RiskAssessment.custom_required_approvals` and append a cited
+        reason + evidence entry. Strictly additive: it only ever *adds* roles
+        and evidence (de-duplicated), never removes a built-in area's role or
+        lowers the risk level. Returns the assessment unchanged when no category
+        is configured or none fires, so the default path is byte-for-byte the
+        same artifact.
+        """
+        if not self._custom_risk_categories:
+            return risk
+        blob = ticket.risk_blob()
+        extra_roles: list[ApprovalRole] = list(risk.custom_required_approvals)
+        reasons = list(risk.risk_reasons)
+        evidence = list(risk.evidence)
+        fired = False
+        for category in self._custom_risk_categories:
+            matched = category.matched_keywords(blob)
+            if not matched:
+                continue
+            fired = True
+            reasons.append(
+                f"Ticket text matches custom risk category '{category.name}'."
+            )
+            evidence.append(
+                RiskEvidence(
+                    area=category.name,
+                    detail="keyword(s) in ticket title/description: "
+                    + ", ".join(f"'{k}'" for k in matched),
+                    source="heuristic",
+                )
+            )
+            for role in category.required_roles:
+                resolved = ApprovalRole(role)
+                if resolved not in extra_roles:
+                    extra_roles.append(resolved)
+        if not fired:
+            return risk
+        return risk.model_copy(
+            update={
+                "risk_reasons": reasons,
+                "evidence": evidence,
+                "custom_required_approvals": extra_roles,
+            }
+        )
 
     def _min_approvals_for(self, repo: str | None) -> int:
         """Minimum distinct approvers for a run routed to ``repo`` (issue #31).

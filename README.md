@@ -172,6 +172,14 @@ risk:
     customer_data: ["member record"]   # built-in floor. Strictly additive (only ever
                                        # flags MORE areas) - the ticket-text twin of
                                        # sensitive_path_globs below.
+  custom_risk_categories:   # NEW, dynamically-named risk categories beyond the fixed
+    crypto_keys:            # seven areas (#155). Slug name (can't collide w/ a built-in)
+      keywords: ["hsm", "signing key"]   # ticket-text triggers -> roles at the gate, and/or
+      path_globs: ["**/crypto/**"]       # diff-path triggers -> REVIEW_REQUIRED escalation.
+      required_roles: ["security"]       # Escalate-only: only ever ADDS a required approval,
+    gdpr_subject_data:                   # never drops a built-in's role. No new gate rule /
+      keywords: ["data subject"]         # Rego change (roles ride the existing resolved-roles
+      required_roles: ["security"]       # field both backends already read).
 policy:
   repo_confidence_threshold: 70   # block work we can't confidently place in a repo
   max_files_changed: 12           # bigger PRs go to a human

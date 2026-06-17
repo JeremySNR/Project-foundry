@@ -27,6 +27,11 @@ from foundry.compliance.controls import (
     ControlMapping,
     mappings_from_config,
 )
+from foundry.engines.risk import (
+    CustomRiskCategory,
+    custom_category_from_mapping,
+    validate_custom_categories,
+)
 from foundry.policy.freeze import (
     ChangeFreezeWindow,
     validate_windows,
@@ -312,6 +317,18 @@ class Settings:
     # can only ever flag *more* areas, never fewer, so it only escalates risk.
     # Area names are validated against SENSITIVE_AREA_KEYS at load (fail-closed).
     extra_sensitive_keywords: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Operator-defined *custom* risk categories beyond the fixed seven built-in
+    # sensitive areas (issue #155). Each category has a slug name (validated so
+    # it cannot collide with a built-in area), ticket-text ``keywords`` and/or
+    # diff ``path_globs`` triggers, and the approval ``required_roles`` it
+    # demands. Built-in areas stay a non-overridable floor: a custom category is
+    # strictly additive / escalate-only - it can only ever *add* a required
+    # approval, never drop a built-in's role or lower risk (invariant #1). The
+    # demanded roles reach the gate via ``PolicyInput.repo.required_roles`` (the
+    # resolved-roles field both the Python engine and ``foundry.rego`` already
+    # read), so there is no new gate rule / Rego change (invariant #2). Validated
+    # at load (fail-closed). Empty default = byte-for-byte the historical behaviour.
+    custom_risk_categories: tuple[CustomRiskCategory, ...] = ()
     # Delivery planner backend. "template" renders deterministic
     # "Satisfy acceptance criterion: X" steps (the no-key default); "llm" adds
     # an LLM pass that produces file-level steps, test locations and verify
@@ -747,6 +764,12 @@ class Settings:
                         f"risk.extra_sensitive_keywords lists unknown sensitive "
                         f"area {area!r}; valid areas are {sorted(valid_areas)}"
                     )
+        # Operator-defined custom risk categories (issue #155): names must be
+        # non-colliding slugs, roles real ApprovalRoles, each with >= 1 trigger.
+        # Validated at load, fail-closed - a malformed category would otherwise
+        # silently never escalate.
+        if self.custom_risk_categories:
+            validate_custom_categories(self.custom_risk_categories)
         # Change-freeze windows must be well-formed (issue #31): a real set of
         # weekdays + start/end OR an absolute range, a resolvable IANA tz. A
         # malformed window is a deploy-time error, not a silently-inert freeze
@@ -961,6 +984,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["extra_sensitive_keywords"] = tuple(
             (str(area), tuple(str(kw) for kw in keywords))
             for area, keywords in (risk["extra_sensitive_keywords"] or {}).items()
+        )
+    if "custom_risk_categories" in risk:
+        out["custom_risk_categories"] = tuple(
+            custom_category_from_mapping(name, spec)
+            for name, spec in (risk["custom_risk_categories"] or {}).items()
         )
 
     planner = data.get("planner", {}) or {}

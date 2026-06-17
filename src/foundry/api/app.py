@@ -2504,6 +2504,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         enforce_plan_scope=settings.enforce_plan_scope,
         sensitive_path_globs=settings.sensitive_globs_map,
         extra_sensitive_keywords=extra_risk_keywords,
+        custom_risk_categories=settings.custom_risk_categories,
         change_freeze_windows=settings.change_freeze_windows,
         max_agent_retries=settings.max_agent_retries,
         retry_on=settings.retry_on,
