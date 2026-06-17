@@ -946,6 +946,20 @@ def test_dashboard_renders_failures_by_category_trend_strip() -> None:
     assert "loadFailureCategoryTrends();" in DASHBOARD_HTML
 
 
+def test_dashboard_renders_failures_by_repo_trend_strip() -> None:
+    """The failures-by-repo trend sparkline strip (issue #37) must fetch the
+    by-repo/trends endpoint, have a panel to render into, and be wired into
+    the refresh loop — the in-page render of the per-repo failure trend
+    ("is *this repo's* failure rate climbing or fading over time?"), the
+    by-repo dimension of the failure trend in failure-red, mirroring the
+    delivery per-repo trend strip and the failures-by-category trend strip."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/failures/by-repo/trends' in DASHBOARD_HTML
+    assert '<div id="failure-repo-trends"></div>' in DASHBOARD_HTML
+    assert "loadFailuresByRepoTrends();" in DASHBOARD_HTML
+
+
 # -- Enricher wiring via build_orchestrator ------------------------------------
 
 
