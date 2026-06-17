@@ -717,3 +717,110 @@ def test_failures_by_repo_trends_rejects_bad_window(monkeypatch, db_url) -> None
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 2
+
+
+# --- failures-by-work-type-trends ------------------------------------------
+
+
+def test_failures_by_work_type_trends_empty_database(
+    monkeypatch, capsys, db_url
+) -> None:
+    _seed(db_url)
+    _run_cli(monkeypatch, db_url, "failures-by-work-type-trends")
+    assert "No runs failed in the last 30d" in capsys.readouterr().out
+
+
+def test_failures_by_work_type_trends_groups_by_work_type(
+    monkeypatch, capsys, db_url
+) -> None:
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        for hours in (1, 2):  # two runs share one work type
+            rid = _add_run(
+                session,
+                status=RunStatus.BLOCKED,
+                created_at=now - timedelta(hours=hours),
+                work_type="bug",
+            )
+            _add_event(
+                session,
+                rid,
+                AuditEventType.RUN_BLOCKED,
+                now - timedelta(hours=hours),
+                metadata_json='{"category": "policy_denied"}',
+            )
+        rid = _add_run(
+            session,
+            status=RunStatus.EXECUTION_FAILED,
+            created_at=now - timedelta(hours=3),
+            work_type="feature",
+        )
+        _add_event(
+            session,
+            rid,
+            AuditEventType.AGENT_FAILED,
+            now - timedelta(hours=3),
+            metadata_json='{"reason": "agent error"}',
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "failures-by-work-type-trends")
+    out = capsys.readouterr().out
+    assert "Failures by work type by day" in out
+    assert "3 total across 2 work type(s), 2 blocked, 1 execution-failed" in out
+    # Most-frequent first: bug (2) before feature (1).
+    assert out.index("bug") < out.index("feature")
+
+
+def test_failures_by_work_type_trends_window_and_week_bucket(
+    monkeypatch, capsys, db_url
+) -> None:
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.BLOCKED,
+            created_at=now - timedelta(days=45),
+            work_type="bug",
+        )
+        _add_event(
+            session,
+            rid,
+            AuditEventType.RUN_BLOCKED,
+            now - timedelta(days=45),
+            metadata_json='{"category": "policy_denied"}',
+        )
+        session.commit()
+
+    # The default 30-day window excludes a 45-day-old block...
+    _run_cli(monkeypatch, db_url, "failures-by-work-type-trends")
+    assert "No runs failed in the last 30d" in capsys.readouterr().out
+
+    # ...but a wide enough window, bucketed by week, surfaces it.
+    _run_cli(
+        monkeypatch,
+        db_url,
+        "failures-by-work-type-trends",
+        "--days",
+        "60",
+        "--bucket",
+        "week",
+    )
+    out = capsys.readouterr().out
+    assert "Failures by work type by week" in out
+    assert "bug" in out
+
+
+def test_failures_by_work_type_trends_rejects_bad_window(monkeypatch, db_url) -> None:
+    _seed(db_url)
+    monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
+    monkeypatch.setenv("FOUNDRY_DATABASE_URL", db_url)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["foundry-memory", "failures-by-work-type-trends", "--days", "0"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
