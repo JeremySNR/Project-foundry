@@ -257,13 +257,20 @@ class PolicyCheckFinding:
     consumer can reason about it without scraping the sentence:
 
     - ``comparator`` - the direction the gate enforces for this knob: ``">="``
-      (higher is stricter), ``"<="`` (lower is stricter), or ``"superset"``
-      (the subject must cover everything the baseline lists).
+      (higher is stricter), ``"<="`` (lower is stricter), ``"superset"`` (the
+      subject must cover everything the baseline lists), or ``"subset"`` (the
+      mirror: the subject must list *no more* than the baseline - used for
+      ``retry_on``, where a *smaller* set of autonomous-retry triggers is
+      stricter).
     - ``subject`` / ``baseline`` - for the **scalar** knobs, the numeric value
       on each side (``None`` for an absent cap, e.g. ``max_cost_per_run``); left
       ``None`` for collection knobs, where a single number does not apply.
     - ``missing`` - for the **collection** knobs, the baseline items the subject
       fails to cover (empty when the control passes); always empty for scalars.
+      For a ``subset`` knob the failure direction is reversed, so ``missing``
+      instead names the subject's **disallowed extra** items (the triggers the
+      baseline does not permit) - the items responsible for the failure either
+      way.
     - ``missing_items`` - the same shortfall as ``missing`` but **structured**,
       so a consumer never has to parse the ``"<key>: <items>"`` prose. One dict
       per shortfall, shaped by the knob's kind:
@@ -274,8 +281,9 @@ class PolicyCheckFinding:
         [<missing glob/role/keyword>, ...]}`` per shortfall key.
       - **``repo_min_approvals``** (numeric): ``{"key": <repo>, "subject": <int>,
         "baseline": <int>}`` per shortfall repo.
-      - **flat list knobs** (``forbidden_globs`` / ``change_freeze_windows``):
-        ``{"item": <glob|window>}`` per missing baseline item.
+      - **flat list knobs** (``forbidden_globs`` / ``change_freeze_windows`` and
+        the ``subset`` knob ``retry_on``): ``{"item": <glob|window|trigger>}``
+        per shortfall item (for ``retry_on``, each disallowed extra trigger).
       - **scalar knobs**: always empty (the ``subject``/``baseline`` numbers
         already carry the comparison).
 
@@ -338,6 +346,10 @@ def compare_policy_strictness(
       risk-escalation maps (``sensitive_path_globs`` / ``extra_sensitive_keywords``,
       area -> diff-path globs / ticket-text keywords): the subject must protect /
       require / escalate on everything the baseline does (it may add more).
+    - **subset is stricter** - ``retry_on`` (the mirror of the superset knobs):
+      the failure reasons that trigger an *autonomous* agent re-dispatch; a
+      *smaller* set hands more failures to a human, so the subject may auto-retry
+      on no more triggers than the baseline (it may auto-retry on fewer).
 
     The comparison only ever looks at *configured* knobs. The risk-escalation
     maps are configured (they decide *which* runs escalate to which roles, an
@@ -393,6 +405,36 @@ def compare_policy_strictness(
             comparator="<=",
             subject=s_ret,
             baseline=b_ret,
+        )
+    )
+
+    # --- retry_on (subset stricter: fewer autonomous-retry triggers) ----- #
+    # `retry_on` is the set of PR-failure reasons (`ci_failed` /
+    # `changes_requested`) that trigger an *autonomous* agent re-dispatch; a
+    # reason outside the set parks the run for a human instead
+    # (`orchestrator._attempt_remediation`). So a SMALLER set is stricter (more
+    # failures handed to a human, fewer autonomous re-dispatches), and the subject
+    # is at least as strict only when its triggers are a SUBSET of the baseline's.
+    # A subject that adds a trigger the baseline omits (e.g. auto-retrying
+    # `changes_requested` when the baseline only auto-retries `ci_failed`) is
+    # *weaker* - exactly the autonomous-action drift a compliance check should
+    # catch, yet which the superset knobs above can't express. Compared `subset`
+    # (the mirror of the `superset` knobs): `missing`/`missing_items` carry the
+    # subject's disallowed *extra* triggers (the items causing the failure),
+    # since the failure direction is reversed.
+    b_retry = set(baseline.retry_on)
+    retry_extra = [trigger for trigger in subject.retry_on if trigger not in b_retry]
+    findings.append(
+        PolicyCheckFinding(
+            "retry_on",
+            not retry_extra,
+            f"auto-retries on {retry_extra} not permitted by baseline "
+            f"{sorted(b_retry)}"
+            if retry_extra
+            else f"auto-retries only within baseline's {sorted(b_retry)}",
+            comparator="subset",
+            missing=tuple(retry_extra),
+            missing_items=tuple({"item": trigger} for trigger in retry_extra),
         )
     )
 

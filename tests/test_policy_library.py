@@ -781,6 +781,69 @@ def test_check_sensitive_knobs_pass_when_covered(tmp_path) -> None:
         assert finding.missing_items == ()
 
 
+def test_check_retry_on_must_be_a_subset(tmp_path) -> None:
+    # `retry_on` is the set of failure reasons that trigger an *autonomous*
+    # re-dispatch; a smaller set is stricter (more failures parked for a human).
+    # A subject that auto-retries on a trigger the baseline omits is therefore
+    # WEAKER, and the `subset`-compared finding must flag it.
+    baseline = _settings(
+        tmp_path / "b",
+        "remediation:\n  retry_on:\n    - ci_failed\n",
+    )
+    subject = _settings(
+        tmp_path / "s",
+        "remediation:\n  retry_on:\n    - ci_failed\n    - changes_requested\n",
+    )
+    finding = _finding(compare_policy_strictness(subject, baseline), "retry_on")
+    assert finding.ok is False
+    assert finding.comparator == "subset"
+    # the offending item is the disallowed *extra* trigger, not a baseline gap
+    assert finding.missing == ("changes_requested",)
+    assert finding.missing_items == ({"item": "changes_requested"},)
+    # the reverse direction (subject auto-retries on FEWER triggers) is stricter
+    assert compare_policy_strictness(baseline, subject).ok
+
+
+def test_check_retry_on_equal_or_subset_passes(tmp_path) -> None:
+    # Equal sets pass cleanly; a strict subset (auto-retry on fewer reasons)
+    # passes too, with no disallowed extras.
+    baseline = _settings(
+        tmp_path / "b",
+        "remediation:\n  retry_on:\n    - ci_failed\n    - changes_requested\n",
+    )
+    for body in (
+        "remediation:\n  retry_on:\n    - ci_failed\n    - changes_requested\n",
+        "remediation:\n  retry_on:\n    - ci_failed\n",
+        "remediation:\n  retry_on: []\n",
+    ):
+        subject = _settings(tmp_path / "s", body)
+        finding = _finding(compare_policy_strictness(subject, baseline), "retry_on")
+        assert finding.ok, body
+        assert finding.missing == ()
+        assert finding.missing_items == ()
+
+
+def test_check_retry_on_serialises_in_json_twin(tmp_path) -> None:
+    # The `subset` finding flows through the shared comparison_to_dict serialiser
+    # (so the CLI and GET /metrics/policy/check verdicts can't drift), carrying
+    # its typed comparator + disallowed-extra items.
+    baseline = _settings(
+        tmp_path / "b",
+        "remediation:\n  retry_on:\n    - ci_failed\n",
+    )
+    subject = _settings(
+        tmp_path / "s",
+        "remediation:\n  retry_on:\n    - ci_failed\n    - changes_requested\n",
+    )
+    payload = comparison_to_dict(compare_policy_strictness(subject, baseline))
+    finding = next(f for f in payload["findings"] if f["knob"] == "retry_on")
+    assert finding["ok"] is False
+    assert finding["comparator"] == "subset"
+    assert finding["missing"] == ["changes_requested"]
+    assert finding["missing_items"] == [{"item": "changes_requested"}]
+    assert "retry_on" in payload["weaknesses"]
+
+
 def test_comparison_to_dict_all_pass() -> None:
     settings = load_preset_settings("soc2")
     payload = comparison_to_dict(compare_policy_strictness(settings, settings))
