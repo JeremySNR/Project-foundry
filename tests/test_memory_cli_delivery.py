@@ -197,6 +197,26 @@ def test_delivery_trends_buckets_over_time(monkeypatch, capsys, db_url) -> None:
     assert "spend $2.0" in out
 
 
+def test_delivery_trends_renders_per_period_approval_latency(
+    monkeypatch, capsys, db_url
+) -> None:
+    """The over-time "is sign-off getting slower?" cut: an approved run renders
+    its approval latency in the period line; the column is '-' for a period whose
+    runs never reached approval."""
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        # Approved 1h before merge (3600s); a never-approved block alongside it.
+        _add_outcome(session, outcome="merged", completed_at=now, approval_seconds=3600)
+        _add_outcome(session, outcome="blocked", completed_at=now, approval_seconds=None)
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "delivery-trends", "--bucket", "day")
+    out = capsys.readouterr().out
+    # _fmt_age(3600) -> "1h00m"; the median over the single approved run.
+    assert "approval 1h00m" in out
+
+
 def test_delivery_trends_rejects_bad_bucket(monkeypatch, db_url) -> None:
     _seed(db_url)
     monkeypatch.delenv("FOUNDRY_CONFIG", raising=False)
