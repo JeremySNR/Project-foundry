@@ -85,6 +85,20 @@ policy:
   # The repo_confidence_threshold below is sent to OPA so the two backends
   # evaluate against the same value.
   # opa_url: http://opa:8181
+  # Live user policy bundle (issue #154). Point this at a separately-authored
+  # file (with the same policy:/risk: knobs as this one) and Foundry merges it
+  # ON TOP OF the resolved config at load as a STRICTLY-ADDITIVE overlay - your
+  # config plus the built-in gate rules stay a non-overridable floor, so the
+  # bundle can only ever make the gate *stricter* (add protected paths, required
+  # roles, escalations and freezes; raise the confidence/approval thresholds;
+  # tighten the file/retry/cost caps; narrow which failures auto-retry). A value
+  # that would weaken the floor is ignored, and a bundle that would weaken any
+  # built-in denial/approval requirement fails loud at load. Lets e.g. a security
+  # team own a reviewed, independently-versioned bundle without forking the app
+  # or hand-editing this file. It may carry ONLY policy knobs (anything else is
+  # rejected) and is loaded from this path, never from a request. Also settable
+  # via FOUNDRY_POLICY_BUNDLE_PATH. Unset (default) = no overlay.
+  # bundle_path: /etc/foundry/security-policy-bundle.yaml
   # A run is blocked unless one repo clears this confidence (0-100).
   repo_confidence_threshold: 70
   # PRs larger than this are routed to human review.
