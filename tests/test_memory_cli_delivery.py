@@ -220,11 +220,45 @@ def test_delivery_trends_renders_per_period_approval_latency(
 
     _run_cli(monkeypatch, db_url, "delivery-trends", "--bucket", "day")
     out = capsys.readouterr().out
-    # _fmt_age(3600) -> "1h00m"; the median over the single approved run.
-    assert "approval 1h00m" in out
-    # _fmt_age(7200) -> "2h00m"; the merge-latency median, the over-time mirror
-    # of the approval latency (the "is shipping getting slower?" cut).
-    assert "merge 2h00m" in out
+    # Rendered as median/p90 (the offline twin of the dashboard p90 render,
+    # #148): over a single approved/merged run median == p90.
+    # _fmt_age(3600) -> "1h00m" approval; _fmt_age(7200) -> "2h00m" merge.
+    assert "approval 1h00m/1h00m" in out
+    assert "merge 2h00m/2h00m" in out
+
+
+def test_delivery_trends_renders_p90_tail_beside_median(
+    monkeypatch, capsys, db_url
+) -> None:
+    """Two merged runs in one period with differing latencies: the period line
+    renders median/p90, and the p90 tail is distinct from the median (it is
+    exactly what the SLA knobs flag, so it must not be discarded offline)."""
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        # merge 1h/2h, approval 30m/1h -> median is the lower, p90 the upper
+        # (nearest-rank over two values).
+        _add_outcome(
+            session,
+            outcome="merged",
+            completed_at=now,
+            approval_seconds=1800,
+            time_to_merge_seconds=3600,
+        )
+        _add_outcome(
+            session,
+            outcome="merged",
+            completed_at=now,
+            approval_seconds=3600,
+            time_to_merge_seconds=7200,
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "delivery-trends", "--bucket", "day")
+    out = capsys.readouterr().out
+    # median/p90: merge 1h00m/2h00m, approval 30m00s/1h00m.
+    assert "merge 1h00m/2h00m" in out
+    assert "approval 30m00s/1h00m" in out
 
 
 def test_delivery_trends_rejects_bad_bucket(monkeypatch, db_url) -> None:
@@ -270,6 +304,38 @@ def test_delivery_by_repo_groups_and_orders(monkeypatch, capsys, db_url) -> None
     assert out.index("payments-service") < out.index("web-frontend")
 
 
+def test_delivery_by_repo_renders_p90_tail(monkeypatch, capsys, db_url) -> None:
+    """The by-repo table renders ttm/tta as median/p90 (the offline twin of the
+    dashboard p90 render, #148), with the p90 tail distinct from the median."""
+    sf = _seed(db_url)
+    with sf() as session:
+        # Two merged runs in one repo, merge 1h/2h, approval 30m/1h.
+        _add_outcome(
+            session,
+            outcome="merged",
+            repo="payments-service",
+            approval_seconds=1800,
+            time_to_merge_seconds=3600,
+        )
+        _add_outcome(
+            session,
+            outcome="merged",
+            repo="payments-service",
+            approval_seconds=3600,
+            time_to_merge_seconds=7200,
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "delivery-by-repo")
+    out = capsys.readouterr().out
+    # Header carries the med/p90 columns, not the bare medians.
+    assert "ttm med/p90" in out
+    assert "tta med/p90" in out
+    # nearest-rank over two values: median is the lower, p90 the upper.
+    assert "1h00m/2h00m" in out  # time-to-merge
+    assert "30m00s/1h00m" in out  # time-to-approval
+
+
 # --- delivery-by-work-type ------------------------------------------------
 
 
@@ -298,6 +364,35 @@ def test_delivery_by_work_type_groups_and_orders(monkeypatch, capsys, db_url) ->
     assert "(unclassified)" in out
     # Most-shipping type (bug, 2) is listed before feature (1).
     assert out.index("bug") < out.index("feature")
+
+
+def test_delivery_by_work_type_renders_p90_tail(monkeypatch, capsys, db_url) -> None:
+    """The by-work-type table renders ttm/tta as median/p90 (the offline twin of
+    the dashboard p90 render, #148), with the p90 tail distinct from the median."""
+    sf = _seed(db_url)
+    with sf() as session:
+        _add_outcome(
+            session,
+            outcome="merged",
+            work_type="bug",
+            approval_seconds=1800,
+            time_to_merge_seconds=3600,
+        )
+        _add_outcome(
+            session,
+            outcome="merged",
+            work_type="bug",
+            approval_seconds=3600,
+            time_to_merge_seconds=7200,
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "delivery-by-work-type")
+    out = capsys.readouterr().out
+    assert "ttm med/p90" in out
+    assert "tta med/p90" in out
+    assert "1h00m/2h00m" in out  # time-to-merge median/p90
+    assert "30m00s/1h00m" in out  # time-to-approval median/p90
 
 
 def test_delivery_by_work_type_rejects_bad_window(monkeypatch, db_url) -> None:
@@ -337,6 +432,37 @@ def test_delivery_by_repo_trends_lists_per_repo_series(monkeypatch, capsys, db_u
     assert "payments-service: 1/1 merged" in out
     assert "web-frontend: 1/1 merged" in out
     assert "week of" in out
+
+
+def test_delivery_by_repo_trends_renders_p90_tail(monkeypatch, capsys, db_url) -> None:
+    """Per-repo trend cells render median/p90 (the offline twin of the dashboard
+    p90 render, #148); two merged runs in one repo/period give a distinct tail.
+    This exercises the same per-period cell render the by-work-type trend uses."""
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        _add_outcome(
+            session,
+            outcome="merged",
+            repo="payments-service",
+            completed_at=now,
+            approval_seconds=1800,
+            time_to_merge_seconds=3600,
+        )
+        _add_outcome(
+            session,
+            outcome="merged",
+            repo="payments-service",
+            completed_at=now,
+            approval_seconds=3600,
+            time_to_merge_seconds=7200,
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "delivery-by-repo-trends", "--bucket", "week")
+    out = capsys.readouterr().out
+    assert "merge 1h00m/2h00m" in out
+    assert "approval 30m00s/1h00m" in out
 
 
 # --- delivery-by-work-type-trends -----------------------------------------

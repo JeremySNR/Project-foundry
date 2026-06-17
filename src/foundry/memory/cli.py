@@ -610,6 +610,16 @@ def _fmt_age(seconds: int | None) -> str:
     return f"{days}d{hours:02d}h"
 
 
+def _fmt_latency(dist: dict) -> str:
+    """A latency distribution as ``median/p90`` (each '-' when absent) - the
+    offline-CLI twin of how the dashboard renders the p90 beside the median
+    (#148). The tail is exactly what the ``dashboard.*_sla_seconds`` SLA knobs
+    flag, so it must not be discarded in the offline view; a ``None`` p90 (a
+    period/cut with no approved/merged runs) renders as '-' via ``_fmt_age``,
+    never a conjured zero."""
+    return f"{_fmt_age(dist['median'])}/{_fmt_age(dist['p90'])}"
+
+
 def _fmt_cost(cost: float | None) -> str:
     """'$X' / '-' - None means no run reported a cost, never a conjured $0
     (matching the delivery aggregates, which leave ``total_cost_usd`` None)."""
@@ -1179,8 +1189,8 @@ def _run_delivery_trends(args: argparse.Namespace) -> None:
             f"shipped {period['prs_shipped']:>3}  blocked {period['blocked']:>3}  "
             f"runs {period['runs_finished']:>3}  retries {period['retries_consumed']:>3}  "
             f"spend {_fmt_cost(period['total_cost_usd'])}  "
-            f"merge {_fmt_age(ttm['median'])}  "
-            f"approval {_fmt_age(tta['median'])}"
+            f"merge {_fmt_latency(ttm)}  "
+            f"approval {_fmt_latency(tta)}"
         )
 
 
@@ -1203,7 +1213,7 @@ def _run_delivery_by_repo(args: argparse.Namespace) -> None:
     )
     print(
         f"{'repo':<40} {'shipped':<8} {'blocked':<8} {'merge%':<7} "
-        f"{'retries':<8} {'spend':<9} {'ttm median':<12} tta median"
+        f"{'retries':<8} {'spend':<9} {'ttm med/p90':<14} tta med/p90"
     )
     for repo in repos:
         ttm = repo["time_to_merge_seconds"]
@@ -1212,7 +1222,7 @@ def _run_delivery_by_repo(args: argparse.Namespace) -> None:
             f"{repo['repo']:<40} {repo['prs_shipped']:<8} {repo['blocked']:<8} "
             f"{repo['merge_rate']:<7} {repo['retries_consumed']:<8} "
             f"{_fmt_cost(repo['total_cost_usd']):<9} "
-            f"{_fmt_age(ttm['median']):<12} {_fmt_age(tta['median'])}"
+            f"{_fmt_latency(ttm):<14} {_fmt_latency(tta)}"
         )
 
 
@@ -1235,7 +1245,7 @@ def _run_delivery_by_work_type(args: argparse.Namespace) -> None:
     )
     print(
         f"{'work type':<16} {'shipped':<8} {'blocked':<8} {'merge%':<7} "
-        f"{'retries':<8} {'spend':<9} {'ttm median':<12} tta median"
+        f"{'retries':<8} {'spend':<9} {'ttm med/p90':<14} tta med/p90"
     )
     for wt in work_types:
         ttm = wt["time_to_merge_seconds"]
@@ -1244,7 +1254,7 @@ def _run_delivery_by_work_type(args: argparse.Namespace) -> None:
             f"{wt['work_type']:<16} {wt['prs_shipped']:<8} {wt['blocked']:<8} "
             f"{wt['merge_rate']:<7} {wt['retries_consumed']:<8} "
             f"{_fmt_cost(wt['total_cost_usd']):<9} "
-            f"{_fmt_age(ttm['median']):<12} {_fmt_age(tta['median'])}"
+            f"{_fmt_latency(ttm):<14} {_fmt_latency(tta)}"
         )
 
 
@@ -1279,7 +1289,7 @@ def _run_delivery_by_repo_trends(args: argparse.Namespace) -> None:
             print(
                 f"    {label} {period_iso[:10]}  shipped {cell['prs_shipped']:>3}  "
                 f"blocked {cell['blocked']:>3}  runs {cell['runs_finished']:>3}  "
-                f"merge {_fmt_age(ttm['median'])}  approval {_fmt_age(tta['median'])}"
+                f"merge {_fmt_latency(ttm)}  approval {_fmt_latency(tta)}"
             )
         print()
 
@@ -1315,6 +1325,6 @@ def _run_delivery_by_work_type_trends(args: argparse.Namespace) -> None:
             print(
                 f"    {label} {period_iso[:10]}  shipped {cell['prs_shipped']:>3}  "
                 f"blocked {cell['blocked']:>3}  runs {cell['runs_finished']:>3}  "
-                f"merge {_fmt_age(ttm['median'])}  approval {_fmt_age(tta['median'])}"
+                f"merge {_fmt_latency(ttm)}  approval {_fmt_latency(tta)}"
             )
         print()
