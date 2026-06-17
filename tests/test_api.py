@@ -890,26 +890,47 @@ def test_dashboard_delivery_trend_renders_latency_columns() -> None:
     """The org-wide delivery-trend table (issue #37) must render the per-period
     sign-off and shipping latency the endpoint now carries (#143/#145) — the
     in-page "is sign-off / shipping getting slower week over week?" view — as
-    median-to-approval / median-to-merge columns, the same dur() medians the
-    by-repo / by-work-type delivery tables already show."""
+    to-approval / to-merge columns, each carrying both the median and the p90
+    tail (the same dur() medians the by-repo / by-work-type delivery tables
+    show, now with the p90 beside them)."""
     from foundry.api.dashboard import DASHBOARD_HTML
 
     assert "p.time_to_approval_seconds" in DASHBOARD_HTML
     assert "p.time_to_merge_seconds" in DASHBOARD_HTML
-    assert "<th>median to approval</th><th>median to merge</th>" in DASHBOARD_HTML
+    assert "<th>to approval (med/p90)</th><th>to merge (med/p90)</th>" in DASHBOARD_HTML
 
 
 def test_dashboard_trend_sparklines_carry_latency_in_tooltip() -> None:
     """The by-repo / by-work-type delivery-trend sparkline strips (issue #37)
-    must enrich each per-week bar's hover tooltip with that week's median
-    sign-off and shipping latency — the per-cell data #143/#145 added to the
+    must enrich each per-week bar's hover tooltip with that week's median and
+    p90 sign-off and shipping latency — the per-cell data #143/#145 added to the
     trend endpoints (the same fields the org-wide trend table renders as
     columns), surfaced on the many-series strips as hover detail."""
     from foundry.api.dashboard import DASHBOARD_HTML
 
     assert "c.time_to_approval_seconds" in DASHBOARD_HTML
     assert "c.time_to_merge_seconds" in DASHBOARD_HTML
-    assert "to approval / ${dur(ttm)} to merge" in DASHBOARD_HTML
+    assert "(p90 ${dur(ttmD.p90)}) to merge" in DASHBOARD_HTML
+
+
+def test_dashboard_delivery_latency_renders_p90_tail() -> None:
+    """The delivery-latency renders (issue #37) must surface the p90 tail
+    beside the median wherever the median is shown — not just the one top-strip
+    merge stat that had it. The distributions carry count/median/p90, and the
+    p90 is exactly the tail the dashboard.*_sla_seconds SLA knobs track: a
+    healthy median can hide a blown-out p90, so the tail must be readable in the
+    top strip (both approval and merge), the three delivery tables, and the two
+    trend sparkline tooltips. Read-only render only — no metric/endpoint change."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    # Top strip: approval p90 now beside the merge p90 that was already there.
+    assert "${dur(tta.p90)}" in DASHBOARD_HTML
+    assert "${dur(ttm.p90)}" in DASHBOARD_HTML
+    # Tables render "median / p90" in every latency cell.
+    assert "${dur(tta.median)} / ${dur(tta.p90)}" in DASHBOARD_HTML
+    assert "${dur(ttm.median)} / ${dur(ttm.p90)}" in DASHBOARD_HTML
+    # Sparkline tooltips carry the p90 tail beside the median.
+    assert "(p90 ${dur(ttaD.p90)}) to approval" in DASHBOARD_HTML
 
 
 def test_dashboard_renders_failures_by_category_panel() -> None:
