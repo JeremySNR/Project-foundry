@@ -1033,6 +1033,7 @@ async function loadMetrics() {
     if (!resp.ok) { el.style.display = "none"; return; }
     const m = await resp.json();
     const ttm = m.time_to_merge_seconds || {};
+    const tta = m.time_to_approval_seconds || {};
     const bands = (m.precision_by_confidence_band || []).map((b) => `
       <tr><td>${esc(b.band)}</td><td>${b.routed}</td><td>${b.merged}</td>
         <td>${Math.round(b.precision * 100)}%</td></tr>`).join("");
@@ -1046,6 +1047,7 @@ async function loadMetrics() {
       <span class="stat"><b>${m.escalations}</b> escalations</span>
       <span class="stat"><b>${dur(ttm.median)}</b> median to merge</span>
       <span class="stat"><b>${dur(ttm.p90)}</b> p90</span>
+      <span class="stat"><b>${dur(tta.median)}</b> median to approval</span>
       <span class="stat"><b>${m.total_cost_usd == null ? "-" : "$" + m.total_cost_usd}</b> agent spend</span>
       ${bands || priors ? `<details><summary>routing accuracy &amp; delivery memory</summary>
         ${bands ? `<table><tr><th>confidence band</th><th>routed</th><th>merged</th><th>precision</th></tr>${bands}</table>` : ""}
@@ -1150,6 +1152,7 @@ async function loadRepoDelivery() {
     const rows = repos.map((r) => {
       const cost = r.total_cost_usd == null ? "-" : "$" + r.total_cost_usd;
       const ttm = r.time_to_merge_seconds || {};
+      const tta = r.time_to_approval_seconds || {};
       return `<tr>
         <td>${esc(r.repo)}</td>
         <td class="num">${r.prs_shipped}</td>
@@ -1158,12 +1161,13 @@ async function loadRepoDelivery() {
         <td class="num">${Math.round(r.merge_rate * 100)}%</td>
         <td class="num">${r.retries_consumed}</td>
         <td class="num">${dur(ttm.median)}</td>
+        <td class="num">${dur(tta.median)}</td>
         <td class="num">${cost}</td>
       </tr>`;
     }).join("");
     el.innerHTML = `<details><summary>delivery by repo (90d) &mdash; where work ships, stalls, and spends</summary>
       <table><tr><th>repository</th><th>shipped</th><th>blocked</th><th>finished</th>
-        <th>merge rate</th><th>retries</th><th>median to merge</th><th>spend</th></tr>${rows}</table>
+        <th>merge rate</th><th>retries</th><th>median to merge</th><th>median to approval</th><th>spend</th></tr>${rows}</table>
     </details>`;
     el.style.display = "block";
   } catch (err) {
@@ -1188,6 +1192,7 @@ async function loadWorkTypeDelivery() {
     const rows = types.map((t) => {
       const cost = t.total_cost_usd == null ? "-" : "$" + t.total_cost_usd;
       const ttm = t.time_to_merge_seconds || {};
+      const tta = t.time_to_approval_seconds || {};
       return `<tr>
         <td>${esc(t.work_type)}</td>
         <td class="num">${t.prs_shipped}</td>
@@ -1196,12 +1201,13 @@ async function loadWorkTypeDelivery() {
         <td class="num">${Math.round(t.merge_rate * 100)}%</td>
         <td class="num">${t.retries_consumed}</td>
         <td class="num">${dur(ttm.median)}</td>
+        <td class="num">${dur(tta.median)}</td>
         <td class="num">${cost}</td>
       </tr>`;
     }).join("");
     el.innerHTML = `<details><summary>delivery by work type (90d) &mdash; do bugs ship while features stall?</summary>
       <table><tr><th>work type</th><th>shipped</th><th>blocked</th><th>finished</th>
-        <th>merge rate</th><th>retries</th><th>median to merge</th><th>spend</th></tr>${rows}</table>
+        <th>merge rate</th><th>retries</th><th>median to merge</th><th>median to approval</th><th>spend</th></tr>${rows}</table>
     </details>`;
     el.style.display = "block";
   } catch (err) {

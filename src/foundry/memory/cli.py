@@ -1126,6 +1126,14 @@ def _run_delivery(args: argparse.Namespace) -> None:
         )
     else:
         print("  time-to-merge     - (no merges)")
+    tta = report["time_to_approval_seconds"]
+    if tta["count"]:
+        print(
+            f"  time-to-approval  median {_fmt_age(tta['median'])}, "
+            f"p90 {_fmt_age(tta['p90'])} (n={tta['count']})"
+        )
+    else:
+        print("  time-to-approval  - (no approvals)")
 
     if report["blocks_by_reason"]:
         print("\n  blocks by reason:")
@@ -1191,14 +1199,16 @@ def _run_delivery_by_repo(args: argparse.Namespace) -> None:
     )
     print(
         f"{'repo':<40} {'shipped':<8} {'blocked':<8} {'merge%':<7} "
-        f"{'retries':<8} {'spend':<9} ttm median"
+        f"{'retries':<8} {'spend':<9} {'ttm median':<12} tta median"
     )
     for repo in repos:
         ttm = repo["time_to_merge_seconds"]
+        tta = repo["time_to_approval_seconds"]
         print(
             f"{repo['repo']:<40} {repo['prs_shipped']:<8} {repo['blocked']:<8} "
             f"{repo['merge_rate']:<7} {repo['retries_consumed']:<8} "
-            f"{_fmt_cost(repo['total_cost_usd']):<9} {_fmt_age(ttm['median'])}"
+            f"{_fmt_cost(repo['total_cost_usd']):<9} "
+            f"{_fmt_age(ttm['median']):<12} {_fmt_age(tta['median'])}"
         )
 
 
@@ -1221,14 +1231,16 @@ def _run_delivery_by_work_type(args: argparse.Namespace) -> None:
     )
     print(
         f"{'work type':<16} {'shipped':<8} {'blocked':<8} {'merge%':<7} "
-        f"{'retries':<8} {'spend':<9} ttm median"
+        f"{'retries':<8} {'spend':<9} {'ttm median':<12} tta median"
     )
     for wt in work_types:
         ttm = wt["time_to_merge_seconds"]
+        tta = wt["time_to_approval_seconds"]
         print(
             f"{wt['work_type']:<16} {wt['prs_shipped']:<8} {wt['blocked']:<8} "
             f"{wt['merge_rate']:<7} {wt['retries_consumed']:<8} "
-            f"{_fmt_cost(wt['total_cost_usd']):<9} {_fmt_age(ttm['median'])}"
+            f"{_fmt_cost(wt['total_cost_usd']):<9} "
+            f"{_fmt_age(ttm['median']):<12} {_fmt_age(tta['median'])}"
         )
 
 
