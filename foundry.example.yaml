@@ -435,6 +435,16 @@ auth:
   #     security-team: ["security"]
   #     qa-guild: ["qa"]
   #
+  #   # --- multi-tenancy / row-level isolation (issue #156) ---
+  #   # Set org_claim to the VERIFIED token claim naming the caller's org to turn
+  #   # on row-level isolation: every read and write in that request is scoped to
+  #   # that org, so one tenant can never read or write another tenant's rows.
+  #   # The org is taken only from the cryptographically-verified token, never the
+  #   # request body (invariant #5). UNSET (the default) => single-tenant: every
+  #   # row lives under the "default" org and behaviour is unchanged.
+  #   # Env override: FOUNDRY_OIDC_ORG_CLAIM.
+  #   org_claim: "org"         # verified claim naming the caller's org/tenant
+  #
   #   # --- dashboard browser login / SSO (issue #34) ---
   #   # Lets an operator sign in to /dashboard via your IdP (OAuth2
   #   # authorization-code + PKCE) instead of pasting an API token. Builds on the

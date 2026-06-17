@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 from sqlalchemy import create_engine, event, select
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, sessionmaker, with_loader_criteria
 from sqlalchemy.pool import StaticPool
 
 
@@ -67,6 +67,65 @@ def _assign_audit_sequences(session, flush_context, instances) -> None:
             next_seq += 1
 
 
+def _stamp_tenant_org(session, flush_context, instances) -> None:
+    """Stamp the active org onto new tenant-scoped rows (issue #156).
+
+    Every row in a tenant-scoped table carries an ``org_id``. The value comes
+    from the current tenant context (``db.tenant``), which a request handler
+    binds from the *authenticated principal* (invariant #5) and which defaults
+    to the single default org otherwise — so a single-tenant deployment stamps
+    everything under that one org and is byte-for-byte unchanged. Done at flush
+    time so every write path gets it for free, before the column's own default
+    would apply. Imported lazily to avoid an import cycle (``models`` imports
+    this module).
+    """
+    from foundry.db.tenant import current_org_id
+
+    from .models import TENANT_SCOPED_MODELS
+
+    org = current_org_id()
+    for obj in session.new:
+        if isinstance(obj, TENANT_SCOPED_MODELS) and getattr(obj, "org_id", None) is None:
+            obj.org_id = org
+
+
+def _apply_tenant_filter(orm_execute_state) -> None:
+    """Filter every ORM SELECT to the current org (issue #156).
+
+    A ``with_loader_criteria`` per tenant-scoped entity restricts the statement
+    to ``org_id == current_org_id()`` wherever that entity appears — top-level,
+    a relationship load, or an aliased join — so a unit of work scoped to one
+    org can never read another org's rows. It is applied to SELECTs *and* to
+    ORM-enabled UPDATE/DELETE statements, so a query-scoped bulk write can't
+    cross the org boundary either (an ORM object update/delete is already safe,
+    since the object could only have been loaded in-org). Column refreshes of an
+    already-loaded object are skipped (applying criteria there is invalid and
+    the object is already org-scoped). With the default org in scope
+    (single-tenant) the predicate matches every row, so behaviour is unchanged.
+    Imported lazily to avoid an import cycle.
+    """
+    if orm_execute_state.is_column_load:
+        return
+    if not (
+        orm_execute_state.is_select
+        or orm_execute_state.is_update
+        or orm_execute_state.is_delete
+    ):
+        return
+
+    from foundry.db.tenant import current_org_id
+
+    from .models import TENANT_SCOPED_MODELS
+
+    org = current_org_id()
+    orm_execute_state.statement = orm_execute_state.statement.options(
+        *(
+            with_loader_criteria(model, model.org_id == org, include_aliases=True)
+            for model in TENANT_SCOPED_MODELS
+        )
+    )
+
+
 def make_engine(url: str | None = None):
     url = url or os.environ.get("FOUNDRY_DATABASE_URL", "sqlite+pysqlite:///:memory:")
     kwargs: dict = {"future": True}
@@ -81,7 +140,11 @@ def make_engine(url: str | None = None):
 
 def make_session_factory(engine):
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    # Tenant org stamped before sequences/hashes so a new row already carries its
+    # org when the audit chain is computed (issue #156).
+    event.listen(factory, "before_flush", _stamp_tenant_org)
     event.listen(factory, "before_flush", _assign_audit_sequences)
+    event.listen(factory, "do_orm_execute", _apply_tenant_filter)
     return factory
 
 

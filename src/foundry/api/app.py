@@ -105,6 +105,7 @@ from .oidc_login import (
 from .sessions import SessionSigner
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
+from .tenant import TenantMiddleware, resolve_request_org
 from .security import (
     is_authorised_approver,
     parse_command,
@@ -225,6 +226,7 @@ def create_app(
     oidc_subject_claim: str = "email",
     oidc_group_claim: str = "groups",
     oidc_group_role_map: Mapping[str, Iterable[str]] | None = None,
+    oidc_org_claim: str | None = None,
     oidc_login: OidcLogin | None = None,
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
@@ -287,6 +289,11 @@ def create_app(
     # config, never request payload (invariant #5).
     app.state.oidc_subject_claim = oidc_subject_claim
     app.state.oidc_group_claim = oidc_group_claim
+    # Multi-tenancy (issue #156): the verified claim naming the caller's org. When
+    # set and present on an OIDC token, the request's reads/writes are isolated to
+    # that org; absent => the single default org (single-tenant, unchanged). Org
+    # is bound only from the verified token, never request payload (invariant #5).
+    app.state.oidc_org_claim = oidc_org_claim
     app.state.oidc_group_role_map = {
         group: {ApprovalRole(r) for r in roles}
         for group, roles in (oidc_group_role_map or {}).items()
@@ -389,6 +396,21 @@ def create_app(
         }
     else:
         app.state.rate_limiters = {}
+
+    # Bind the active org for every request before any handler/DB session runs
+    # (issue #156). Registered first, which Starlette makes the *outermost*
+    # middleware (it wraps user middleware in reverse), so the org is set in the
+    # request's own event-loop task and propagates into every downstream handler,
+    # including the ungated reads. Derives the org only from the verified OIDC
+    # token; default (single-tenant) otherwise.
+    app.add_middleware(
+        TenantMiddleware,
+        resolve_org=lambda scope: resolve_request_org(
+            scope,
+            verifier=app.state.oidc_verifier,
+            org_claim=app.state.oidc_org_claim,
+        ),
+    )
 
     @app.middleware("http")
     async def _rate_limit(request: Request, call_next):
@@ -2598,6 +2620,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         oidc_group_role_map={
             group: roles for group, roles in settings.oidc_group_role_map
         },
+        oidc_org_claim=settings.oidc_org_claim,
         oidc_login=oidc_login,
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,

@@ -148,6 +148,13 @@ class Settings:
     oidc_subject_claim: str = "email"
     oidc_group_claim: str = "groups"
     oidc_group_role_map: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Multi-tenancy (issue #156): the verified OIDC claim that names the caller's
+    # org. When set and present on the token, every read/write in that request is
+    # isolated to that org; absent (the default), the request operates in the
+    # single default org, so a single-tenant deployment is unchanged. The org is
+    # taken only from the cryptographically-verified token, never the request
+    # payload (invariant #5).
+    oidc_org_claim: str | None = None
 
     # --- OIDC browser login / SSO for the dashboard (issue #34) ---
     # Authorization-code-with-PKCE login so a browser user signs in with the IdP
@@ -1146,6 +1153,8 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["oidc_subject_claim"] = str(oidc["subject_claim"])
     if "group_claim" in oidc:
         out["oidc_group_claim"] = str(oidc["group_claim"])
+    if "org_claim" in oidc:
+        out["oidc_org_claim"] = str(oidc["org_claim"]) or None
     if "group_role_map" in oidc:
         out["oidc_group_role_map"] = tuple(
             (str(group), tuple(str(r) for r in (roles or [])))
@@ -1247,6 +1256,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_OIDC_JWKS_URI": "oidc_jwks_uri",
         "FOUNDRY_OIDC_SUBJECT_CLAIM": "oidc_subject_claim",
         "FOUNDRY_OIDC_GROUP_CLAIM": "oidc_group_claim",
+        "FOUNDRY_OIDC_ORG_CLAIM": "oidc_org_claim",
         "FOUNDRY_OIDC_CLIENT_ID": "oidc_client_id",
         "FOUNDRY_OIDC_CLIENT_SECRET": "oidc_client_secret",
         "FOUNDRY_OIDC_AUTHORIZATION_ENDPOINT": "oidc_authorization_endpoint",
