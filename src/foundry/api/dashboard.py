@@ -1449,6 +1449,8 @@ async function loadPolicy() {
       ["per-repo forbidden paths", policyList(p.repo_forbidden_globs, (v) => esc((v || []).join(", ")))],
       ["per-repo required roles", policyList(p.repo_required_roles, (v) => esc((v || []).join(", ")))],
       ["per-path required roles", policyList(p.path_required_roles, (v) => esc((v || []).join(", ")))],
+      ["sensitive-path globs (escalate to area roles)", policyList(p.sensitive_path_globs, (v) => esc((v || []).join(", ")))],
+      ["extra sensitive keywords (ticket text)", policyList(p.extra_sensitive_keywords, (v) => esc((v || []).join(", ")))],
       ["change-freeze windows", freezes.length ? freezes.map((w) => `<div class="kv">${esc(w)}</div>`).join("") : '<span class="kv">none</span>'],
       ["max agent retries", esc(p.max_agent_retries)],
       ["max cost per run", esc(cap)],
