@@ -129,6 +129,15 @@ class Settings:
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
+    # --- SCIM 2.0 provisioning credential (secret: env; issue #157) ---
+    # The bearer token an IdP presents to the /scim/v2 user/group provisioning
+    # endpoints. Unset => the SCIM surface is disabled (403) and approval-role
+    # resolution never consults the provisioned directory, so a non-SCIM
+    # deployment is byte-for-byte unchanged. A machine-to-machine credential,
+    # distinct from ``api_token``; the committed ``oidc_group_role_map`` still
+    # owns the group->role mapping, so SCIM provisions membership, never roles.
+    scim_bearer_token: str | None = None
+
     # --- OIDC API auth (behaviour: yaml; not secrets - public IdP metadata) ---
     # Optional, additive second credential path (issue #34): when issuer +
     # audience + jwks_uri are all set, token-gated endpoints also accept a valid
@@ -938,6 +947,11 @@ class Settings:
         return bool(self.oidc_issuer and self.oidc_audience and self.oidc_jwks_uri)
 
     @property
+    def scim_enabled(self) -> bool:
+        """True when the SCIM provisioning surface is enabled (issue #157)."""
+        return bool(self.scim_bearer_token)
+
+    @property
     def oidc_login_configured(self) -> bool:
         """True when the non-secret browser-login parts are all set.
 
@@ -1259,6 +1273,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_SLACK_BOT_TOKEN": "slack_bot_token",
         "FOUNDRY_SLACK_CHANNEL": "slack_channel",
         "FOUNDRY_API_TOKEN": "api_token",
+        "FOUNDRY_SCIM_BEARER_TOKEN": "scim_bearer_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
         "FOUNDRY_AGENT_AUTO_FALLBACK": "agent_auto_fallback",
         "FOUNDRY_TRACKER_PROVIDER": "tracker_provider",
