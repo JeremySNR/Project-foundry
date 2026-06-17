@@ -134,6 +134,8 @@ def test_metrics_empty_database(client) -> None:
     assert body["runs_finished"] == 0
     assert body["prs_shipped"] == 0
     assert body["time_to_merge_seconds"]["median"] is None
+    assert body["time_to_approval_seconds"]["count"] == 0
+    assert body["time_to_approval_seconds"]["median"] is None
     assert body["precision_by_confidence_band"] == []
     assert body["top_priors"] == []
 
@@ -194,6 +196,13 @@ def test_metrics_counts_a_merge_and_a_block(client) -> None:
     assert body["blocks_by_reason"] == {"pr_closed_unmerged": 1}
     assert body["time_to_merge_seconds"]["count"] == 1
     assert body["time_to_merge_seconds"]["median"] >= 0
+
+    # Both runs were approved by a human before dispatch, so the approval-latency
+    # distribution covers both - the merged run *and* the later-blocked one
+    # (approval happens before the block), unlike time-to-merge which only the
+    # merged run contributes to.
+    assert body["time_to_approval_seconds"]["count"] == 2
+    assert body["time_to_approval_seconds"]["median"] >= 0
 
     # Both runs routed at confidence 90 (explicit repo label): one band,
     # 2 routed, 1 merged.

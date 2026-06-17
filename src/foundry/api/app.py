@@ -1121,7 +1121,8 @@ def create_app(
     @app.get("/metrics/delivery")
     def metrics_delivery(request: Request, days: int = 90) -> dict[str, Any]:
         """Delivery-memory aggregates: PRs shipped, blocks, time-to-merge,
-        cost, and routing precision by confidence band. Token-gated like the
+        time-to-approval (intake->sign-off latency for approved runs), cost,
+        and routing precision by confidence band. Token-gated like the
         timeline - per-team cost and routing history are more sensitive than
         the bare statuses on ``GET /runs``.
         """

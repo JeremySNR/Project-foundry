@@ -146,6 +146,24 @@ def _band(confidence: int) -> str:
     return f"{low}-{min(low + 9, 100)}"
 
 
+def _approval_seconds(row: FoundryRunOutcome) -> int | None:
+    """Seconds from run creation (intake) to the recorded approval.
+
+    Defined only for runs that reached human approval (``approved_at`` set);
+    runs blocked / rejected / still parked before approval have no approval
+    latency and are excluded - the approval-side mirror of how
+    ``time_to_merge_seconds`` is defined only for merged runs. In a system whose
+    whole product is the human approval gate, this is the governance-bottleneck
+    signal the live approval queue (`approval_queue`) can't give historically:
+    "once work is ready, how long does a human take to sign it off?". Both
+    timestamps come from the same timezone-aware column, so they are
+    consistently naive (SQLite) or aware (Postgres) and subtract cleanly.
+    """
+    if row.approved_at is None or row.created_at_run is None:
+        return None
+    return max(int((row.approved_at - row.created_at_run).total_seconds()), 0)
+
+
 def delivery_metrics(session, *, since: datetime) -> dict:
     """Aggregate delivery outcomes for runs that finished at/after ``since``."""
     rows: list[FoundryRunOutcome] = (
@@ -156,6 +174,7 @@ def delivery_metrics(session, *, since: datetime) -> dict:
 
     outcome_counts: dict[str, int] = {}
     merge_times: list[int] = []
+    approval_times: list[int] = []
     retries = escalations = ci_failures = 0
     total_cost = 0.0
     cost_seen = False
@@ -172,6 +191,9 @@ def delivery_metrics(session, *, since: datetime) -> dict:
             cost_seen = True
         if row.time_to_merge_seconds is not None:
             merge_times.append(row.time_to_merge_seconds)
+        approval_seconds = _approval_seconds(row)
+        if approval_seconds is not None:
+            approval_times.append(approval_seconds)
         if row.outcome == "blocked":
             reason = row.blocked_reason_category or "unknown"
             blocks_by_reason[reason] = blocks_by_reason.get(reason, 0) + 1
@@ -215,6 +237,7 @@ def delivery_metrics(session, *, since: datetime) -> dict:
         )
 
     merge_times.sort()
+    approval_times.sort()
     precision_by_band = [
         {
             "band": band,
@@ -255,6 +278,11 @@ def delivery_metrics(session, *, since: datetime) -> dict:
             "count": len(merge_times),
             "median": _percentile(merge_times, 0.5),
             "p90": _percentile(merge_times, 0.9),
+        },
+        "time_to_approval_seconds": {
+            "count": len(approval_times),
+            "median": _percentile(approval_times, 0.5),
+            "p90": _percentile(approval_times, 0.9),
         },
         "blocks_by_reason": blocks_by_reason,
         "blocked_superseded_by_merged_run": superseded,
@@ -310,6 +338,7 @@ def delivery_by_repo(session, *, since: datetime) -> dict:
                 "total_cost": 0.0,
                 "cost_seen": False,
                 "merge_times": [],
+                "approval_times": [],
                 "runs_finished": 0,
             }
         agg["runs_finished"] += 1
@@ -322,10 +351,14 @@ def delivery_by_repo(session, *, since: datetime) -> dict:
             agg["cost_seen"] = True
         if row.time_to_merge_seconds is not None:
             agg["merge_times"].append(row.time_to_merge_seconds)
+        approval_seconds = _approval_seconds(row)
+        if approval_seconds is not None:
+            agg["approval_times"].append(approval_seconds)
 
     out_repos = []
     for repo, agg in repos.items():
         merge_times = sorted(agg["merge_times"])
+        approval_times = sorted(agg["approval_times"])
         runs = agg["runs_finished"]
         shipped = agg["outcomes"].get("merged", 0)
         out_repos.append(
@@ -349,6 +382,11 @@ def delivery_by_repo(session, *, since: datetime) -> dict:
                     "count": len(merge_times),
                     "median": _percentile(merge_times, 0.5),
                     "p90": _percentile(merge_times, 0.9),
+                },
+                "time_to_approval_seconds": {
+                    "count": len(approval_times),
+                    "median": _percentile(approval_times, 0.5),
+                    "p90": _percentile(approval_times, 0.9),
                 },
             }
         )
@@ -404,6 +442,7 @@ def delivery_by_work_type(session, *, since: datetime) -> dict:
                 "total_cost": 0.0,
                 "cost_seen": False,
                 "merge_times": [],
+                "approval_times": [],
                 "runs_finished": 0,
             }
         agg["runs_finished"] += 1
@@ -416,10 +455,14 @@ def delivery_by_work_type(session, *, since: datetime) -> dict:
             agg["cost_seen"] = True
         if row.time_to_merge_seconds is not None:
             agg["merge_times"].append(row.time_to_merge_seconds)
+        approval_seconds = _approval_seconds(row)
+        if approval_seconds is not None:
+            agg["approval_times"].append(approval_seconds)
 
     out_types = []
     for work_type, agg in types.items():
         merge_times = sorted(agg["merge_times"])
+        approval_times = sorted(agg["approval_times"])
         runs = agg["runs_finished"]
         shipped = agg["outcomes"].get("merged", 0)
         out_types.append(
@@ -443,6 +486,11 @@ def delivery_by_work_type(session, *, since: datetime) -> dict:
                     "count": len(merge_times),
                     "median": _percentile(merge_times, 0.5),
                     "p90": _percentile(merge_times, 0.9),
+                },
+                "time_to_approval_seconds": {
+                    "count": len(approval_times),
+                    "median": _percentile(approval_times, 0.5),
+                    "p90": _percentile(approval_times, 0.9),
                 },
             }
         )

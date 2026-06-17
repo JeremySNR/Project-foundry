@@ -47,6 +47,7 @@ def _add_outcome(
     jobs_count: int = 1,
     cost_usd: float | None = None,
     time_to_merge_seconds: int | None = None,
+    approval_seconds: int | None = None,
     routed_confidence: int | None = None,
     blocked_reason_category: str | None = None,
     escalations_count: int = 0,
@@ -56,6 +57,7 @@ def _add_outcome(
     global _counter
     _counter += 1
     rid = f"r-{_counter}"
+    created_at_run = completed_at - timedelta(hours=1)
     session.add(
         FoundryRun(
             id=rid,
@@ -75,7 +77,12 @@ def _add_outcome(
             work_type=work_type,
             routed_confidence=routed_confidence,
             trigger_type="label",
-            created_at_run=completed_at - timedelta(hours=1),
+            created_at_run=created_at_run,
+            approved_at=(
+                created_at_run + timedelta(seconds=approval_seconds)
+                if approval_seconds is not None
+                else None
+            ),
             completed_at=completed_at,
             jobs_count=jobs_count,
             cost_usd=cost_usd,
@@ -111,6 +118,7 @@ def test_delivery_empty_database(monkeypatch, capsys, db_url) -> None:
     # No run reported cost => no conjured $0.
     assert "spend             -" in out
     assert "time-to-merge     - (no merges)" in out
+    assert "time-to-approval  - (no approvals)" in out
 
 
 def test_delivery_aggregates_outcomes_cost_and_precision(monkeypatch, capsys, db_url) -> None:
@@ -122,9 +130,10 @@ def test_delivery_aggregates_outcomes_cost_and_precision(monkeypatch, capsys, db
             cost_usd=1.50,
             jobs_count=2,  # one retry consumed
             time_to_merge_seconds=3600,
+            approval_seconds=1800,
             routed_confidence=85,
         )
-        _add_outcome(session, outcome="merged", routed_confidence=85)
+        _add_outcome(session, outcome="merged", approval_seconds=1800, routed_confidence=85)
         _add_outcome(
             session,
             outcome="blocked",
@@ -142,6 +151,9 @@ def test_delivery_aggregates_outcomes_cost_and_precision(monkeypatch, capsys, db
     assert "spend             $1.5" in out
     # time-to-merge surfaces when there is at least one merge.
     assert "time-to-merge     median 1h00m" in out
+    # time-to-approval surfaces when at least one run was approved (both merged
+    # runs were approved 30m after intake).
+    assert "time-to-approval  median 30m00s" in out
     # blocks-by-reason breakdown + supersession line.
     assert "forbidden_path" in out
     assert "(superseded by later merge)" in out
