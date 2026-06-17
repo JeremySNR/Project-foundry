@@ -42,10 +42,32 @@ from foundry.schemas.common import (
 )
 
 from .base import Base
+from .tenant import DEFAULT_ORG_ID
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class TenantScoped:
+    """Mixin giving a table its ``org_id`` for row-level isolation (issue #156).
+
+    Every tenant-scoped table inherits this column. It is ``NOT NULL`` with a
+    ``server_default`` of :data:`~foundry.db.tenant.DEFAULT_ORG_ID` so existing
+    rows (and any raw insert) land in the default org, and a Python-side default
+    as a safety net. In practice the value is stamped from the active tenant
+    context at flush time (``db/base.py``), so a row created while serving an
+    authenticated org's request is written under *that* org. Indexed because
+    every tenant-scoped read filters on it.
+    """
+
+    org_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default=DEFAULT_ORG_ID,
+        server_default=DEFAULT_ORG_ID,
+        index=True,
+    )
 
 
 class ArtifactType(str, enum.Enum):
@@ -98,17 +120,21 @@ _ACTIVE_STATUS_PREDICATE = "status IN ({})".format(
 )
 
 
-class FoundryRun(Base):
+class FoundryRun(TenantScoped, Base):
     __tablename__ = "foundry_runs"
 
     # NOTE: linear_issue_id is deliberately not unique on its own - a ticket may
     # be re-analysed after clarification, rejection or failure. "At most one
     # *active* run per issue" is enforced by the partial unique index below
     # (migration 0006 on Postgres; create_all on SQLite dev), which backstops
-    # the intake pre-check against concurrent webhook deliveries.
+    # the intake pre-check against concurrent webhook deliveries. Scoped by
+    # org_id (issue #156) so two tenants can each have an active run for the
+    # same upstream issue id; within one org the constraint is unchanged (and a
+    # single-tenant deployment, all rows under the default org, is identical).
     __table_args__ = (
         Index(
             "uq_foundry_runs_one_active_per_issue",
+            "org_id",
             "linear_issue_id",
             unique=True,
             sqlite_where=text(_ACTIVE_STATUS_PREDICATE),
@@ -171,7 +197,7 @@ class FoundryRun(Base):
     )
 
 
-class FoundryArtifact(Base):
+class FoundryArtifact(TenantScoped, Base):
     __tablename__ = "foundry_artifacts"
     __table_args__ = (Index("idx_artifact_run_type", "run_id", "artifact_type"),)
 
@@ -189,7 +215,7 @@ class FoundryArtifact(Base):
     run: Mapped[FoundryRun] = relationship(back_populates="artifacts")
 
 
-class FoundryAuditEvent(Base):
+class FoundryAuditEvent(TenantScoped, Base):
     __tablename__ = "foundry_audit_events"
     # The per-run sequence is the audit trail's guaranteed order. A unique
     # constraint makes a duplicate sequence (e.g. two unlocked sessions both
@@ -226,7 +252,7 @@ class FoundryAuditEvent(Base):
     run: Mapped[FoundryRun] = relationship(back_populates="audit_events")
 
 
-class FoundryPolicyDecision(Base):
+class FoundryPolicyDecision(TenantScoped, Base):
     __tablename__ = "foundry_policy_decisions"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -243,7 +269,7 @@ class FoundryPolicyDecision(Base):
     run: Mapped[FoundryRun] = relationship(back_populates="policy_decisions")
 
 
-class FoundryAgentJob(Base):
+class FoundryAgentJob(TenantScoped, Base):
     __tablename__ = "foundry_agent_jobs"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -271,7 +297,7 @@ class FoundryAgentJob(Base):
     run: Mapped[FoundryRun] = relationship(back_populates="agent_jobs")
 
 
-class FoundryRunOutcome(Base):
+class FoundryRunOutcome(TenantScoped, Base):
     """Delivery memory: one denormalized row per finished run.
 
     Every field is *derived* from rows that already exist (audit events, agent
@@ -343,7 +369,7 @@ class FoundryRunOutcome(Base):
     run: Mapped[FoundryRun] = relationship()
 
 
-class FoundryWebhookDelivery(Base):
+class FoundryWebhookDelivery(TenantScoped, Base):
     """Durable, bounded webhook idempotency / replay guard.
 
     One row per processed inbound delivery. The unique ``(provider,
@@ -377,7 +403,7 @@ class FoundryWebhookDelivery(Base):
     )
 
 
-class FoundryRepoCatalogEntry(Base):
+class FoundryRepoCatalogEntry(TenantScoped, Base):
     """One row per repository in the org: the metadata the enricher scores against.
 
     Metadata plus, when code-facts sync is enabled, narrowly-scoped code facts:
@@ -413,3 +439,20 @@ class FoundryRepoCatalogEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+# Every table carrying an ``org_id`` (issue #156). The session machinery in
+# ``db/base.py`` reads this tuple to stamp the active org on new rows at flush
+# time and to filter every ORM SELECT to the current org, so a unit of work
+# scoped to one tenant can neither read nor write another tenant's rows. Adding
+# a new tenant-scoped table means adding it here (and inheriting TenantScoped).
+TENANT_SCOPED_MODELS: tuple[type[TenantScoped], ...] = (
+    FoundryRun,
+    FoundryArtifact,
+    FoundryAuditEvent,
+    FoundryPolicyDecision,
+    FoundryAgentJob,
+    FoundryRunOutcome,
+    FoundryWebhookDelivery,
+    FoundryRepoCatalogEntry,
+)
