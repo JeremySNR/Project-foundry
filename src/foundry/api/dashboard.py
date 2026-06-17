@@ -22,7 +22,14 @@ trends, issue #37)
 and a failures-by-repo trend strip (each routed repo's failures-by-week series
 as a sparkline on one shared scale - "is *this repo's* failure rate climbing or
 fading over time?", the in-page render of GET /metrics/failures/by-repo/trends,
-the by-repo dimension of the failure trend in failure-red, issue #37),
+the by-repo dimension of the failure trend in failure-red, issue #37)
+and a failures-by-work-type trend strip (each work type's failures-by-week
+series as a sparkline on one shared scale - "is *this kind of work's* failure
+rate climbing or fading over time, are bugs failing more while features ship?",
+the in-page render of GET /metrics/failures/by-work-type/trends, the
+by-work-type dimension of the failure trend in failure-red - completing the
+failure-trend strip set the way the delivery surface has both by-repo and
+by-work-type trend strips, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
@@ -41,6 +48,7 @@ agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/failures/trends``,
 ``GET /metrics/failures/by-category/trends``,
 ``GET /metrics/failures/by-repo/trends``,
+``GET /metrics/failures/by-work-type/trends``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
 ``GET /metrics/delivery/by-work-type``,
@@ -202,18 +210,23 @@ DASHBOARD_HTML = """<!doctype html>
     background: var(--green); border-radius: 1px;
   }
   #worktype-trends .spark i.empty { height: 2px; background: var(--border); }
-  #failure-category-trends .prov {
+  #failure-category-trends .prov, #failure-repo-trends .prov,
+  #failure-work-type-trends .prov {
     display: flex; align-items: center; gap: 12px; padding: 4px 0;
   }
-  #failure-category-trends .prov .name { min-width: 220px; }
-  #failure-category-trends .spark {
+  #failure-category-trends .prov .name, #failure-repo-trends .prov .name,
+  #failure-work-type-trends .prov .name { min-width: 220px; }
+  #failure-category-trends .spark, #failure-repo-trends .spark,
+  #failure-work-type-trends .spark {
     display: inline-flex; align-items: flex-end; gap: 2px; height: 24px;
   }
-  #failure-category-trends .spark i {
+  #failure-category-trends .spark i, #failure-repo-trends .spark i,
+  #failure-work-type-trends .spark i {
     display: inline-block; width: 6px; min-height: 1px;
     background: var(--red); border-radius: 1px;
   }
-  #failure-category-trends .spark i.empty { height: 2px; background: var(--border); }
+  #failure-category-trends .spark i.empty, #failure-repo-trends .spark i.empty,
+  #failure-work-type-trends .spark i.empty { height: 2px; background: var(--border); }
   #failure-trends table, #failure-categories table, #failure-repos table,
   #failure-work-types table {
     border-collapse: collapse; margin: 8px 0 2px; font-size: 12px;
@@ -292,6 +305,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="failure-trends"></div>
 <div id="failure-category-trends"></div>
 <div id="failure-repo-trends"></div>
+<div id="failure-work-type-trends"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -940,6 +954,51 @@ async function loadFailuresByRepoTrends() {
   }
 }
 
+async function loadFailuresByWorkTypeTrends() {
+  const el = $("#failure-work-type-trends");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/failures/by-work-type/trends?days=30&bucket=week", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const workTypes = m.work_types || [];
+    if (!workTypes.length) { el.style.display = "none"; return; }  // nothing failed recently: hide
+    // Scale every work type's bars to one shared max (failures-per-week) so the
+    // sparklines are comparable across kinds of work, not each normalised to its
+    // own peak - the same shared-scale rule the by-category / by-repo failure
+    // trends and the delivery trend strips use, so a spiking work type stands
+    // out, in failure-red.
+    const maxCount = Math.max(1, ...workTypes.flatMap(
+      (w) => (w.series || []).map((p) => p.count)));
+    const rows = workTypes.map((w) => {
+      const bars = (w.series || []).map((p) => {
+        const when = fmtPeriod(p.period_start);
+        if (!p.count) {
+          return `<i class="empty" title="${esc(when)}: no failures"></i>`;
+        }
+        const h = Math.max(2, Math.round((p.count / maxCount) * 24));
+        return `<i style="height:${h}px" title="${esc(when)}: ${p.count} failed (${p.blocked} blocked, ${p.failed} execution-failed)"></i>`;
+      }).join("");
+      return `<div class="prov">
+        <span class="name">${esc(w.work_type)}
+          <span class="kv">${w.count} total &middot; ${w.blocked} blocked &middot; ${w.failed} failed</span></span>
+        <span class="spark">${bars}</span></div>`;
+    }).join("");
+    el.innerHTML = `<details><summary>failures by work type, trend &mdash; failures by week (${m.days}d), is this kind of work's failure rate climbing or fading? are bugs failing more while features ship?</summary>
+      ${rows}
+      <div class="kv">each bar = one week; height = failures (shared scale across work types)</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadMetrics() {
   const el = $("#metrics");
   if (!hasAuth()) {
@@ -1406,6 +1465,7 @@ function refresh() {
   loadFailureTrends();
   loadFailureCategoryTrends();
   loadFailuresByRepoTrends();
+  loadFailuresByWorkTypeTrends();
   loadMetrics();
   loadTrends();
   loadAgents();
