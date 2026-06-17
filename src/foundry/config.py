@@ -332,6 +332,19 @@ class Settings:
     # OPA decision endpoint base URL (e.g. http://opa:8181). Required when
     # policy_provider == "opa".
     policy_opa_url: str | None = None
+    # Live user-loadable policy bundle (issue #154): a path to a separately
+    # authored bundle (same ``policy:``/``risk:`` knobs as this file) that is
+    # merged **on top of** the resolved config at load as a strictly-additive
+    # overlay - the base config + built-in gate rules remain a non-overridable
+    # floor, so the bundle can only ever make the gate *stricter* (more protected
+    # paths, more required approvals, higher confidence/approval thresholds,
+    # tighter caps, narrower autonomous-retry triggers), never weaker. See
+    # ``policy/overlay.py``. Loaded from a configured path, never request input
+    # (invariant #5); changes only knob *values* both backends already read, so
+    # there is no Python/Rego lock-step concern (invariant #2). None (default) =
+    # no overlay, byte-for-byte the historical behaviour. A configured-but-missing
+    # bundle, or one that would weaken the floor, fails loud at load.
+    policy_bundle_path: str | None = None
     repo_confidence_threshold: int = 70
     max_files_changed: int = 12
     forbidden_globs: tuple[str, ...] = DEFAULT_FORBIDDEN_GLOBS
@@ -485,6 +498,15 @@ class Settings:
         if path is not None and Path(path).exists():
             settings = settings._with(_from_yaml(Path(path)))
         settings = settings._with(_from_env(env or os.environ))
+        # A configured user policy bundle (issue #154) is merged on top of the
+        # resolved config as a strictly-additive overlay before validation, so the
+        # merged result is what gets validated and what the gate runs against. The
+        # overlay can only ever make the gate stricter (the base remains a
+        # non-overridable floor); see policy/overlay.py.
+        if settings.policy_bundle_path:
+            from foundry.policy.overlay import apply_policy_bundle
+
+            settings = apply_policy_bundle(settings)
         settings._validate()
         return settings
 
@@ -971,6 +993,9 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["policy_provider"] = policy["provider"]
     if "opa_url" in policy:
         out["policy_opa_url"] = policy["opa_url"]
+    if "bundle_path" in policy:
+        raw_bundle = policy["bundle_path"]
+        out["policy_bundle_path"] = None if raw_bundle is None else str(raw_bundle)
     if "repo_confidence_threshold" in policy:
         out["repo_confidence_threshold"] = int(policy["repo_confidence_threshold"])
     if "max_files_changed" in policy:
@@ -1216,6 +1241,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_CONTEXT_ORG": "context_org",
         "FOUNDRY_POLICY_PROVIDER": "policy_provider",
         "FOUNDRY_POLICY_OPA_URL": "policy_opa_url",
+        "FOUNDRY_POLICY_BUNDLE_PATH": "policy_bundle_path",
         "FOUNDRY_OIDC_ISSUER": "oidc_issuer",
         "FOUNDRY_OIDC_AUDIENCE": "oidc_audience",
         "FOUNDRY_OIDC_JWKS_URI": "oidc_jwks_uri",
