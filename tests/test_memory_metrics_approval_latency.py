@@ -26,8 +26,11 @@ from foundry.memory.metrics import (
     UNCLASSIFIED_WORK_TYPE_LABEL,
     UNROUTED_REPO_LABEL,
     delivery_by_repo,
+    delivery_by_repo_trends,
     delivery_by_work_type,
+    delivery_by_work_type_trends,
     delivery_metrics,
+    delivery_trends,
 )
 from foundry.schemas.common import RunStatus
 
@@ -166,3 +169,101 @@ def test_by_work_type_carries_per_type_approval_latency(session_factory) -> None
     assert by_type["bug"]["median"] == 120
     assert by_type["feature"] == {"count": 1, "median": 900, "p90": 900}
     assert by_type[UNCLASSIFIED_WORK_TYPE_LABEL]["count"] == 0
+
+
+# --- over-time trend cuts: the "is sign-off getting slower week over week?" view
+
+
+def test_trends_carry_per_period_approval_latency(session_factory) -> None:
+    """delivery_trends buckets approval latency over time, the over-time
+    complement of the point-in-time distribution: two approved runs this week,
+    one approved run two weeks ago, and a zero-filled gap week between them."""
+    with session_factory() as session:
+        _add_outcome(session, outcome="merged", completed_at=NOW, approval_seconds=3600)
+        _add_outcome(session, outcome="merged", completed_at=NOW, approval_seconds=7200)
+        _add_outcome(
+            session,
+            outcome="merged",
+            completed_at=NOW - timedelta(days=14),
+            approval_seconds=600,
+        )
+        report = delivery_trends(session, since=NOW - timedelta(days=90), bucket="week")
+
+    periods = report["periods"]
+    # Weeks start Monday. NOW is Wed 2026-06-10 -> week of Mon 2026-06-08;
+    # two weeks earlier -> Mon 2026-05-25; the gap week is filled.
+    assert [p["period_start"] for p in periods] == [
+        "2026-05-25T00:00:00+00:00",
+        "2026-06-01T00:00:00+00:00",
+        "2026-06-08T00:00:00+00:00",
+    ]
+    earliest, gap, latest = periods
+    assert earliest["time_to_approval_seconds"] == {"count": 1, "median": 600, "p90": 600}
+    # The zero-filled gap week reports an empty distribution, never a conjured 0.
+    assert gap["time_to_approval_seconds"] == {"count": 0, "median": None, "p90": None}
+    # _percentile([3600, 7200], 0.5) -> index 0; 0.9 -> index 1.
+    assert latest["time_to_approval_seconds"] == {
+        "count": 2,
+        "median": 3600,
+        "p90": 7200,
+    }
+
+
+def test_trend_period_excludes_unapproved_runs(session_factory) -> None:
+    """A run that never reached approval contributes to the period's run/ship
+    counts but not its approval-latency distribution - the same exclusion as the
+    point-in-time cut."""
+    with session_factory() as session:
+        _add_outcome(session, outcome="merged", completed_at=NOW, approval_seconds=1800)
+        _add_outcome(session, outcome="blocked", completed_at=NOW, approval_seconds=None)
+        report = delivery_trends(session, since=NOW - timedelta(days=7), bucket="week")
+
+    latest = report["periods"][-1]
+    assert latest["runs_finished"] == 2
+    assert latest["time_to_approval_seconds"] == {"count": 1, "median": 1800, "p90": 1800}
+
+
+def test_by_repo_trends_carry_per_period_approval_latency(session_factory) -> None:
+    with session_factory() as session:
+        _add_outcome(
+            session, outcome="merged", repo="payments", completed_at=NOW, approval_seconds=3600
+        )
+        _add_outcome(
+            session, outcome="merged", repo="web", completed_at=NOW, approval_seconds=60
+        )
+        report = delivery_by_repo_trends(
+            session, since=NOW - timedelta(days=7), bucket="week"
+        )
+
+    by_repo = {r["repo"]: r for r in report["repos"]}
+    assert by_repo["payments"]["series"][-1]["time_to_approval_seconds"] == {
+        "count": 1,
+        "median": 3600,
+        "p90": 3600,
+    }
+    assert by_repo["web"]["series"][-1]["time_to_approval_seconds"]["median"] == 60
+
+
+def test_by_work_type_trends_carry_per_period_approval_latency(session_factory) -> None:
+    with session_factory() as session:
+        _add_outcome(
+            session, outcome="merged", work_type="bug", completed_at=NOW, approval_seconds=120
+        )
+        _add_outcome(
+            session,
+            outcome="merged",
+            work_type="feature",
+            completed_at=NOW,
+            approval_seconds=900,
+        )
+        report = delivery_by_work_type_trends(
+            session, since=NOW - timedelta(days=7), bucket="week"
+        )
+
+    by_type = {t["work_type"]: t for t in report["work_types"]}
+    assert by_type["bug"]["series"][-1]["time_to_approval_seconds"] == {
+        "count": 1,
+        "median": 120,
+        "p90": 120,
+    }
+    assert by_type["feature"]["series"][-1]["time_to_approval_seconds"]["median"] == 900
