@@ -32,7 +32,9 @@ by-work-type dimension of the failure trend in failure-red - completing the
 failure-trend strip set the way the delivery surface has both by-repo and
 by-work-type trend strips, issue #37),
 the delivery metrics
-strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
+strip, a delivery-trend-over-time table (PRs shipped vs blocked plus the
+per-week median sign-off and shipping latency - "is sign-off / shipping getting
+slower week over week?", issue #37), the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
 (where work ships, stalls, and spends) with a per-repo trend sparkline strip
 (is each repo speeding up or stalling?), a delivery-by-work-type table (do bugs
@@ -1116,19 +1118,27 @@ async function loadTrends() {
       const shipW = Math.round((p.prs_shipped / maxFinished) * 120);
       const blockW = Math.round((p.blocked / maxFinished) * 120);
       const cost = p.total_cost_usd == null ? "-" : "$" + p.total_cost_usd;
+      // Per-period approval/merge latency landed in the endpoint in #143/#145;
+      // render the medians as columns so "is sign-off / shipping getting slower
+      // week over week?" is readable down the column (the same dur() medians the
+      // by-repo / by-work-type delivery tables already show).
+      const tta = p.time_to_approval_seconds || {};
+      const ttm = p.time_to_merge_seconds || {};
       return `<tr>
         <td>${esc(fmtPeriod(p.period_start))}</td>
         <td class="num">${p.prs_shipped}</td>
         <td class="num">${p.blocked}</td>
         <td class="num">${p.runs_finished}</td>
         <td class="num">${p.retries_consumed}</td>
+        <td class="num">${dur(tta.median)}</td>
+        <td class="num">${dur(ttm.median)}</td>
         <td class="num">${cost}</td>
         <td><span class="bar" style="width:${shipW}px"></span><span class="bar blocked" style="width:${blockW}px"></span></td>
       </tr>`;
     }).join("");
-    el.innerHTML = `<details open><summary>delivery trend &mdash; PRs shipped vs blocked, by week (90d)</summary>
+    el.innerHTML = `<details open><summary>delivery trend &mdash; PRs shipped vs blocked, with sign-off &amp; shipping latency, by week (90d)</summary>
       <table><tr><th>week of</th><th>shipped</th><th>blocked</th><th>finished</th>
-        <th>retries</th><th>spend</th><th></th></tr>${rows}</table>
+        <th>retries</th><th>median to approval</th><th>median to merge</th><th>spend</th><th></th></tr>${rows}</table>
     </details>`;
     el.style.display = "block";
   } catch (err) {

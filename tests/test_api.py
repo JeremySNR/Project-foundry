@@ -886,6 +886,19 @@ def test_dashboard_renders_delivery_by_work_type_trend_strip() -> None:
     assert "loadWorkTypeTrends();" in DASHBOARD_HTML
 
 
+def test_dashboard_delivery_trend_renders_latency_columns() -> None:
+    """The org-wide delivery-trend table (issue #37) must render the per-period
+    sign-off and shipping latency the endpoint now carries (#143/#145) — the
+    in-page "is sign-off / shipping getting slower week over week?" view — as
+    median-to-approval / median-to-merge columns, the same dur() medians the
+    by-repo / by-work-type delivery tables already show."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert "p.time_to_approval_seconds" in DASHBOARD_HTML
+    assert "p.time_to_merge_seconds" in DASHBOARD_HTML
+    assert "<th>median to approval</th><th>median to merge</th>" in DASHBOARD_HTML
+
+
 def test_dashboard_renders_failures_by_category_panel() -> None:
     """The failures-by-category panel (issue #37) must fetch the
     by-category endpoint, have a panel to render into, and be wired into the
