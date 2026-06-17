@@ -58,6 +58,18 @@ class RiskAssessment(BaseModel):
     sensitive_areas: SensitiveAreas = Field(default_factory=SensitiveAreas)
     allowed_agent_mode: AgentMode
     required_approvals: list[ApprovalRole] = Field(default_factory=list)
+    # Approval roles demanded by operator-defined *custom* risk categories
+    # (issue #155) whose ticket-text keywords fired at intake. Kept distinct
+    # from ``required_approvals`` (which the policy gate re-derives from the
+    # fixed built-in sensitive-area booleans) because these reach the gate by a
+    # different, already-existing channel: the orchestrator unions them into
+    # ``PolicyInput.repo.required_roles`` - the resolved-roles field both the
+    # Python engine and ``foundry.rego`` already read - so no new gate rule or
+    # Rego change is needed (invariant #2 stays satisfied for free). Strictly
+    # additive / escalate-only: a custom category can only ever *add* a required
+    # approval, never drop a built-in area's role (invariant #1). Defaulted so
+    # artifacts recorded before this field existed still validate when loaded.
+    custom_required_approvals: list[ApprovalRole] = Field(default_factory=list)
     # Cited evidence per flag. Defaulted so artifacts recorded before this
     # field existed still validate when loaded back.
     evidence: list[RiskEvidence] = Field(default_factory=list)

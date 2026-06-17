@@ -164,6 +164,102 @@ def test_repo_required_roles_default_empty() -> None:
     assert Settings.from_env({}).repo_required_roles_map == {}
 
 
+# -- custom risk categories (issue #155) ----------------------------------------
+
+_CUSTOM_CATEGORIES_YAML = """
+risk:
+  custom_risk_categories:
+    crypto_keys:
+      keywords: ["Signing Key", "HSM"]
+      path_globs: ["**/crypto/**", "**/keys/**"]
+      required_roles: ["security", "engineering"]
+    gdpr_subject_data:
+      keywords: ["data subject"]
+      required_roles: ["security"]
+"""
+
+
+def test_custom_risk_categories_default_empty() -> None:
+    """No config => no custom risk categories (built-in areas unchanged)."""
+    assert Settings.from_env({}).custom_risk_categories == ()
+
+
+def test_custom_risk_categories_load_from_yaml(tmp_path) -> None:
+    path = tmp_path / "foundry.yaml"
+    path.write_text(_CUSTOM_CATEGORIES_YAML)
+    s = Settings.load(path, env={})
+    by_name = {c.name: c for c in s.custom_risk_categories}
+    assert set(by_name) == {"crypto_keys", "gdpr_subject_data"}
+    crypto = by_name["crypto_keys"]
+    # Keywords are lower-cased to match RawTicket.risk_blob (which lower-cases).
+    assert crypto.keywords == ("signing key", "hsm")
+    assert crypto.path_globs == ("**/crypto/**", "**/keys/**")
+    assert crypto.required_roles == ("security", "engineering")
+    assert by_name["gdpr_subject_data"].path_globs == ()
+
+
+def test_custom_risk_category_name_colliding_with_builtin_rejected(tmp_path) -> None:
+    """A custom name that shadows a built-in sensitive area fails loud (#155)."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "risk:\n"
+        "  custom_risk_categories:\n"
+        "    auth:\n"
+        '      keywords: ["whatever"]\n'
+        '      required_roles: ["engineering"]\n'
+    )
+    with pytest.raises(ValueError, match="collides with a built-in"):
+        Settings.load(path, env={})
+
+
+def test_custom_risk_category_unknown_role_rejected(tmp_path) -> None:
+    """A typo'd approval role fails loud at load (fail-closed)."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "risk:\n"
+        "  custom_risk_categories:\n"
+        "    crypto_keys:\n"
+        '      keywords: ["hsm"]\n'
+        '      required_roles: ["wizard"]\n'
+    )
+    with pytest.raises(ValueError, match="unknown approval roles"):
+        Settings.load(path, env={})
+
+
+def test_custom_risk_category_without_trigger_rejected(tmp_path) -> None:
+    """A category with no keywords and no globs could never fire - rejected."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "risk:\n"
+        "  custom_risk_categories:\n"
+        "    crypto_keys:\n"
+        '      required_roles: ["security"]\n'
+    )
+    with pytest.raises(ValueError, match="at least one trigger"):
+        Settings.load(path, env={})
+
+
+def test_custom_risk_category_without_role_rejected(tmp_path) -> None:
+    """A category that demands no role could never escalate - rejected."""
+    import pytest
+
+    path = tmp_path / "foundry.yaml"
+    path.write_text(
+        "risk:\n"
+        "  custom_risk_categories:\n"
+        "    crypto_keys:\n"
+        '      keywords: ["hsm"]\n'
+    )
+    with pytest.raises(ValueError, match="at least one required approval role"):
+        Settings.load(path, env={})
+
+
 def test_min_approvals_defaults_to_one() -> None:
     """No config => the historical single-approval lifecycle (issue #31)."""
     s = Settings.from_env({})
