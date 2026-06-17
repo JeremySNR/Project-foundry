@@ -39,7 +39,9 @@ merge-confidence trend (is each agent improving?), a delivery-by-repo table
 (where work ships, stalls, and spends) with a per-repo trend sparkline strip
 (is each repo speeding up or stalling?), a delivery-by-work-type table (do bugs
 ship while features stall?) with a per-work-type trend sparkline strip (are
-features speeding up or slipping vs bugs?), an epic board (multi-repo
+features speeding up or slipping vs bugs?) - both trend strips' per-week bars
+carry that week's median sign-off / shipping latency on hover - an epic board
+(multi-repo
 runs rolled up, issue #35), a policy-gate panel (the effective gate this
 deployment enforces - the in-app twin of ``foundry-policy explain``, issue #31),
 the run list (with an approval-queue filter) and,
@@ -1252,7 +1254,13 @@ async function loadRepoTrends() {
         }
         const h = Math.max(2, Math.round((c.prs_shipped / maxShipped) * 24));
         const cost = c.total_cost_usd == null ? "" : `, $${c.total_cost_usd}`;
-        return `<i style="height:${h}px" title="${esc(when)}: ${c.prs_shipped} shipped of ${c.runs_finished} finished${cost}"></i>`;
+        // Per-cell sign-off/shipping latency the trend endpoint now carries
+        // (#143/#145) - hover detail only, so a never-approved / never-merged
+        // week adds nothing rather than a conjured "-".
+        const tta = (c.time_to_approval_seconds || {}).median;
+        const ttm = (c.time_to_merge_seconds || {}).median;
+        const lat = tta == null && ttm == null ? "" : `, ${dur(tta)} to approval / ${dur(ttm)} to merge`;
+        return `<i style="height:${h}px" title="${esc(when)}: ${c.prs_shipped} shipped of ${c.runs_finished} finished${cost}${lat}"></i>`;
       }).join("");
       const cost = r.total_cost_usd == null ? "-" : "$" + r.total_cost_usd;
       return `<div class="prov">
@@ -1262,7 +1270,7 @@ async function loadRepoTrends() {
     }).join("");
     el.innerHTML = `<details><summary>delivery by repo, trend &mdash; PRs shipped by week (90d), is each repo speeding up or stalling?</summary>
       ${rows}
-      <div class="kv">each bar = one week; height = PRs shipped (shared scale across repos)</div>
+      <div class="kv">each bar = one week; height = PRs shipped (shared scale across repos); hover for that week's median sign-off / shipping latency</div>
     </details>`;
     el.style.display = "block";
   } catch (err) {
@@ -1297,7 +1305,13 @@ async function loadWorkTypeTrends() {
         }
         const h = Math.max(2, Math.round((c.prs_shipped / maxShipped) * 24));
         const cost = c.total_cost_usd == null ? "" : `, $${c.total_cost_usd}`;
-        return `<i style="height:${h}px" title="${esc(when)}: ${c.prs_shipped} shipped of ${c.runs_finished} finished${cost}"></i>`;
+        // Per-cell sign-off/shipping latency the trend endpoint now carries
+        // (#143/#145) - hover detail only, so a never-approved / never-merged
+        // week adds nothing rather than a conjured "-".
+        const tta = (c.time_to_approval_seconds || {}).median;
+        const ttm = (c.time_to_merge_seconds || {}).median;
+        const lat = tta == null && ttm == null ? "" : `, ${dur(tta)} to approval / ${dur(ttm)} to merge`;
+        return `<i style="height:${h}px" title="${esc(when)}: ${c.prs_shipped} shipped of ${c.runs_finished} finished${cost}${lat}"></i>`;
       }).join("");
       const cost = t.total_cost_usd == null ? "-" : "$" + t.total_cost_usd;
       return `<div class="prov">
@@ -1307,7 +1321,7 @@ async function loadWorkTypeTrends() {
     }).join("");
     el.innerHTML = `<details><summary>delivery by work type, trend &mdash; PRs shipped by week (90d), are features speeding up or slipping vs bugs?</summary>
       ${rows}
-      <div class="kv">each bar = one week; height = PRs shipped (shared scale across work types)</div>
+      <div class="kv">each bar = one week; height = PRs shipped (shared scale across work types); hover for that week's median sign-off / shipping latency</div>
     </details>`;
     el.style.display = "block";
   } catch (err) {
