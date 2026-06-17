@@ -129,6 +129,14 @@ class Settings:
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
+    # --- artifact encryption at rest (secret: env); None => plaintext ---
+    # Fernet key for encrypting artifact payloads (foundry_artifacts.content_json)
+    # at rest. Comma-separate keys to rotate (the first encrypts; all are tried
+    # for decrypt). Unset => payloads stored as plaintext (the historical
+    # behaviour). Needs the optional 'crypto' extra (cryptography); a key set
+    # without it fails closed at startup. See db/encryption.py.
+    artifact_encryption_key: str | None = None
+
     # --- SCIM 2.0 provisioning credential (secret: env; issue #157) ---
     # The bearer token an IdP presents to the /scim/v2 user/group provisioning
     # endpoints. Unset => the SCIM surface is disabled (403) and approval-role
@@ -679,6 +687,13 @@ class Settings:
                 "rate_limit_api_per_minute must be >= 1, got "
                 f"{self.rate_limit_api_per_minute} (use rate_limit_enabled: false to disable)"
             )
+        if self.artifact_encryption_key:
+            # Fail closed at config load: a key that can't build a cipher
+            # (cryptography missing, or invalid key material) is a deploy-time
+            # error, not a first-write surprise.
+            from foundry.db.encryption import build_cipher
+
+            build_cipher(self.artifact_encryption_key)
         if self.approval_sla_seconds is not None and self.approval_sla_seconds < 1:
             raise ValueError(
                 "approval_sla_seconds must be >= 1 when set, got "
@@ -1273,6 +1288,7 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_SLACK_BOT_TOKEN": "slack_bot_token",
         "FOUNDRY_SLACK_CHANNEL": "slack_channel",
         "FOUNDRY_API_TOKEN": "api_token",
+        "FOUNDRY_ARTIFACT_ENCRYPTION_KEY": "artifact_encryption_key",
         "FOUNDRY_SCIM_BEARER_TOKEN": "scim_bearer_token",
         "FOUNDRY_AGENT_PROVIDER": "agent_provider",
         "FOUNDRY_AGENT_AUTO_FALLBACK": "agent_auto_fallback",
