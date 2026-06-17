@@ -531,11 +531,12 @@ def _empty_delivery_period() -> dict:
 
     ``_cost`` / ``_cost_seen`` are private: a period where no run reported cost
     must render ``total_cost_usd: None`` (never a conjured $0), matching
-    :func:`delivery_metrics`. ``_approval_times`` is likewise private - the raw
-    per-run approval latencies the period renders into a ``time_to_approval_seconds``
-    distribution, the over-time complement of the point-in-time cut's distribution
-    (the "is sign-off getting slower week over week?" signal).
-    :func:`_render_delivery_period` strips all three private keys.
+    :func:`delivery_metrics`. ``_approval_times`` / ``_merge_times`` are likewise
+    private - the raw per-run approval and merge latencies the period renders into
+    ``time_to_approval_seconds`` / ``time_to_merge_seconds`` distributions, the
+    over-time complement of the point-in-time cuts' distributions (the "is sign-off
+    / is shipping getting slower week over week?" signals).
+    :func:`_render_delivery_period` strips all four private keys.
     """
     return {
         "runs_finished": 0,
@@ -545,6 +546,7 @@ def _empty_delivery_period() -> dict:
         "_cost": 0.0,
         "_cost_seen": False,
         "_approval_times": [],
+        "_merge_times": [],
     }
 
 
@@ -565,6 +567,10 @@ def _accumulate_delivery_period(agg: dict, row: FoundryRunOutcome) -> None:
     approval_seconds = _approval_seconds(row)
     if approval_seconds is not None:
         agg["_approval_times"].append(approval_seconds)
+    # Merge latency: only merged runs contribute, the same definition as the
+    # point-in-time cuts' ``time_to_merge_seconds`` (an unmerged run has none).
+    if row.time_to_merge_seconds is not None:
+        agg["_merge_times"].append(row.time_to_merge_seconds)
 
 
 def _render_delivery_period(period_start: datetime, agg: dict | None) -> dict:
@@ -572,6 +578,7 @@ def _render_delivery_period(period_start: datetime, agg: dict | None) -> dict:
     zero-filled bucket so a sparkline reads as a continuous series)."""
     agg = agg or _empty_delivery_period()
     approval_times = sorted(agg["_approval_times"])
+    merge_times = sorted(agg["_merge_times"])
     return {
         "period_start": period_start.isoformat(),
         "runs_finished": agg["runs_finished"],
@@ -579,6 +586,11 @@ def _render_delivery_period(period_start: datetime, agg: dict | None) -> dict:
         "blocked": agg["blocked"],
         "retries_consumed": agg["retries_consumed"],
         "total_cost_usd": round(agg["_cost"], 2) if agg["_cost_seen"] else None,
+        "time_to_merge_seconds": {
+            "count": len(merge_times),
+            "median": _percentile(merge_times, 0.5),
+            "p90": _percentile(merge_times, 0.9),
+        },
         "time_to_approval_seconds": {
             "count": len(approval_times),
             "median": _percentile(approval_times, 0.5),
@@ -607,15 +619,16 @@ def delivery_trends(session, *, since: datetime, bucket: str = "week") -> dict:
     or down?" view the single-window :func:`delivery_metrics` can't answer.
 
     Each period reports PRs shipped, blocked runs, total runs finished, retries
-    consumed, agent spend and a ``time_to_approval_seconds`` distribution
-    (count/median/p90) - the over-time complement of the point-in-time cut's
-    approval latency, the "is sign-off getting slower week over week?" signal.
-    Empty periods inside the window are filled with zeros so a sparkline reads as
-    a continuous series rather than a sparse one. ``cost_usd`` stays ``None`` for
-    a period where no provider reported cost, matching :func:`delivery_metrics`
-    (never conjure a $0 from missing data); a period whose runs never reached
-    approval reports a ``count: 0`` / ``median: None`` approval distribution, the
-    same way the point-in-time cut does.
+    consumed, agent spend and both a ``time_to_merge_seconds`` and a
+    ``time_to_approval_seconds`` distribution (count/median/p90) - the over-time
+    complement of the point-in-time cut's merge and approval latencies, the "is
+    shipping / is sign-off getting slower week over week?" signals. Empty periods
+    inside the window are filled with zeros so a sparkline reads as a continuous
+    series rather than a sparse one. ``cost_usd`` stays ``None`` for a period where
+    no provider reported cost, matching :func:`delivery_metrics` (never conjure a
+    $0 from missing data); a period whose runs never merged / never reached
+    approval reports a ``count: 0`` / ``median: None`` distribution for that
+    latency, the same way the point-in-time cut does.
     """
     if bucket not in TREND_BUCKETS:
         raise ValueError(f"bucket must be one of {TREND_BUCKETS}, got {bucket!r}")
@@ -661,11 +674,11 @@ def delivery_by_repo_trends(session, *, since: datetime, bucket: str = "week") -
     per-repo sparklines line up column-for-column — the same shape
     :func:`~foundry.memory.scorecards.agent_scorecard_trends` uses. Each repo
     also carries its window totals so a caller can label the trend without a
-    second query. Every period cell carries a ``time_to_approval_seconds``
-    distribution (the shared period shape), so "is sign-off for *this repo*
-    getting slower over time?" is answerable per repo. Unrouted runs (NULL
-    ``repo``) bucket under the :data:`UNROUTED_REPO_LABEL` sentinel, as in
-    :func:`delivery_by_repo`.
+    second query. Every period cell carries ``time_to_merge_seconds`` and
+    ``time_to_approval_seconds`` distributions (the shared period shape), so "is
+    shipping / sign-off for *this repo* getting slower over time?" is answerable
+    per repo. Unrouted runs (NULL ``repo``) bucket under the
+    :data:`UNROUTED_REPO_LABEL` sentinel, as in :func:`delivery_by_repo`.
     """
     if bucket not in TREND_BUCKETS:
         raise ValueError(f"bucket must be one of {TREND_BUCKETS}, got {bucket!r}")
@@ -750,10 +763,11 @@ def delivery_by_work_type_trends(
     per-type sparklines line up column-for-column — the same shape
     :func:`delivery_by_repo_trends` uses. Each type also carries its window
     totals so a caller can label the trend without a second query. Every period
-    cell carries a ``time_to_approval_seconds`` distribution (the shared period
-    shape), so "is sign-off for *this kind of work* getting slower over time?"
-    is answerable per type. Runs whose ``work_type`` was never classified (NULL)
-    bucket under the :data:`UNCLASSIFIED_WORK_TYPE_LABEL` sentinel, as in
+    cell carries ``time_to_merge_seconds`` and ``time_to_approval_seconds``
+    distributions (the shared period shape), so "is shipping / sign-off for *this
+    kind of work* getting slower over time?" is answerable per type. Runs whose
+    ``work_type`` was never classified (NULL) bucket under the
+    :data:`UNCLASSIFIED_WORK_TYPE_LABEL` sentinel, as in
     :func:`delivery_by_work_type`.
     """
     if bucket not in TREND_BUCKETS:

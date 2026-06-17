@@ -206,8 +206,15 @@ def test_delivery_trends_renders_per_period_approval_latency(
     now = datetime.now(timezone.utc)
     sf = _seed(db_url)
     with sf() as session:
-        # Approved 1h before merge (3600s); a never-approved block alongside it.
-        _add_outcome(session, outcome="merged", completed_at=now, approval_seconds=3600)
+        # Approved 1h before merge (3600s), merged after 2h (7200s); a
+        # never-approved/never-merged block alongside it.
+        _add_outcome(
+            session,
+            outcome="merged",
+            completed_at=now,
+            approval_seconds=3600,
+            time_to_merge_seconds=7200,
+        )
         _add_outcome(session, outcome="blocked", completed_at=now, approval_seconds=None)
         session.commit()
 
@@ -215,6 +222,9 @@ def test_delivery_trends_renders_per_period_approval_latency(
     out = capsys.readouterr().out
     # _fmt_age(3600) -> "1h00m"; the median over the single approved run.
     assert "approval 1h00m" in out
+    # _fmt_age(7200) -> "2h00m"; the merge-latency median, the over-time mirror
+    # of the approval latency (the "is shipping getting slower?" cut).
+    assert "merge 2h00m" in out
 
 
 def test_delivery_trends_rejects_bad_bucket(monkeypatch, db_url) -> None:

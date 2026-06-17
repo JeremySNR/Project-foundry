@@ -1172,12 +1172,14 @@ def _run_delivery_trends(args: argparse.Namespace) -> None:
     label = "week of" if args.bucket == "week" else "day"
     print(f"Delivery by {args.bucket} (last {args.days}d):\n")
     for period in periods:
+        ttm = period["time_to_merge_seconds"]
         tta = period["time_to_approval_seconds"]
         print(
             f"  {label} {period['period_start'][:10]}  "
             f"shipped {period['prs_shipped']:>3}  blocked {period['blocked']:>3}  "
             f"runs {period['runs_finished']:>3}  retries {period['retries_consumed']:>3}  "
             f"spend {_fmt_cost(period['total_cost_usd'])}  "
+            f"merge {_fmt_age(ttm['median'])}  "
             f"approval {_fmt_age(tta['median'])}"
         )
 
@@ -1272,11 +1274,12 @@ def _run_delivery_by_repo_trends(args: argparse.Namespace) -> None:
             f"{_fmt_cost(repo['total_cost_usd'])}"
         )
         for period_iso, cell in zip(periods, repo["series"]):
+            ttm = cell["time_to_merge_seconds"]
             tta = cell["time_to_approval_seconds"]
             print(
                 f"    {label} {period_iso[:10]}  shipped {cell['prs_shipped']:>3}  "
                 f"blocked {cell['blocked']:>3}  runs {cell['runs_finished']:>3}  "
-                f"approval {_fmt_age(tta['median'])}"
+                f"merge {_fmt_age(ttm['median'])}  approval {_fmt_age(tta['median'])}"
             )
         print()
 
@@ -1307,10 +1310,11 @@ def _run_delivery_by_work_type_trends(args: argparse.Namespace) -> None:
             f"{_fmt_cost(wt['total_cost_usd'])}"
         )
         for period_iso, cell in zip(periods, wt["series"]):
+            ttm = cell["time_to_merge_seconds"]
             tta = cell["time_to_approval_seconds"]
             print(
                 f"    {label} {period_iso[:10]}  shipped {cell['prs_shipped']:>3}  "
                 f"blocked {cell['blocked']:>3}  runs {cell['runs_finished']:>3}  "
-                f"approval {_fmt_age(tta['median'])}"
+                f"merge {_fmt_age(ttm['median'])}  approval {_fmt_age(tta['median'])}"
             )
         print()
