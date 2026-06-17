@@ -23,7 +23,16 @@ loaded with the process environment so ``FOUNDRY_*`` overrides are reflected),
 so you can answer "what does *my* gate actually resolve to?", not just "what
 does this preset resolve to?". It takes ``--format text`` (default) or
 ``--format json`` (the same effective knobs as a machine-readable object on
-stdout, for a dashboard/CI step).
+stdout, for a dashboard/CI step). ``explain`` is the **offline twin** of the
+in-app ``GET /metrics/policy`` endpoint, so it also surfaces that endpoint's one
+live, time-dependent field - ``active_freeze``: whether a ``change_freeze``
+window is in effect *right now* (evaluated with the same pure ``active_freeze()``
+the orchestrator uses before holding an autonomous re-dispatch). In text mode the
+active window is marked ``[ACTIVE NOW]`` and a ``CHANGE FREEZE ACTIVE`` banner is
+printed; in json mode a top-level ``active_freeze`` field carries ``null`` or
+``{description, reason}``, matching the endpoint's shape so the two can't drift -
+answering "why aren't autonomous retries firing right now?" from a terminal with
+no running API or bearer token.
 
 ``check`` is the verification counterpart to ``explain``: it loads *your* config
 (``--config`` or ``FOUNDRY_CONFIG``) and a baseline (a preset name or a path to
@@ -46,10 +55,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None, *, now: "datetime | None" = None) -> None:
     parser = argparse.ArgumentParser(
         prog="foundry-policy",
         description="Browse and adopt Foundry's starter policy library.",
@@ -117,7 +129,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "show":
         _run_show(args.name)
     elif args.command == "explain":
-        _run_explain(args.target, args.config, args.format)
+        _run_explain(args.target, args.config, args.format, now=now)
     elif args.command == "check":
         _run_check(args.config, args.against, args.format)
 
@@ -146,13 +158,19 @@ def _run_show(name: str) -> None:
 
 
 def _run_explain(
-    target: str | None, config_path: str | None, fmt: str = "text"
+    target: str | None,
+    config_path: str | None,
+    fmt: str = "text",
+    *,
+    now: "datetime | None" = None,
 ) -> None:
     import json
     import os
+    from datetime import datetime, timezone
     from pathlib import Path
 
     from foundry.config import Settings
+    from foundry.policy.freeze import active_freeze, describe_window
     from foundry.policy.library import (
         available_preset_names,
         effective_policy_summary,
@@ -211,9 +229,30 @@ def _run_explain(
 
     summary = effective_policy_summary(settings)
 
+    # The one live, time-dependent signal, mirroring GET /metrics/policy's
+    # `active_freeze`: is a change-freeze window in effect *right now*? Evaluated
+    # with the same pure `active_freeze()` the orchestrator uses before holding an
+    # autonomous re-dispatch, so the offline `explain` view can answer "why aren't
+    # autonomous retries firing right now?" without a running API or bearer token.
+    # `now` is injected by tests for determinism; the CLI uses the wall clock.
+    evaluated_at = now or datetime.now(timezone.utc)
+    frozen = active_freeze(settings.change_freeze_windows, evaluated_at)
+    active_freeze_payload = (
+        {"description": describe_window(frozen), "reason": frozen.reason}
+        if frozen is not None
+        else None
+    )
+
     if fmt == "json":
+        # Top-level `active_freeze` mirrors the GET /metrics/policy response shape
+        # (null, or {description, reason}) so the offline twin can't drift from it.
         json.dump(
-            {"source": source, "kind": kind, "policy": summary},
+            {
+                "source": source,
+                "kind": kind,
+                "policy": summary,
+                "active_freeze": active_freeze_payload,
+            },
             sys.stdout,
             indent=2,
         )
@@ -272,13 +311,21 @@ def _run_explain(
         for area, keywords in summary["extra_sensitive_keywords"].items():
             print(f"      {area}: {', '.join(keywords)}")
 
-    if summary["change_freeze_windows"]:
+    if settings.change_freeze_windows:
         print(
             "\n  change-freeze windows "
             "(autonomous re-dispatch held for a human while active):"
         )
-        for window in summary["change_freeze_windows"]:
-            print(f"      {window}")
+        for window in settings.change_freeze_windows:
+            marker = "[ACTIVE NOW] " if window is frozen else ""
+            print(f"      {marker}{describe_window(window)}")
+        if frozen is not None:
+            # The offline twin of the dashboard's "CHANGE FREEZE ACTIVE" banner:
+            # a freeze is in effect right now, so autonomous re-dispatch is held.
+            print(
+                f"\n  >> CHANGE FREEZE ACTIVE: {describe_window(frozen)}\n"
+                "     autonomous re-dispatch is held for a human right now."
+            )
 
 
 def _run_check(config_path: str | None, against: str, fmt: str = "text") -> None:
