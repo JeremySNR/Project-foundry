@@ -18,7 +18,11 @@ direction-of-travel view: "are we failing more than usual?", issue #37)
 and a failures-by-category trend strip (each failure reason's failures-by-week
 series as a sparkline on one shared scale - "is a *specific* blocker spiking
 or fading over time?", the in-page render of GET /metrics/failures/by-category/
-trends, issue #37),
+trends, issue #37)
+and a failures-by-repo trend strip (each routed repo's failures-by-week series
+as a sparkline on one shared scale - "is *this repo's* failure rate climbing or
+fading over time?", the in-page render of GET /metrics/failures/by-repo/trends,
+the by-repo dimension of the failure trend in failure-red, issue #37),
 the delivery metrics
 strip, a delivery-trend-over-time table, the agent scorecards, a per-agent
 merge-confidence trend (is each agent improving?), a delivery-by-repo table
@@ -36,6 +40,7 @@ agent jobs). All data comes from ``GET /runs``, ``GET /metrics/fleet``,
 ``GET /metrics/failures/by-repo``, ``GET /metrics/failures/by-work-type``,
 ``GET /metrics/failures/trends``,
 ``GET /metrics/failures/by-category/trends``,
+``GET /metrics/failures/by-repo/trends``,
 ``GET /metrics/delivery``, ``GET /metrics/delivery/trends``,
 ``GET /metrics/delivery/by-repo``, ``GET /metrics/delivery/by-repo/trends``,
 ``GET /metrics/delivery/by-work-type``,
@@ -286,6 +291,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="failure-work-types"></div>
 <div id="failure-trends"></div>
 <div id="failure-category-trends"></div>
+<div id="failure-repo-trends"></div>
 <div id="metrics"></div>
 <div id="trends"></div>
 <div id="agents"></div>
@@ -890,6 +896,50 @@ async function loadFailureCategoryTrends() {
   }
 }
 
+async function loadFailuresByRepoTrends() {
+  const el = $("#failure-repo-trends");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/failures/by-repo/trends?days=30&bucket=week", {
+      headers: authHeaders(),
+    });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const repos = m.repos || [];
+    if (!repos.length) { el.style.display = "none"; return; }  // nothing failed recently: hide
+    // Scale every repo's bars to one shared max (failures-per-week) so the
+    // sparklines are comparable across repos, not each normalised to its own
+    // peak - the same shared-scale rule the by-category failure trend and the
+    // delivery trend strips use, so a spiking repo stands out, in failure-red.
+    const maxCount = Math.max(1, ...repos.flatMap(
+      (r) => (r.series || []).map((p) => p.count)));
+    const rows = repos.map((r) => {
+      const bars = (r.series || []).map((p) => {
+        const when = fmtPeriod(p.period_start);
+        if (!p.count) {
+          return `<i class="empty" title="${esc(when)}: no failures"></i>`;
+        }
+        const h = Math.max(2, Math.round((p.count / maxCount) * 24));
+        return `<i style="height:${h}px" title="${esc(when)}: ${p.count} failed (${p.blocked} blocked, ${p.failed} execution-failed)"></i>`;
+      }).join("");
+      return `<div class="prov">
+        <span class="name">${esc(r.repo)}
+          <span class="kv">${r.count} total &middot; ${r.blocked} blocked &middot; ${r.failed} failed</span></span>
+        <span class="spark">${bars}</span></div>`;
+    }).join("");
+    el.innerHTML = `<details><summary>failures by repo, trend &mdash; failures by week (${m.days}d), is this repo's failure rate climbing or fading?</summary>
+      ${rows}
+      <div class="kv">each bar = one week; height = failures (shared scale across repos)</div>
+    </details>`;
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 async function loadMetrics() {
   const el = $("#metrics");
   if (!hasAuth()) {
@@ -1355,6 +1405,7 @@ function refresh() {
   loadFailureWorkTypes();
   loadFailureTrends();
   loadFailureCategoryTrends();
+  loadFailuresByRepoTrends();
   loadMetrics();
   loadTrends();
   loadAgents();
