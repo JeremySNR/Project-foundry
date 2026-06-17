@@ -409,8 +409,11 @@ def main() -> None:
 def _session_factory():
     from foundry.config import Settings
     from foundry.db.base import init_schema, make_engine, make_session_factory
+    from foundry.db.encryption import configure_cipher_from_key
 
     settings = Settings.load(os.environ.get("FOUNDRY_CONFIG"), env=os.environ)
+    # Backfill reads artifact payloads; decrypt with the configured key.
+    configure_cipher_from_key(settings.artifact_encryption_key)
     engine = make_engine(settings.database_url)
     init_schema(engine)
     return settings, make_session_factory(engine)

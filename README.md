@@ -258,6 +258,7 @@ Secrets via env:
 | `FOUNDRY_SLACK_SIGNING_SECRET` | Enables `/webhooks/slack` (Slack v0 request-signing + replay-age; endpoint disabled without it). |
 | `FOUNDRY_SLACK_BOT_TOKEN` / `FOUNDRY_SLACK_CHANNEL` | Enables outbound Slack: posts the interactive approval message + status updates (parked/blocked/PR open/merged). Fail-closed — both (token + channel, the latter also settable via `notifications.slack_channel`) required, else no notifier. |
 | `FOUNDRY_API_TOKEN` | Bearer token for the REST approval endpoint, the timeline API, the delivery-metrics API, the compliance evidence-pack endpoint and the dashboard. **Unset = those are disabled** (fail closed) unless OIDC is configured; approvals still work via signed Linear comments. |
+| `FOUNDRY_ARTIFACT_ENCRYPTION_KEY` | Fernet key to encrypt artifact payloads at rest (comma-separate to rotate). Needs the `crypto` extra; **unset = plaintext** (the default). Content hashes stay over plaintext, so audit integrity is unaffected. |
 | `FOUNDRY_OIDC_ISSUER` / `..._AUDIENCE` / `..._JWKS_URI` | Enables **OIDC** bearer auth on the token-gated API as an alternative/addition to `FOUNDRY_API_TOKEN` (issue #34): a valid JWT from your IdP is accepted alongside the static token. All three are required together (also settable under `auth.oidc` in YAML). Optionally `FOUNDRY_OIDC_ALGORITHMS` (comma-separated allow-list, default `RS256`) and `FOUNDRY_OIDC_LEEWAY_SECONDS` (clock-skew tolerance, default 60). Needs the `oidc` extra (`pip install 'project-foundry[oidc]'`; bundled in the Docker image). |
 | `FOUNDRY_OIDC_SUBJECT_CLAIM` / `..._GROUP_CLAIM` | For OIDC-authenticated REST approvals (issue #34): which **verified** claim names identify the approver (default `email`, falling back to `sub`) and carry IdP group membership (default `groups`). The approver identity is then bound to the verified token, not the request body. The IdP-group → approver-role map itself is YAML-only — `auth.oidc.group_role_map` ({group → roles}); a verified member of a mapped group is granted those roles on top of any committed `approval.approvers` grant. |
 | `FOUNDRY_OIDC_ORG_CLAIM` | Enables **multi-tenancy / row-level isolation** (issue #156): the **verified** OIDC claim that names the caller's org (e.g. `org` or `tenant`; also `auth.oidc.org_claim` in YAML). When set, every read and write in that request is isolated to that org — a unit of work scoped to one tenant can neither read nor write another's rows. The org is taken only from the cryptographically-verified token, never the request payload. **Unset (the default) ⇒ single-tenant:** every row lives under the default org and behaviour is unchanged. |
@@ -366,6 +367,7 @@ These are enforced, tested, and not negotiable by a prompt:
 - No auto-merge. Ever, in this version.
 - Secrets never end up in an agent prompt; job inputs are scanned before dispatch.
 - Every decision, every artifact, every approval is content-hashed and written down, so you can always answer "why did the agent do that?".
+- Artifact payloads can be encrypted at rest (`FOUNDRY_ARTIFACT_ENCRYPTION_KEY`, opt-in) without touching the audit guarantees: hashes are computed over plaintext, so integrity verification holds with or without the key.
 
 These aren't suggestions, they're the creed. This is the Way.
 
@@ -410,7 +412,7 @@ src/foundry/
   policy/          the Python engine + foundry.rego (kept in sync)
   agents/          provider abstraction: manual, fake, Cursor (two ways), Claude Code, webhook
   connectors/      Linear, GitHub, GitHub Issues, Jira, GitLab, live HTTP transports
-  db/              SQLAlchemy models (runs, artifacts, audit, policy, jobs)
+  db/              SQLAlchemy models (runs, artifacts, audit, policy, jobs) + at-rest artifact encryption (encryption.py)
   audit/           content hashing + the verifiable trail
   api/             the FastAPI app, webhook security, payload mapping, dashboard
 tests/             one module per package, plus the gated Temporal/Postgres/E2E tests
