@@ -239,6 +239,25 @@ def main() -> None:
         help="Time bucket for the trend (default: day).",
     )
 
+    fail_repo_trends_p = sub.add_parser(
+        "failures-by-repo-trends",
+        help="Print recent failures grouped by routed repo and bucketed over time, "
+        "most-frequent first (offline twin of "
+        "GET /metrics/failures/by-repo/trends).",
+    )
+    fail_repo_trends_p.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Only count runs that failed in the last N days (default: 30).",
+    )
+    fail_repo_trends_p.add_argument(
+        "--bucket",
+        default="day",
+        choices=("day", "week"),
+        help="Time bucket for the trend (default: day).",
+    )
+
     sub.add_parser(
         "approvals",
         help="Print runs awaiting human approval, oldest first (offline twin of "
@@ -344,6 +363,8 @@ def main() -> None:
         _run_failures_trends(args)
     elif args.command == "failures-by-category-trends":
         _run_failures_by_category_trends(args)
+    elif args.command == "failures-by-repo-trends":
+        _run_failures_by_repo_trends(args)
     elif args.command == "approvals":
         _run_approvals()
     elif args.command == "executions":
@@ -816,6 +837,42 @@ def _run_failures_by_category_trends(args: argparse.Namespace) -> None:
             f"({cat['blocked']} blocked, {cat['failed']} execution-failed)"
         )
         for period_iso, cell in zip(periods, cat["series"]):
+            print(
+                f"    {label} {period_iso[:10]}  failures {cell['count']:>3}  "
+                f"blocked {cell['blocked']:>3}  "
+                f"execution-failed {cell['failed']:>3}"
+            )
+        print()
+
+
+def _run_failures_by_repo_trends(args: argparse.Namespace) -> None:
+    from foundry.memory.metrics import failures_by_repo_trends
+
+    since = _since_from_days(args.days)
+
+    _settings, session_factory = _session_factory()
+    with session_factory() as session:
+        report = failures_by_repo_trends(session, since=since, bucket=args.bucket)
+
+    repos = report["repos"]
+    if not repos:
+        print(f"No runs failed in the last {args.days}d - nothing to triage.")
+        return
+
+    periods = report["periods"]
+    label = "week of" if args.bucket == "week" else "day"
+    print(
+        f"Failures by repo by {args.bucket} (last {args.days}d): "
+        f"{report['count']} total across {report['distinct_repos']} "
+        f"repo(s), {report['blocked']} blocked, {report['failed']} "
+        f"execution-failed (most frequent first):\n"
+    )
+    for repo in repos:
+        print(
+            f"{repo['repo']}: {repo['count']} total "
+            f"({repo['blocked']} blocked, {repo['failed']} execution-failed)"
+        )
+        for period_iso, cell in zip(periods, repo["series"]):
             print(
                 f"    {label} {period_iso[:10]}  failures {cell['count']:>3}  "
                 f"blocked {cell['blocked']:>3}  "

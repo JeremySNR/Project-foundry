@@ -1477,3 +1477,78 @@ def test_failures_by_category_trends_accepts_week_bucket(client) -> None:
     ).json()
     assert body["bucket"] == "week"
     assert body["count"] == 1
+
+
+# -- GET /metrics/failures/by-repo/trends (by-repo over-time, issue #37) -------
+
+
+def test_failures_by_repo_trends_requires_bearer_token(client) -> None:
+    assert client.get("/metrics/failures/by-repo/trends").status_code == 401
+    assert (
+        client.get(
+            "/metrics/failures/by-repo/trends",
+            headers={"Authorization": "Bearer wrong"},
+        ).status_code
+        == 401
+    )
+
+
+def test_failures_by_repo_trends_rejects_bad_window(client) -> None:
+    assert (
+        client.get(
+            "/metrics/failures/by-repo/trends?days=0", headers=AUTH
+        ).status_code
+        == 422
+    )
+
+
+def test_failures_by_repo_trends_rejects_bad_bucket(client) -> None:
+    assert (
+        client.get(
+            "/metrics/failures/by-repo/trends?bucket=month", headers=AUTH
+        ).status_code
+        == 422
+    )
+
+
+def test_failures_by_repo_trends_empty_database(client) -> None:
+    body = client.get("/metrics/failures/by-repo/trends", headers=AUTH).json()
+    assert body["days"] == 30
+    assert body["bucket"] == "day"  # the failure-trend default
+    assert body["count"] == 0
+    assert body["distinct_repos"] == 0
+    assert body["periods"] == []
+    assert body["repos"] == []
+
+
+def test_failures_by_repo_trends_groups_blocked_run(client) -> None:
+    _run_to_blocked(client)
+    body = client.get("/metrics/failures/by-repo/trends", headers=AUTH).json()
+    assert body["count"] == 1
+    assert body["distinct_repos"] == 1
+    repo = body["repos"][0]
+    assert repo["count"] == 1
+    assert repo["blocked"] == 1
+    # One shared axis; the repo's series sums to its window count.
+    assert sum(cell["count"] for cell in repo["series"]) == 1
+
+
+def test_failures_by_repo_trends_matches_rollup_totals(client) -> None:
+    # The by-repo over-time cut must agree with the point-in-time by-repo roll-up
+    # it refines: same runs, same window, same derivation.
+    _run_to_blocked(client, issue_id="issue-rt1", key="LIN-941")
+    _run_to_blocked(client, issue_id="issue-rt2", key="LIN-942")
+    rollup = client.get("/metrics/failures/by-repo", headers=AUTH).json()
+    cut = client.get("/metrics/failures/by-repo/trends", headers=AUTH).json()
+    assert cut["count"] == rollup["count"] == 2
+    assert cut["blocked"] == rollup["blocked"]
+    assert cut["distinct_repos"] == rollup["distinct_repos"]
+
+
+def test_failures_by_repo_trends_accepts_week_bucket(client) -> None:
+    _run_to_blocked(client)
+    body = client.get(
+        "/metrics/failures/by-repo/trends?bucket=week", headers=AUTH
+    ).json()
+    assert body["bucket"] == "week"
+    assert body["count"] == 1

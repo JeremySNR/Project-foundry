@@ -1579,6 +1579,46 @@ def create_app(
                 **failures_by_category_trends(session, since=since, bucket=bucket),
             }
 
+    @app.get("/metrics/failures/by-repo/trends")
+    def metrics_failures_by_repo_trends(
+        request: Request, days: int = 30, bucket: str = "day"
+    ) -> dict[str, Any]:
+        """Recently-failed runs **grouped by routed repo and bucketed over time** -
+        the by-repo dimension of ``GET /metrics/failures/trends``, the way
+        ``/metrics/failures/by-category/trends`` is to it by *reason* and
+        ``/metrics/delivery/by-repo/trends`` is to ``/metrics/delivery/trends``.
+
+        Where the org-wide trend answers *"are we failing more than usual?"* and
+        the point-in-time ``/metrics/failures/by-repo`` roll-up answers *"which
+        repo is failing most right now?"*, this answers the question neither can:
+        *is **this repo's** failure rate climbing or fading over time?* Each repo
+        carries a zero-filled ``series`` on one shared time axis (``day`` or
+        ``week``) so the per-repo sparklines line up column-for-column, plus its
+        window totals; runs that never routed bucket under an explicit
+        ``(unrouted)`` sentinel.
+
+        Reuses the same failure-event derivation the feed, the by-repo roll-up and
+        the org-wide trend serve, so the totals can't drift. Read-only, changes no
+        gate: a blocked run stays blocked (invariant #7). Token-gated and
+        fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS, failures_by_repo_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **failures_by_repo_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/policy")
     def metrics_policy(request: Request) -> dict[str, Any]:
         """The effective policy gate this deployment resolves to - the read-only,
