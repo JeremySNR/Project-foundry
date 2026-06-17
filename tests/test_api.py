@@ -899,6 +899,19 @@ def test_dashboard_delivery_trend_renders_latency_columns() -> None:
     assert "<th>median to approval</th><th>median to merge</th>" in DASHBOARD_HTML
 
 
+def test_dashboard_trend_sparklines_carry_latency_in_tooltip() -> None:
+    """The by-repo / by-work-type delivery-trend sparkline strips (issue #37)
+    must enrich each per-week bar's hover tooltip with that week's median
+    sign-off and shipping latency — the per-cell data #143/#145 added to the
+    trend endpoints (the same fields the org-wide trend table renders as
+    columns), surfaced on the many-series strips as hover detail."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert "c.time_to_approval_seconds" in DASHBOARD_HTML
+    assert "c.time_to_merge_seconds" in DASHBOARD_HTML
+    assert "to approval / ${dur(ttm)} to merge" in DASHBOARD_HTML
+
+
 def test_dashboard_renders_failures_by_category_panel() -> None:
     """The failures-by-category panel (issue #37) must fetch the
     by-category endpoint, have a panel to render into, and be wired into the
