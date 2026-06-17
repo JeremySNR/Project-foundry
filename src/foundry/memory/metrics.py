@@ -1703,6 +1703,133 @@ def failure_trends(
     }
 
 
+def failures_by_category_trends(
+    session, *, since: datetime, bucket: str = "day", now: datetime | None = None
+) -> dict:
+    """Recently-failed runs **grouped by reason and bucketed over time** - the
+    by-category dimension of :func:`failure_trends`, the way
+    :func:`delivery_by_work_type_trends` is to :func:`delivery_trends`.
+
+    The org-wide :func:`failure_trends` shows whether we are failing *more* than
+    usual; the point-in-time :func:`failures_by_category` roll-up shows *what* is
+    failing most right now. Neither answers the question this does: *is a
+    **specific** systemic blocker (``policy_denied``, ``budget_exceeded``,
+    ``forbidden_path``, ...) trending up or fading?* - the direction-of-travel of
+    each reason, so an on-call can tell a one-off spike from a worsening
+    regression.
+
+    Every run currently in a terminal-failure state (:data:`FAILURE_STATUSES`)
+    whose failure happened within the window (at or after ``since``) is grouped by
+    its failure ``reason`` (the ``category``/``reason`` from the
+    ``RUN_BLOCKED``/``AGENT_FAILED`` audit metadata, via the same
+    :func:`_failure_event_map` derivation the feed, the by-category roll-up and
+    the org-wide trend use, so the totals here can never drift from theirs) and
+    bucketed by ``bucket_start`` of its failure time. Runs with no parseable
+    reason bucket under :data:`UNKNOWN_FAILURE_CATEGORY`.
+
+    Every category's ``series`` is aligned to one shared time axis spanning the
+    first to the last *populated* period (across all categories), zero-filled so
+    the per-category sparklines line up column-for-column - the same shape and
+    shared :func:`_delivery_axis` the delivery trends use. Each category also
+    carries its window totals (``count`` with a ``blocked``/``failed`` split) so a
+    caller can label the trend without a second query. Categories are ordered
+    **most-frequent first**, ties broken by most-recent then name - the same order
+    as :func:`failures_by_category` so the point-in-time and over-time cuts read
+    consistently.
+
+    Read-only - it surfaces what already happened and blocks/merges nothing. A
+    blocked run stays blocked (invariant #7).
+    """
+    if bucket not in TREND_BUCKETS:
+        raise ValueError(f"bucket must be one of {TREND_BUCKETS}, got {bucket!r}")
+
+    now = _as_utc(now or datetime.now(timezone.utc))
+    since = _as_utc(since)
+    runs: list[FoundryRun] = (
+        session.query(FoundryRun)
+        .filter(FoundryRun.status.in_(FAILURE_STATUSES))
+        .all()
+    )
+    failed_map = _failure_event_map(session, runs)
+
+    # category -> period_start -> accumulator, plus per-category window totals and
+    # the smallest elapsed seen (the most-recent failure) for the recency tiebreak.
+    per_period: dict[str, dict[datetime, dict]] = {}
+    totals: dict[str, dict] = {}
+    newest_elapsed: dict[str, int] = {}
+    total = blocked_total = failed_total = 0
+    for run in runs:
+        marked = failed_map.get(run.id)
+        # Fall back to the immutable created_at (not the drift-prone updated_at)
+        # when a failed run carries no marker event - same rule as the feed.
+        if marked is not None:
+            failed_at, reason = marked
+        else:
+            failed_at, reason = run.created_at, None
+        failed_at = _as_utc(failed_at)
+        if failed_at < since:
+            continue  # an older incident, outside the window
+        elapsed = max(0, int((now - failed_at).total_seconds()))
+        category = reason or UNKNOWN_FAILURE_CATEGORY
+        is_blocked = run.status == RunStatus.BLOCKED
+
+        agg = per_period.setdefault(category, {}).setdefault(
+            bucket_start(failed_at, bucket), _empty_failure_period()
+        )
+        cat_total = totals.setdefault(category, _empty_failure_period())
+        for target in (agg, cat_total):
+            target["count"] += 1
+            if is_blocked:
+                target["blocked"] += 1
+            else:
+                target["failed"] += 1
+        if is_blocked:
+            blocked_total += 1
+        else:
+            failed_total += 1
+        prev = newest_elapsed.get(category)
+        newest_elapsed[category] = elapsed if prev is None else min(prev, elapsed)
+        total += 1
+
+    # One shared axis across every category so the per-category series align.
+    populated = [start for periods in per_period.values() for start in periods]
+    axis = _delivery_axis(populated, bucket)
+
+    out_categories = []
+    for category, cat_total in totals.items():
+        periods = per_period[category]
+        out_categories.append(
+            {
+                "category": category,
+                "count": cat_total["count"],
+                "blocked": cat_total["blocked"],
+                "failed": cat_total["failed"],
+                "newest_failure_seconds": newest_elapsed[category],
+                "series": [
+                    _render_failure_period(start, periods.get(start)) for start in axis
+                ],
+            }
+        )
+
+    # Most-frequent first; ties to the most-recently-seen (smallest newest age),
+    # then category name - the same order as failures_by_category.
+    out_categories.sort(
+        key=lambda c: (-c["count"], c["newest_failure_seconds"], c["category"])
+    )
+
+    return {
+        "now": now.isoformat(),
+        "since": since.isoformat(),
+        "bucket": bucket,
+        "count": total,
+        "blocked": blocked_total,
+        "failed": failed_total,
+        "distinct_categories": len(out_categories),
+        "periods": [start.isoformat() for start in axis],
+        "categories": out_categories,
+    }
+
+
 def fleet_status(
     session,
     *,
