@@ -960,6 +960,22 @@ def test_dashboard_renders_failures_by_repo_trend_strip() -> None:
     assert "loadFailuresByRepoTrends();" in DASHBOARD_HTML
 
 
+def test_dashboard_renders_failures_by_work_type_trend_strip() -> None:
+    """The failures-by-work-type trend sparkline strip (issue #37) must fetch the
+    by-work-type/trends endpoint, have a panel to render into, and be wired into
+    the refresh loop — the in-page render of the per-work-type failure trend
+    ("is *this kind of work's* failure rate climbing or fading over time, are
+    bugs failing more while features ship?"), the by-work-type dimension of the
+    failure trend in failure-red. It completes the failure-trend strip set the
+    way the delivery surface has both a by-repo and a by-work-type trend strip,
+    mirroring the failures-by-category and failures-by-repo trend strips."""
+    from foundry.api.dashboard import DASHBOARD_HTML
+
+    assert 'fetch("metrics/failures/by-work-type/trends' in DASHBOARD_HTML
+    assert '<div id="failure-work-type-trends"></div>' in DASHBOARD_HTML
+    assert "loadFailuresByWorkTypeTrends();" in DASHBOARD_HTML
+
+
 # -- Enricher wiring via build_orchestrator ------------------------------------
 
 
