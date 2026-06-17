@@ -441,6 +441,91 @@ class FoundryRepoCatalogEntry(TenantScoped, Base):
     )
 
 
+class FoundryScimUser(TenantScoped, Base):
+    """A user provisioned by an IdP over SCIM 2.0 (issue #157).
+
+    SCIM lets an IdP create/update/deactivate the identities Foundry knows about,
+    so an operator no longer has to hand-maintain a static approver list. The row
+    holds **only identity + lifecycle state** - never a role grant. Authority is
+    derived the same way it always has been: an active user's group memberships
+    (:class:`FoundryScimGroupMember`) are mapped through the *committed*
+    ``oidc_group_role_map`` to approver roles, so a SCIM payload can never assert
+    a role itself (invariant #5). Deactivating a user (``active = False``, the
+    standard SCIM de-provisioning signal) revokes that derived authority.
+
+    ``user_name`` is the SCIM ``userName`` - email-shaped and the key that binds a
+    provisioned user to a verified OIDC subject claim at approval time. Unique
+    per org so two tenants can each provision the same address.
+    """
+
+    __tablename__ = "foundry_scim_users"
+    __table_args__ = (
+        UniqueConstraint("org_id", "user_name", name="uq_scim_user_username"),
+        Index("ix_foundry_scim_users_external_id", "external_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # SCIM resource id
+    user_name: Mapped[str] = mapped_column(String(320))  # SCIM userName (email-shaped)
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The SCIM de-provisioning signal: an inactive user keeps its row (so it can
+    # be re-activated) but contributes no approval authority.
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class FoundryScimGroup(TenantScoped, Base):
+    """A group provisioned by an IdP over SCIM 2.0 (issue #157).
+
+    ``display_name`` is the SCIM ``displayName`` and is exactly the key looked up
+    in the committed ``oidc_group_role_map`` - so a provisioned group only grants
+    roles the operator has already mapped to that group name in config. Deleting
+    a group (or removing a user from it) revokes the roles it conferred. Unique
+    per org.
+    """
+
+    __tablename__ = "foundry_scim_groups"
+    __table_args__ = (
+        UniqueConstraint("org_id", "display_name", name="uq_scim_group_displayname"),
+        Index("ix_foundry_scim_groups_external_id", "external_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # SCIM resource id
+    display_name: Mapped[str] = mapped_column(String(255))  # maps via oidc_group_role_map
+    external_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class FoundryScimGroupMember(TenantScoped, Base):
+    """Membership edge between a SCIM group and a SCIM user (issue #157).
+
+    The join table behind a group's SCIM ``members`` and the role resolution that
+    maps an active user's groups to approver roles. Unique ``(group_id, user_id)``
+    so a user is listed at most once per group.
+    """
+
+    __tablename__ = "foundry_scim_group_members"
+    __table_args__ = (
+        UniqueConstraint("group_id", "user_id", name="uq_scim_group_member"),
+        Index("ix_foundry_scim_group_members_user", "user_id"),
+        Index("ix_foundry_scim_group_members_group", "group_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    group_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("foundry_scim_groups.id", ondelete="CASCADE")
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("foundry_scim_users.id", ondelete="CASCADE")
+    )
+
+
 # Every table carrying an ``org_id`` (issue #156). The session machinery in
 # ``db/base.py`` reads this tuple to stamp the active org on new rows at flush
 # time and to filter every ORM SELECT to the current org, so a unit of work
@@ -455,4 +540,7 @@ TENANT_SCOPED_MODELS: tuple[type[TenantScoped], ...] = (
     FoundryRunOutcome,
     FoundryWebhookDelivery,
     FoundryRepoCatalogEntry,
+    FoundryScimUser,
+    FoundryScimGroup,
+    FoundryScimGroupMember,
 )

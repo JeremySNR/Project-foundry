@@ -73,8 +73,13 @@ def _intake(session_factory, org: str | None = None) -> str:
 # --------------------------------------------------------------------------- #
 
 def test_every_tenant_table_has_org_id() -> None:
-    """All eight tenant-scoped tables carry the column the isolation relies on."""
-    assert len(TENANT_SCOPED_MODELS) == 8
+    """All tenant-scoped tables carry the column the isolation relies on.
+
+    Eleven today: the original eight (#156) plus the three SCIM provisioning
+    tables (#157), all of which inherit ``TenantScoped`` so a provisioned
+    directory is isolated per org.
+    """
+    assert len(TENANT_SCOPED_MODELS) == 11
     for model in TENANT_SCOPED_MODELS:
         assert "org_id" in model.__table__.columns
         col = model.__table__.columns["org_id"]

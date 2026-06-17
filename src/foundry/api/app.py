@@ -102,6 +102,16 @@ from .oidc_login import (
     OidcLogin,
     OidcLoginError,
 )
+from .scim import (
+    ScimError,
+    ScimStore,
+    list_response,
+    member_ids_from_value,
+    parse_displayname_filter,
+    parse_username_filter,
+    to_scim_group,
+    to_scim_user,
+)
 from .sessions import SessionSigner
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
@@ -228,6 +238,7 @@ def create_app(
     oidc_group_role_map: Mapping[str, Iterable[str]] | None = None,
     oidc_org_claim: str | None = None,
     oidc_login: OidcLogin | None = None,
+    scim_bearer_token: str | None = None,
     ticket_mapper: TicketMapper | None = None,
     github_webhook_secret: str | None = None,
     github_connector: GitHubConnector | None = None,
@@ -305,6 +316,16 @@ def create_app(
     # login config so the read path can verify the cookie it mints.
     app.state.oidc_login = oidc_login
     app.state.session_signer = oidc_login.signer if oidc_login is not None else None
+    # SCIM 2.0 provisioning (issue #157). When a provisioning bearer token is set,
+    # the /scim/v2 endpoints let an IdP create/update/deactivate users and groups;
+    # the store reads/writes the DB through the same session factory (tenant-
+    # scoped). The committed ``oidc_group_role_map`` still owns the group->role
+    # mapping, so a SCIM payload provisions *membership*, never a role (invariant
+    # #5). Unset => the SCIM surface is disabled and role resolution never consults
+    # the store, so a non-SCIM deployment is byte-for-byte unchanged.
+    app.state.scim_bearer_token = scim_bearer_token
+    app.state.scim_enabled = bool(scim_bearer_token)
+    app.state.scim_store = ScimStore(session_factory) if scim_bearer_token else None
     app.state.ticket_mapper = ticket_mapper or linear_payload_to_ticket
     # GitHub PR webhooks default to the same signing secret unless given one.
     app.state.github_webhook_secret = github_webhook_secret or webhook_secret
@@ -1837,6 +1858,19 @@ def create_app(
                         f"('{app.state.oidc_subject_claim}' or 'sub')"
                     ),
                 )
+            # SCIM-provisioned directory (issue #157). An active provisioned user's
+            # group memberships add roles via the committed map; a de-provisioned
+            # (inactive) user has its approval authority revoked outright. Roles
+            # are still committed-config-derived - SCIM only supplies membership.
+            store = app.state.scim_store
+            if store is not None:
+                res = store.resolve_identity(user, app.state.oidc_group_role_map)
+                if res.provisioned and not res.active:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="approver has been de-provisioned (SCIM active=false)",
+                    )
+                roles = set(roles) | set(res.roles)
             body_user = body.get("user")
             if body_user and body_user != user:
                 raise HTTPException(
@@ -1891,6 +1925,130 @@ def create_app(
         if command.command == "approve":
             result["dispatched"] = run.status is RunStatus.AGENT_RUNNING
         return result
+
+    # ---- SCIM 2.0 provisioning (issue #157) --------------------------------
+    # An IdP creates/updates/deactivates users and groups here; an active user's
+    # group memberships map to approver roles through the committed
+    # ``oidc_group_role_map`` (the group displayName is the key), so the surface
+    # provisions *membership*, never roles (invariant #5). Authenticated by a
+    # dedicated provisioning bearer token; disabled (403) when none is set, so a
+    # non-SCIM deployment never exposes it.
+
+    @app.exception_handler(ScimError)
+    async def _scim_error_handler(_request: Request, exc: ScimError) -> JSONResponse:
+        return _scim_json(exc.to_dict(), status=exc.status)
+
+    @app.post("/scim/v2/Users")
+    async def scim_create_user(request: Request) -> Response:
+        store = _require_scim(app, request)
+        body = await _scim_body(request)
+        rec = store.create_user(
+            user_name=body.get("userName"),
+            external_id=body.get("externalId"),
+            display_name=body.get("displayName"),
+            active=body.get("active", True),
+        )
+        resource = to_scim_user(rec)
+        return _scim_json(
+            resource, status=201, location=resource["meta"]["location"]
+        )
+
+    @app.get("/scim/v2/Users/{user_id}")
+    async def scim_get_user(user_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        rec = store.get_user(user_id)
+        if rec is None:
+            raise ScimError(404, f"user {user_id!r} not found")
+        return _scim_json(to_scim_user(rec))
+
+    @app.get("/scim/v2/Users")
+    async def scim_list_users(request: Request) -> Response:
+        store = _require_scim(app, request)
+        user_name = parse_username_filter(request.query_params.get("filter"))
+        recs = store.list_users(user_name=user_name)
+        return _scim_json(list_response([to_scim_user(r) for r in recs]))
+
+    @app.put("/scim/v2/Users/{user_id}")
+    async def scim_replace_user(user_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        body = await _scim_body(request)
+        rec = store.replace_user(
+            user_id,
+            user_name=body.get("userName"),
+            external_id=body.get("externalId"),
+            display_name=body.get("displayName"),
+            active=body.get("active", True),
+        )
+        return _scim_json(to_scim_user(rec))
+
+    @app.patch("/scim/v2/Users/{user_id}")
+    async def scim_patch_user(user_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        body = await _scim_body(request)
+        rec = store.patch_user(user_id, body.get("Operations"))
+        return _scim_json(to_scim_user(rec))
+
+    @app.delete("/scim/v2/Users/{user_id}")
+    async def scim_delete_user(user_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        if not store.delete_user(user_id):
+            raise ScimError(404, f"user {user_id!r} not found")
+        return Response(status_code=204)
+
+    @app.post("/scim/v2/Groups")
+    async def scim_create_group(request: Request) -> Response:
+        store = _require_scim(app, request)
+        body = await _scim_body(request)
+        rec = store.create_group(
+            display_name=body.get("displayName"),
+            external_id=body.get("externalId"),
+            member_ids=_scim_member_ids(body.get("members")),
+        )
+        resource = to_scim_group(rec)
+        return _scim_json(
+            resource, status=201, location=resource["meta"]["location"]
+        )
+
+    @app.get("/scim/v2/Groups/{group_id}")
+    async def scim_get_group(group_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        rec = store.get_group(group_id)
+        if rec is None:
+            raise ScimError(404, f"group {group_id!r} not found")
+        return _scim_json(to_scim_group(rec))
+
+    @app.get("/scim/v2/Groups")
+    async def scim_list_groups(request: Request) -> Response:
+        store = _require_scim(app, request)
+        display_name = parse_displayname_filter(request.query_params.get("filter"))
+        recs = store.list_groups(display_name=display_name)
+        return _scim_json(list_response([to_scim_group(r) for r in recs]))
+
+    @app.put("/scim/v2/Groups/{group_id}")
+    async def scim_replace_group(group_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        body = await _scim_body(request)
+        rec = store.replace_group(
+            group_id,
+            display_name=body.get("displayName"),
+            external_id=body.get("externalId"),
+            member_ids=_scim_member_ids(body.get("members")),
+        )
+        return _scim_json(to_scim_group(rec))
+
+    @app.patch("/scim/v2/Groups/{group_id}")
+    async def scim_patch_group(group_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        body = await _scim_body(request)
+        rec = store.patch_group(group_id, body.get("Operations"))
+        return _scim_json(to_scim_group(rec))
+
+    @app.delete("/scim/v2/Groups/{group_id}")
+    async def scim_delete_group(group_id: str, request: Request) -> Response:
+        store = _require_scim(app, request)
+        if not store.delete_group(group_id):
+            raise ScimError(404, f"group {group_id!r} not found")
+        return Response(status_code=204)
 
     return app
 
@@ -2061,6 +2219,69 @@ def _resolve_oidc_approver(
     for group in groups:
         roles |= app.state.oidc_group_role_map.get(group, set())
     return identity, roles
+
+
+def _require_scim(app: FastAPI, request: Request) -> ScimStore:
+    """Auth-gate a SCIM request and hand back the store (issue #157).
+
+    Fail-closed: the surface is **disabled (403)** unless a provisioning bearer
+    token is configured, so a non-SCIM deployment never exposes provisioning.
+    Authenticated by a constant-time compare against that dedicated token - the
+    machine-to-machine provisioning credential, distinct from the human approval
+    token and never an OIDC user token or session cookie.
+    """
+    token = app.state.scim_bearer_token
+    store: ScimStore | None = app.state.scim_store
+    if not token or store is None:
+        raise ScimError(
+            403, "SCIM provisioning is disabled (set FOUNDRY_SCIM_BEARER_TOKEN)"
+        )
+    provided = request.headers.get("authorization", "")
+    if not hmac.compare_digest(provided, f"Bearer {token}"):
+        raise ScimError(401, "invalid or missing SCIM bearer token")
+    return store
+
+
+def _scim_json(
+    body: dict[str, Any], *, status: int = 200, location: str | None = None
+) -> JSONResponse:
+    """A JSON response with the SCIM content type (and optional Location)."""
+    headers = {"Location": location} if location else None
+    return JSONResponse(
+        content=body,
+        status_code=status,
+        media_type="application/scim+json",
+        headers=headers,
+    )
+
+
+async def _scim_body(request: Request) -> dict[str, Any]:
+    """Parse a SCIM request body as a JSON object, raising a SCIM error if not.
+
+    Read from the raw body (not FastAPI's ``Body``) so any content type an IdP
+    sends - ``application/scim+json`` or ``application/json`` - is accepted.
+    """
+    raw = await request.body()
+    if not raw:
+        raise ScimError(400, "request body required", scim_type="invalidSyntax")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ScimError(
+            400, "request body is not valid JSON", scim_type="invalidSyntax"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ScimError(
+            400, "request body must be a JSON object", scim_type="invalidSyntax"
+        )
+    return data
+
+
+def _scim_member_ids(members: Any) -> list[str]:
+    """User ids from a SCIM Group ``members`` array (``[{value: id}, ...]``)."""
+    if members is None:
+        return []
+    return member_ids_from_value(members)
 
 
 def _actor_identity(payload: dict[str, Any]) -> str | None:
@@ -2623,6 +2844,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         },
         oidc_org_claim=settings.oidc_org_claim,
         oidc_login=oidc_login,
+        scim_bearer_token=settings.scim_bearer_token,
         github_webhook_secret=settings.github_webhook_secret,
         github_connector=github_connector,
         jira_webhook_secret=settings.jira_webhook_secret,

@@ -508,6 +508,20 @@ auth:
   #   # FOUNDRY_OIDC_END_SESSION_ENDPOINT / FOUNDRY_OIDC_POST_LOGOUT_REDIRECT_URI.
   #   end_session_endpoint: "https://login.example.com/v2/logout"
   #   post_logout_redirect_uri: "https://foundry.example.com/dashboard"
+  #
+  # --- SCIM 2.0 provisioning (issue #157) ---
+  # The SCIM /scim/v2/Users + /scim/v2/Groups surface lets your IdP provision and
+  # DE-PROVISION the users/groups Foundry recognises, instead of hand-maintaining
+  # the `approval.approvers` list below. It is gated by a dedicated env-only
+  # provisioning bearer token (FOUNDRY_SCIM_BEARER_TOKEN) - there is no YAML knob
+  # because it is a secret; UNSET => the surface is disabled (403) and approver-
+  # role resolution never consults the provisioned directory, so a non-SCIM
+  # deployment is unchanged. SCIM provisions MEMBERSHIP, never roles: an active
+  # provisioned user's group memberships map to approver roles through the
+  # committed `auth.oidc.group_role_map` above (the group displayName is the key),
+  # and deactivating a user (active:false) or removing it from a group REVOKES
+  # that authority (invariants #1, #5). A provisioned user binds to a verified
+  # OIDC approval by userName == the verified subject claim (email).
 
 notifications:
   # Channel id (e.g. "C01APPROVALS") Foundry posts approval messages + status
