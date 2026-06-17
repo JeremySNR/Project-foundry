@@ -410,6 +410,80 @@ def test_cli_explain_surfaces_change_freeze_windows(
     assert "Weekend release blackout" in out
 
 
+def test_cli_explain_marks_active_change_freeze_now(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The offline twin of GET /metrics/policy's `active_freeze`: with a clock
+    # inside the change-management weekend blackout, `explain` marks the window
+    # ACTIVE NOW and prints the CHANGE FREEZE ACTIVE banner (the CLI mirror of
+    # the dashboard's banner).
+    from datetime import datetime, timezone
+
+    from foundry.policy.cli import main
+
+    saturday_noon = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    main(["explain", "change-management"], now=saturday_noon)
+    out = capsys.readouterr().out
+    assert "[ACTIVE NOW] sat/sun 00:00-23:59 UTC" in out
+    assert "CHANGE FREEZE ACTIVE" in out
+    assert "held for a human right now" in out
+
+
+def test_cli_explain_no_active_freeze_outside_window(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Same preset, but a weekday clock: the window is still listed, but it is not
+    # marked active and no banner prints (autonomous retries are not held).
+    from datetime import datetime, timezone
+
+    from foundry.policy.cli import main
+
+    wednesday_noon = datetime(2026, 6, 17, 12, 0, tzinfo=timezone.utc)
+    main(["explain", "change-management"], now=wednesday_noon)
+    out = capsys.readouterr().out
+    assert "sat/sun 00:00-23:59 UTC" in out  # still listed
+    assert "ACTIVE NOW" not in out
+    assert "CHANGE FREEZE ACTIVE" not in out
+
+
+def test_cli_explain_json_carries_active_freeze(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # json mode adds a top-level `active_freeze` mirroring the GET /metrics/policy
+    # shape: {description, reason} when in effect, null otherwise.
+    import json
+    from datetime import datetime, timezone
+
+    from foundry.policy.cli import main
+
+    saturday_noon = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+    main(["explain", "change-management", "--format", "json"], now=saturday_noon)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["active_freeze"] == {
+        "description": "sat/sun 00:00-23:59 UTC - Weekend release blackout",
+        "reason": "Weekend release blackout",
+    }
+
+    wednesday_noon = datetime(2026, 6, 17, 12, 0, tzinfo=timezone.utc)
+    main(["explain", "change-management", "--format", "json"], now=wednesday_noon)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["active_freeze"] is None
+
+
+def test_cli_explain_json_active_freeze_null_when_no_windows(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A preset with no change-freeze windows always reports active_freeze: null,
+    # byte-for-byte the prior behaviour (the field is purely additive).
+    import json
+
+    from foundry.policy.cli import main
+
+    main(["explain", "soc2", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["active_freeze"] is None
+
+
 def test_cli_unknown_preset_exits_nonzero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
