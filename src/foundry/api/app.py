@@ -1539,6 +1539,46 @@ def create_app(
                 **failure_trends(session, since=since, bucket=bucket),
             }
 
+    @app.get("/metrics/failures/by-category/trends")
+    def metrics_failures_by_category_trends(
+        request: Request, days: int = 30, bucket: str = "day"
+    ) -> dict[str, Any]:
+        """Recently-failed runs **grouped by reason and bucketed over time** - the
+        by-category dimension of ``GET /metrics/failures/trends``, the way
+        ``/metrics/delivery/by-work-type/trends`` is to ``/metrics/delivery/trends``.
+
+        Where the org-wide trend answers *"are we failing more than usual?"* and
+        the point-in-time ``/metrics/failures/by-category`` roll-up answers *"what
+        is failing most right now?"*, this answers the question neither can: *is a
+        **specific** systemic blocker (``policy_denied``, ``budget_exceeded``, ...)
+        trending up or fading?* Each category carries a zero-filled ``series`` on
+        one shared time axis (``day`` or ``week``) so the per-category sparklines
+        line up column-for-column, plus its window totals; runs whose failure
+        carries no parseable reason bucket under an explicit ``(unknown)``
+        sentinel.
+
+        Reuses the same failure-event derivation the feed, the by-category roll-up
+        and the org-wide trend serve, so the totals can't drift. Read-only, changes
+        no gate: a blocked run stays blocked (invariant #7). Token-gated and
+        fail-closed like the other metrics endpoints.
+        """
+        from foundry.memory.metrics import TREND_BUCKETS, failures_by_category_trends
+
+        _require_api_token(app, request)
+        if days < 1:
+            raise HTTPException(status_code=422, detail="days must be >= 1")
+        if bucket not in TREND_BUCKETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"bucket must be one of {list(TREND_BUCKETS)}",
+            )
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        with app.state.session_factory() as session:
+            return {
+                "days": days,
+                **failures_by_category_trends(session, since=since, bucket=bucket),
+            }
+
     @app.get("/metrics/policy")
     def metrics_policy(request: Request) -> dict[str, Any]:
         """The effective policy gate this deployment resolves to - the read-only,
