@@ -318,6 +318,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="epics"></div>
 <div id="policy"></div>
 <div id="policy-check"></div>
+<div id="integrity"></div>
 <main>
   <div id="runs"></div>
   <div id="detail"><div class="empty">Select a run to see its full decision timeline.</div></div>
@@ -1481,6 +1482,45 @@ async function loadPolicyCheck() {
   }
 }
 
+// The org-wide audit-integrity verdict (issue #34) - the always-on, in-app twin
+// of the `foundry-evidence verify` CLI gate (#132). Read-only; recomputes the
+// tamper-evidence audit chain (#36) for every run in the window so an auditor
+// sees "is the audit trail intact right now?" on the dashboard, the audit-trail
+// sibling of the compliance-check panel above. A tampered chain is reported,
+// never blocked or repaired.
+async function loadIntegrity() {
+  const el = $("#integrity");
+  if (!hasAuth()) {
+    el.style.display = "none";  // unauthenticated: skip the call, it can only 401
+    return;
+  }
+  try {
+    const resp = await fetch("metrics/integrity", { headers: authHeaders() });
+    if (!resp.ok) { el.style.display = "none"; return; }
+    const m = await resp.json();
+    const verdict = m.verified
+      ? '<span class="badge b-green">VERIFIED</span>'
+      : `<span class="badge b-red">TAMPERED</span> <span class="kv">${(m.failed || []).length} run(s) failed</span>`;
+    const failed = (m.failed || []).map((id) =>
+      `<tr><td><span class="badge b-red">FAIL</span></td><td><code class="run" data-id="${esc(id)}" title="open timeline">${esc(id)}</code></td></tr>`
+    ).join("");
+    const failedTable = failed
+      ? `<table>${failed}</table>`
+      : '<div class="kv">every run's audit chain verified</div>';
+    el.innerHTML = `<details><summary>audit integrity &mdash; is every run's audit chain intact? (the in-app twin of <code>foundry-evidence verify</code>)</summary>
+      <div style="padding:6px 0">verdict: ${verdict} <span class="kv">${m.run_count} run(s) in window</span></div>
+      ${failedTable}
+      <div class="kv">read-only continuous tamper-evidence check over the cross-row audit hash chain &mdash; it reports a broken chain, it blocks no run</div>
+    </details>`;
+    el.querySelectorAll("[data-id]").forEach((node) => {
+      node.addEventListener("click", () => loadTimeline(node.dataset.id));
+    });
+    el.style.display = "block";
+  } catch (err) {
+    el.style.display = "none";
+  }
+}
+
 function refresh() {
   loadRuns();
   loadFleet();
@@ -1506,6 +1546,7 @@ function refresh() {
   loadEpics();
   loadPolicy();
   loadPolicyCheck();
+  loadIntegrity();
 }
 
 $("#save").addEventListener("click", () => {

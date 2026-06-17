@@ -47,6 +47,7 @@ from foundry.compliance import (
     build_epic_evidence_pack,
     build_evidence_archive,
     build_evidence_pack,
+    build_integrity_archive,
     render_archive_html,
     render_archive_pdf,
     render_epic_evidence_html,
@@ -1738,6 +1739,53 @@ def create_app(
                 "weaknesses": [],
             }
         return {"configured": True, **check}
+
+    @app.get("/metrics/integrity")
+    def metrics_integrity(
+        request: Request,
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = None,
+        days: int | None = None,
+    ) -> dict[str, Any]:
+        """The audit-integrity verdict of every run in a window - the read-only,
+        always-on, in-app twin of the ``foundry-evidence verify`` CLI gate (#132).
+
+        Recomputes the tamper-evidence audit chain (#36) for each run in the range
+        and returns the org-wide pass/fail (``verified``), the ``run_count``, the
+        list of runs whose chain didn't verify (``failed``), and the per-run
+        verdicts (``runs``). It runs the *same* ``build_integrity_archive`` that
+        backs ``foundry-evidence verify`` and an evidence pack's ``integrity``
+        block, so the dashboard signal can't drift from the CLI gate's verdict -
+        the audit-trail sibling of how ``GET /metrics/policy/check`` mirrors
+        ``foundry-policy check``. So "is the audit trail intact right now?" is
+        answerable on the dashboard without a terminal.
+
+        Bound the window with ISO 8601 ``from``/``to`` (``from`` inclusive, ``to``
+        exclusive; a date-only ``to`` covers the whole day) or with ``days`` (the
+        last N days); with nothing supplied it defaults to the last 90 days, the
+        same semantics as ``GET /evidence`` and ``foundry-evidence verify``. Token-
+        gated and fail-closed like the other metrics endpoints; read-only, changes
+        no gate - a tampered chain is *reported*, not blocked or repaired.
+        """
+        _require_api_token(app, request)
+        until = (
+            _parse_iso_bound(to, inclusive_day_end=True)
+            if to
+            else datetime.now(timezone.utc)
+        )
+        if from_:
+            since = _parse_iso_bound(from_, inclusive_day_end=False)
+        else:
+            window = 90 if days is None else days
+            if window < 1:
+                raise HTTPException(status_code=422, detail="days must be >= 1")
+            since = until - timedelta(days=window)
+        if since >= until:
+            raise HTTPException(
+                status_code=422, detail="'from' must be before 'to'"
+            )
+        with app.state.session_factory() as session:
+            return build_integrity_archive(session, since=since, until=until)
 
     @app.post("/runs/{run_id}/approval")
     def approval(
