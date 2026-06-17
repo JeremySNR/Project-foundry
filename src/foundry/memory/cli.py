@@ -636,6 +636,15 @@ def _sla_note(breaches: int, sla_seconds: int | None) -> str:
     return f"  (SLA {sla_seconds}s, none breaching)"
 
 
+def _cost_sla_note(breaches: int, cost_sla_usd: float | None) -> str:
+    """The spend twin of :func:`_sla_note` for the execution cost SLA."""
+    if cost_sla_usd is None:
+        return ""
+    if breaches:
+        return f"  ({breaches} over budget SLA ${cost_sla_usd:.2f})"
+    return f"  (budget SLA ${cost_sla_usd:.2f}, none breaching)"
+
+
 def _run_fleet() -> None:
     from foundry.memory.metrics import fleet_status
 
@@ -645,6 +654,7 @@ def _run_fleet() -> None:
             session,
             sla_seconds=settings.approval_sla_seconds,
             execution_sla_seconds=settings.execution_sla_seconds,
+            execution_cost_sla_usd=settings.execution_cost_sla_usd,
             review_sla_seconds=settings.review_sla_seconds,
             review_stale_sla_seconds=settings.review_stale_sla_seconds,
         )
@@ -659,10 +669,19 @@ def _run_fleet() -> None:
         f"(oldest wait {_fmt_age(snap['oldest_wait_seconds'])})"
         f"{_sla_note(snap['approvals_breaching_sla'], snap['approval_sla_seconds'])}"
     )
+    costliest = (
+        "-"
+        if snap["costliest_execution_usd"] is None
+        else f"${snap['costliest_execution_usd']}"
+    )
     print(
         f"  agents running  {snap['agents_running']}  "
         f"(oldest run {_fmt_age(snap['oldest_execution_seconds'])})"
         f"{_sla_note(snap['executions_breaching_sla'], snap['execution_sla_seconds'])}"
+    )
+    print(
+        f"  costliest run   {costliest}"
+        f"{_cost_sla_note(snap['executions_breaching_cost'], snap['execution_cost_sla_usd'])}"
     )
     print(
         f"  PRs open        {snap['prs_open']}  "
@@ -940,31 +959,65 @@ def _run_failures_by_work_type_trends(args: argparse.Namespace) -> None:
 
 
 def _render_inflight_queue(
-    *, title: str, empty_msg: str, report: dict, age_key: str, age_header: str
+    *,
+    title: str,
+    empty_msg: str,
+    report: dict,
+    age_key: str,
+    age_header: str,
+    show_cost: bool = False,
 ) -> None:
     """Shared renderer for the single-age in-flight queues (approvals, executions).
 
     Both surface the same per-run shape - a parked run with one age and an
     ``sla_breached`` flag, the queue ordered oldest first - and differ only in the
     age field's name/header and the empty message, so the table layout lives here.
+    With ``show_cost`` (the execution queue) a ``spend`` column is added and the
+    optional budget-SLA breach is rolled into the header note and the per-run flag.
     """
     runs = report["runs"]
     if not runs:
         print(empty_msg)
         return
+    cost_note = ""
+    if show_cost and report.get("cost_sla_usd") is not None:
+        cost_note = (
+            f", {report['cost_breaches']} of {report['count']} over the "
+            f"${report['cost_sla_usd']:.2f} budget SLA"
+        )
     print(
         f"{title}: {report['count']} total"
-        f"{_sla_note(report['sla_breaches'], report['sla_seconds'])} (oldest first):\n"
+        f"{_sla_note(report['sla_breaches'], report['sla_seconds'])}{cost_note} "
+        "(oldest first):\n"
     )
-    print(f"{age_header:<9} {'status':<18} {'issue':<14} {'run':<14} step")
-    for run in runs:
-        breach = "  ! breaching SLA" if run["sla_breached"] else ""
-        step = run["current_step"] or "-"
+    if show_cost:
         print(
-            f"{_fmt_age(run[age_key]):<9} {run['status']:<18} "
-            f"{(run['linear_issue_key'] or '-'):<14} {run['run_id'][:12]:<14} "
-            f"{step}{breach}"
+            f"{age_header:<9} {'spend':<10} {'status':<18} {'issue':<14} {'run':<14} step"
         )
+    else:
+        print(f"{age_header:<9} {'status':<18} {'issue':<14} {'run':<14} step")
+    for run in runs:
+        flags = []
+        if run["sla_breached"]:
+            flags.append("SLA")
+        if show_cost and run.get("cost_breached"):
+            flags.append("budget")
+        breach = f"  ! breaching {', '.join(flags)}" if flags else ""
+        step = run["current_step"] or "-"
+        if show_cost:
+            cost = run.get("cost_usd")
+            cost_str = "-" if cost is None else f"${cost:.2f}"
+            print(
+                f"{_fmt_age(run[age_key]):<9} {cost_str:<10} {run['status']:<18} "
+                f"{(run['linear_issue_key'] or '-'):<14} {run['run_id'][:12]:<14} "
+                f"{step}{breach}"
+            )
+        else:
+            print(
+                f"{_fmt_age(run[age_key]):<9} {run['status']:<18} "
+                f"{(run['linear_issue_key'] or '-'):<14} {run['run_id'][:12]:<14} "
+                f"{step}{breach}"
+            )
 
 
 def _run_approvals() -> None:
@@ -987,13 +1040,18 @@ def _run_executions() -> None:
 
     settings, session_factory = _session_factory()
     with session_factory() as session:
-        report = execution_queue(session, sla_seconds=settings.execution_sla_seconds)
+        report = execution_queue(
+            session,
+            sla_seconds=settings.execution_sla_seconds,
+            cost_sla_usd=settings.execution_cost_sla_usd,
+        )
     _render_inflight_queue(
         title="Execution queue (agents in flight)",
         empty_msg="No agents are currently running.",
         report=report,
         age_key="running_seconds",
         age_header="running",
+        show_cost=True,
     )
 
 

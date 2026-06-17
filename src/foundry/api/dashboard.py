@@ -3,7 +3,8 @@
 Read-only visibility over the audit data that already exists: a live fleet
 strip (runs in flight / approval queue / execution queue / review queue / spend
 in flight, from the current run states), an approval-queue panel, an
-execution-queue panel (in-flight agent runs with run-time age + SLA, issue #37)
+execution-queue panel (in-flight agent runs with run-time age + SLA + agent
+spend so far, with an optional budget SLA, issue #37)
 and a review-queue panel (open PRs with review-latency age + a "stale since last
 push" age, each with its own SLA, issue #37), a failure/triage panel (recently
 blocked or execution-failed runs with how long ago they failed and why, newest
@@ -568,6 +569,15 @@ async function loadFleet() {
     const execBreaching = f.executions_breaching_sla
       ? `<span class="stat bad"><b>${f.executions_breaching_sla}</b> over SLA</span>`
       : "";
+    // Spend cut of the same in-flight agents: the single costliest running agent
+    // and how many have burned past the budget SLA (issue #37). Both omitted when
+    // no running agent reported cost / the count is zero.
+    const costliestRun = f.costliest_execution_usd == null
+      ? ""
+      : `<span class="stat"><b>$${f.costliest_execution_usd}</b> costliest run</span>`;
+    const execCostBreaching = f.executions_breaching_cost
+      ? `<span class="stat bad"><b>${f.executions_breaching_cost}</b> over budget SLA</span>`
+      : "";
     // The review-side equivalent: oldest open PR awaiting review + PRs over the
     // review SLA (issue #37). Both omitted when no PR is open.
     const oldestReview = f.prs_open
@@ -588,6 +598,8 @@ async function loadFleet() {
       <span class="stat"><b>${f.agents_running}</b> agents running</span>
       ${oldestExec}
       ${execBreaching}
+      ${costliestRun}
+      ${execCostBreaching}
       <span class="stat ${f.awaiting_human ? "bad" : ""}"><b>${f.awaiting_human}</b> awaiting a human</span>
       ${oldest}
       ${breaching}
@@ -647,17 +659,28 @@ async function loadExecutions() {
     const q = await resp.json();
     const runs = q.runs || [];
     if (!runs.length) { el.style.display = "none"; return; }  // nothing running: hide
-    const rows = runs.map((r) => `
-      <div class="run ${r.sla_breached ? "breach" : ""}" data-id="${esc(r.run_id)}" title="open timeline">
+    const rows = runs.map((r) => {
+      // Spend so far, omitted for a run whose provider reported no cost (never a
+      // conjured $0); reddened when it has burned past the budget SLA.
+      const cost = r.cost_usd == null
+        ? ""
+        : `<span class="age ${r.cost_breached ? "bad" : ""}">$${r.cost_usd} spent</span>`;
+      return `
+      <div class="run ${r.sla_breached || r.cost_breached ? "breach" : ""}" data-id="${esc(r.run_id)}" title="open timeline">
         <span class="key">${esc(r.linear_issue_key)}</span>${badge(r.status)}
         <span class="age ${r.sla_breached ? "bad" : ""}">${dur(r.running_seconds)} running</span>
+        ${cost}
         <div class="meta">${esc(r.run_id)} &middot; ${esc(r.risk_level || "unclassified")} risk
           &middot; ${esc(r.current_step || "-")}</div>
-      </div>`).join("");
+      </div>`;
+    }).join("");
     const sla = q.sla_seconds
       ? ` &middot; ${q.sla_breaches} of ${q.count} over the ${dur(q.sla_seconds)} SLA`
       : "";
-    el.innerHTML = `<details open><summary>execution queue &mdash; ${q.count} agent${q.count === 1 ? "" : "s"} running, oldest first${sla}</summary>${rows}</details>`;
+    const costSla = q.cost_sla_usd
+      ? ` &middot; ${q.cost_breaches} of ${q.count} over the $${q.cost_sla_usd} budget SLA`
+      : "";
+    el.innerHTML = `<details open><summary>execution queue &mdash; ${q.count} agent${q.count === 1 ? "" : "s"} running, oldest first${sla}${costSla}</summary>${rows}</details>`;
     el.style.display = "block";
     el.querySelectorAll(".run[data-id]").forEach((node) => {
       node.addEventListener("click", () => loadTimeline(node.dataset.id));

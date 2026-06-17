@@ -144,6 +144,29 @@ def test_fleet_empty_database(monkeypatch, capsys, db_url) -> None:
     assert "Fleet snapshot (live):" in out
     assert "runs total      0" in out
     assert "spend committed -" in out  # no in-flight cost => no conjured $0
+    assert "costliest run   -" in out  # no in-flight cost => no conjured $0
+
+
+def test_fleet_shows_costliest_running_agent(monkeypatch, capsys, db_url) -> None:
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        rid = _add_run(session, status=RunStatus.AGENT_RUNNING, created_at=now)
+        _add_event(session, rid, AuditEventType.AGENT_STARTED, now)
+        session.add(
+            FoundryAgentJob(
+                id="costjob-1",
+                run_id=rid,
+                provider="fake",
+                started_at=now,
+                cost_usd=4.25,
+            )
+        )
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "fleet")
+    out = capsys.readouterr().out
+    assert "costliest run   $4.25" in out
 
 
 def test_fleet_counts_parked_and_terminal_runs(monkeypatch, capsys, db_url) -> None:

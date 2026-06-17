@@ -17,7 +17,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from foundry.db import FoundryRun, create_all, make_engine, make_session_factory
-from foundry.db.models import AuditEventType, FoundryAuditEvent
+from foundry.db.models import (
+    AgentJobStatus,
+    AuditEventType,
+    FoundryAgentJob,
+    FoundryAuditEvent,
+)
 from foundry.memory.cli import main
 from foundry.schemas.common import OverallRisk, RunStatus
 
@@ -70,6 +75,20 @@ def _add_event(
             event_type=event_type,
             actor_type="foundry",
             created_at=created_at,
+        )
+    )
+
+
+def _add_job(session, run_id: str, *, cost_usd: float | None) -> None:
+    global _counter
+    _counter += 1
+    session.add(
+        FoundryAgentJob(
+            id=f"qj-{_counter}",
+            run_id=run_id,
+            provider="fake",
+            status=AgentJobStatus.RUNNING,
+            cost_usd=cost_usd,
         )
     )
 
@@ -181,6 +200,54 @@ def test_executions_lists_in_flight_run(monkeypatch, capsys, db_url) -> None:
     assert "Execution queue (agents in flight): 1 total" in out
     assert "agent_running" in out
     assert "30m" in out  # dated from AGENT_STARTED, not the 90m-old created_at
+
+
+def test_executions_shows_spend(monkeypatch, capsys, db_url) -> None:
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.AGENT_RUNNING,
+            created_at=now - timedelta(minutes=30),
+        )
+        _add_event(
+            session, rid, AuditEventType.AGENT_STARTED, now - timedelta(minutes=30)
+        )
+        _add_job(session, rid, cost_usd=3.50)
+        session.commit()
+
+    _run_cli(monkeypatch, db_url, "executions")
+    out = capsys.readouterr().out
+    assert "spend" in out  # the added column header
+    assert "$3.50" in out  # the run's summed agent spend
+
+
+def test_executions_flags_budget_sla(monkeypatch, capsys, db_url, tmp_path) -> None:
+    """The CLI reads the same dashboard.execution_cost_sla_usd knob as the
+    dashboard, so an over-budget in-flight run is flagged just as
+    GET /metrics/executions flags it."""
+    now = datetime.now(timezone.utc)
+    sf = _seed(db_url)
+    with sf() as session:
+        rid = _add_run(
+            session,
+            status=RunStatus.AGENT_RUNNING,
+            created_at=now - timedelta(minutes=30),
+        )
+        _add_event(
+            session, rid, AuditEventType.AGENT_STARTED, now - timedelta(minutes=30)
+        )
+        _add_job(session, rid, cost_usd=7.50)
+        session.commit()
+
+    config = tmp_path / "foundry.yaml"
+    config.write_text("dashboard:\n  execution_cost_sla_usd: 5.0\n")
+
+    _run_cli(monkeypatch, db_url, "executions", config=str(config))
+    out = capsys.readouterr().out
+    assert "over the $5.00 budget SLA" in out  # the header summary
+    assert "! breaching budget" in out  # the per-row marker
 
 
 # --- reviews --------------------------------------------------------------

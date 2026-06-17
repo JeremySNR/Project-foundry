@@ -880,8 +880,39 @@ def _dispatch_since_map(session, runs: list[FoundryRun]) -> dict[str, datetime]:
     return {run_id: created_at for run_id, created_at in rows if created_at is not None}
 
 
+def _agent_cost_map(session, runs: list[FoundryRun]) -> dict[str, float]:
+    """For each run, the total provider-reported agent spend so far - the sum of
+    its agent jobs' ``cost_usd``.
+
+    Only rows that actually reported a cost are summed, and a run with no
+    cost-reporting job is *absent* from the map (never a conjured ``$0`` from
+    missing data) - the same rule :func:`fleet_status` / :func:`delivery_metrics`
+    apply to org-wide spend, so the caller can render ``cost_usd: None`` for a run
+    whose provider does not report cost (e.g. ``manual`` / ``webhook``).
+    """
+    if not runs:
+        return {}
+    rows = (
+        session.query(
+            FoundryAgentJob.run_id,
+            func.sum(FoundryAgentJob.cost_usd),
+        )
+        .filter(
+            FoundryAgentJob.run_id.in_([r.id for r in runs]),
+            FoundryAgentJob.cost_usd.isnot(None),
+        )
+        .group_by(FoundryAgentJob.run_id)
+        .all()
+    )
+    return {run_id: total for run_id, total in rows if total is not None}
+
+
 def execution_queue(
-    session, *, now: datetime | None = None, sla_seconds: int | None = None
+    session,
+    *,
+    now: datetime | None = None,
+    sla_seconds: int | None = None,
+    cost_sla_usd: float | None = None,
 ) -> dict:
     """In-flight agent runs with per-run run-time age - the machine-state
     complement to :func:`approval_queue`, and the drill-down behind the fleet
@@ -896,6 +927,19 @@ def execution_queue(
     VP/on-call wants for a hung or runaway agent silently burning budget; with
     no SLA the breach signal is inert (``sla_breaches`` is 0), matching the
     historical behaviour byte-for-byte.
+
+    Each entry also carries the agent **spend so far** (``cost_usd`` - the sum of
+    the run's agent jobs' provider-reported cost, ``None`` when no job reported
+    one, never a conjured ``$0``), turning "running 6h" into "running 6h *and*
+    has spent $4.20". ``cost_sla_usd`` is the spend twin of ``sla_seconds``: a run
+    whose spend so far is at least that many dollars is flagged ``cost_breached``
+    and counted in ``cost_breaches`` - the "this agent has burned over $N and is
+    still going" signal, fired *before* the hard ``policy.max_cost_per_run``
+    budget cap (which blocks the run; this only flags it for a human). With no
+    cost SLA the breach signal is inert (``cost_breaches`` is 0). The queue also
+    reports ``total_cost_usd`` (committed by every in-flight run) and
+    ``costliest_cost_usd`` (the single most expensive run), both ``None`` when no
+    in-flight run reported cost.
     """
     now = _as_utc(now or datetime.now(timezone.utc))
     runs: list[FoundryRun] = (
@@ -904,6 +948,7 @@ def execution_queue(
         .all()
     )
     dispatched_since = _dispatch_since_map(session, runs)
+    cost_by_run = _agent_cost_map(session, runs)
 
     entries: list[dict] = []
     for run in runs:
@@ -913,6 +958,16 @@ def execution_queue(
         # Clamp at 0: a future-dated row (clock skew) is not negative run time.
         ran = max(0, int((now - _as_utc(since)).total_seconds()))
         breached = sla_seconds is not None and ran >= sla_seconds
+        # Spend so far. Compare the *raw* sum to the threshold (so a $4.999 run
+        # against a $5 SLA does not flip on the displayed-and-rounded value),
+        # then round only for display - never conjuring $0 for a run whose
+        # provider reported no cost.
+        raw_cost = cost_by_run.get(run.id)
+        cost_breached = (
+            cost_sla_usd is not None
+            and raw_cost is not None
+            and raw_cost >= cost_sla_usd
+        )
         status = run.status.value if isinstance(run.status, RunStatus) else str(run.status)
         entries.append(
             {
@@ -924,17 +979,29 @@ def execution_queue(
                 "running_since": _as_utc(since).isoformat(),
                 "running_seconds": ran,
                 "sla_breached": breached,
+                "cost_usd": round(raw_cost, 2) if raw_cost is not None else None,
+                "cost_breached": cost_breached,
             }
         )
 
     entries.sort(key=lambda e: e["running_seconds"], reverse=True)
     breaches = sum(1 for e in entries if e["sla_breached"])
+    cost_breaches = sum(1 for e in entries if e["cost_breached"])
+    # Aggregate from the raw sums (not the per-entry rounded values) so the total
+    # can't drift by a cent; None when no in-flight run reported any cost.
+    raw_costs = [c for c in cost_by_run.values() if c is not None]
+    total_cost = round(sum(raw_costs), 2) if raw_costs else None
+    costliest_cost = round(max(raw_costs), 2) if raw_costs else None
     return {
         "now": now.isoformat(),
         "sla_seconds": sla_seconds,
+        "cost_sla_usd": cost_sla_usd,
         "count": len(entries),
         "oldest_running_seconds": entries[0]["running_seconds"] if entries else None,
         "sla_breaches": breaches,
+        "cost_breaches": cost_breaches,
+        "total_cost_usd": total_cost,
+        "costliest_cost_usd": costliest_cost,
         "runs": entries,
     }
 
@@ -2093,6 +2160,7 @@ def fleet_status(
     *,
     sla_seconds: int | None = None,
     execution_sla_seconds: int | None = None,
+    execution_cost_sla_usd: float | None = None,
     review_sla_seconds: int | None = None,
     review_stale_sla_seconds: int | None = None,
     now: datetime | None = None,
@@ -2110,7 +2178,11 @@ def fleet_status(
     ``active_cost_usd`` sums provider-reported cost across agent jobs belonging
     to runs still in an active state; it stays ``None`` when no in-flight job
     reported cost (never a conjured ``$0`` from missing data, matching
-    :func:`delivery_metrics`).
+    :func:`delivery_metrics`). ``costliest_execution_usd`` is the spend of the
+    single most expensive *currently-running* agent (from :func:`execution_queue`)
+    - the "which agent is the expensive one" cut the org-wide total can't give -
+    and, when ``execution_cost_sla_usd`` is set, ``executions_breaching_cost``
+    counts the in-flight agents that have burned past that ceiling.
     """
     by_status: dict[str, int] = {}
     for status, count in (
@@ -2152,7 +2224,12 @@ def fleet_status(
     # The machine-side equivalent for ``agents_running``: the oldest in-flight
     # agent run and how many have breached the execution SLA. Same derivation the
     # GET /metrics/executions drill-down serves, so they can never disagree.
-    execution = execution_queue(session, now=now, sla_seconds=execution_sla_seconds)
+    execution = execution_queue(
+        session,
+        now=now,
+        sla_seconds=execution_sla_seconds,
+        cost_sla_usd=execution_cost_sla_usd,
+    )
     # The review-side equivalent for ``prs_open``: the oldest open PR awaiting
     # review and how many have breached the review SLA, plus the most-stale PR (no
     # push for the longest) and how many have breached the *staleness* SLA. Same
@@ -2177,6 +2254,9 @@ def fleet_status(
         "oldest_execution_seconds": execution["oldest_running_seconds"],
         "execution_sla_seconds": execution_sla_seconds,
         "executions_breaching_sla": execution["sla_breaches"],
+        "execution_cost_sla_usd": execution_cost_sla_usd,
+        "executions_breaching_cost": execution["cost_breaches"],
+        "costliest_execution_usd": execution["costliest_cost_usd"],
         "prs_open": _count(RunStatus.PR_OPEN),
         "oldest_review_seconds": review["oldest_unreviewed_seconds"],
         "review_sla_seconds": review_sla_seconds,
