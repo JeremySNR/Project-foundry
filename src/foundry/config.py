@@ -79,6 +79,29 @@ def _bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in _TRUE
 
 
+def _parse_org_secret_pairs(raw: str) -> tuple[tuple[str, str], ...]:
+    """Parse ``FOUNDRY_WEBHOOK_ORG_SECRETS`` (``org=secret`` pairs, comma-sep).
+
+    Split each pair on the first ``=`` so a base64/Fernet secret's ``=`` padding
+    survives; blank chunks are skipped. Shape only — semantic validation (blank /
+    reserved / duplicate / reused) happens fail-closed at ``Settings`` load via
+    ``WebhookOrgSecrets.from_pairs``.
+    """
+    pairs: list[tuple[str, str]] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        org, sep, secret = chunk.partition("=")
+        if not sep:
+            raise ValueError(
+                "FOUNDRY_WEBHOOK_ORG_SECRETS entries must be 'org=secret' pairs, "
+                f"got {chunk!r}"
+            )
+        pairs.append((org.strip(), secret.strip()))
+    return tuple(pairs)
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- storage (secret: env) ---
@@ -87,6 +110,17 @@ class Settings:
     # --- webhook signing secrets (secret: env) ---
     linear_webhook_secret: str = ""
     github_webhook_secret: str | None = None
+
+    # --- per-org webhook secrets (secret: env; issue #34 follow-up) ---
+    # Map a verified webhook delivery to its tenant org. Webhooks carry no OIDC
+    # token, so the verified principal is the shared secret that authenticated
+    # the delivery: a delivery signed (HMAC: Linear/GitHub) or tokened
+    # (GitLab/Jira) with org X's dedicated secret runs in org X; the global
+    # secrets above resolve to the default org. Org comes from *which committed
+    # secret matched*, never the payload (invariant #5). Set via
+    # FOUNDRY_WEBHOOK_ORG_SECRETS as comma-separated ``org=secret`` pairs; empty
+    # (the default) => single-tenant, every delivery in the default org.
+    webhook_org_secrets: tuple[tuple[str, str], ...] = ()
 
     # --- outbound API tokens (secret: env); None => connector not wired live ---
     linear_api_token: str | None = None
@@ -630,6 +664,13 @@ class Settings:
                 "estimated_cost_per_dispatch must be >= 0, got "
                 f"{self.estimated_cost_per_dispatch}"
             )
+        if self.webhook_org_secrets:
+            # Fail-closed at load (deploy-time): a blank/reserved org, blank
+            # secret, duplicate org, or a secret reused across orgs is rejected so
+            # a delivery can never resolve to an ambiguous tenant (issue #34).
+            from foundry.api.webhook_org import WebhookOrgSecrets
+
+            WebhookOrgSecrets.from_pairs(self.webhook_org_secrets)
         if self.risk_provider not in ("heuristic", "llm"):
             raise ValueError(
                 f"risk_provider must be 'heuristic' or 'llm', got {self.risk_provider!r}"
@@ -1333,6 +1374,10 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
             part.strip()
             for part in env["FOUNDRY_OIDC_SCOPES"].split(",")
             if part.strip()
+        )
+    if "FOUNDRY_WEBHOOK_ORG_SECRETS" in env:
+        out["webhook_org_secrets"] = _parse_org_secret_pairs(
+            env["FOUNDRY_WEBHOOK_ORG_SECRETS"]
         )
     if "FOUNDRY_OIDC_SESSION_TTL_SECONDS" in env:
         out["oidc_session_ttl_seconds"] = int(env["FOUNDRY_OIDC_SESSION_TTL_SECONDS"])

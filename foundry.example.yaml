@@ -473,6 +473,19 @@ auth:
   #   # Env override: FOUNDRY_OIDC_ORG_CLAIM.
   #   org_claim: "org"         # verified claim naming the caller's org/tenant
   #
+  #   # --- per-org WEBHOOK routing (issue #34) ---
+  #   # Webhooks carry no OIDC token, so a webhook-created run / PR observation
+  #   # would otherwise always land in the "default" org. Give each tenant org a
+  #   # dedicated webhook secret and a delivery signed (HMAC: Linear/GitHub) or
+  #   # tokened (GitLab/Jira) with it binds that org for the delivery; the global
+  #   # secrets above keep mapping to the default org. The org comes from WHICH
+  #   # committed secret matched, never the payload (invariant #5). Secret, so
+  #   # env-only (no YAML): FOUNDRY_WEBHOOK_ORG_SECRETS as comma-separated
+  #   # "org=secret" pairs, e.g.
+  #   #   FOUNDRY_WEBHOOK_ORG_SECRETS="acme=whsec_acme123,globex=whsec_globex456"
+  #   # Each secret must be distinct from the others and from the global webhook
+  #   # secrets (rejected at startup otherwise). UNSET => single-tenant, unchanged.
+  #
   #   # --- dashboard browser login / SSO (issue #34) ---
   #   # Lets an operator sign in to /dashboard via your IdP (OAuth2
   #   # authorization-code + PKCE) instead of pasting an API token. Builds on the
