@@ -158,12 +158,17 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   carries an `org_id` and a central session seam (`db/base.py`) stamps it on
   write and filters every read/write to the active org (`db/tenant.py`
   contextvar), so a unit of work scoped to one org can't read or write another's
-  rows. The API binds the org per-request from the **verified OIDC `org_claim`**
-  only (`api/tenant.py` middleware, never a request payload — invariant #5);
-  unset, or any non-OIDC path, runs in the single default org, so a single-tenant
-  deployment (all rows `org_id='default'`) is byte-for-byte unchanged. Mapping a
-  *webhook* intake to a non-default org, and binding the org onto the dashboard
-  SSO session cookie, are the remaining slices. API auth accepts
+  rows. The API binds the org per-request from a **verified principal** only
+  (`api/tenant.py` middleware, never a request payload — invariant #5): the
+  **OIDC bearer token's `org_claim`** (API path) **or** the dashboard's
+  **signed SSO session cookie** — `OidcLogin.complete` stamps the verified
+  id_token's `org_claim` into the HMAC-signed cookie at login and
+  `resolve_request_org` reads it back, so a cookie-authenticated dashboard read
+  is scoped to the operator's own org (the read-path twin of the bearer path);
+  the org is preserved across sliding-session re-mints. Unset `org_claim`, or any
+  other path, runs in the single default org, so a single-tenant deployment (all
+  rows `org_id='default'`) is byte-for-byte unchanged. Mapping a *webhook* intake
+  to a non-default org is the one remaining slice. API auth accepts
   OIDC JWTs as well as the static bearer token (#34), and the OIDC REST-approval
   path now **binds the approver identity to the verified token** and **maps IdP
   groups to approver roles** via committed config (`auth.oidc.group_role_map`) —
@@ -173,7 +178,8 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   (`api/oidc_login.py`: authorization-code + PKCE, signed session cookie via
   `api/sessions.py`) — the session cookie authenticates the dashboard's reads
   but is rejected on the approval endpoint (CSRF-safe), so it never widens the
-  human gate. **RP-Initiated (federated) logout** has landed too
+  human gate. The cookie also carries the verified `org_claim` (above), so the
+  dashboard's reads are tenant-scoped without a bearer token. **RP-Initiated (federated) logout** has landed too
   (`auth.oidc.end_session_endpoint` (+ optional `post_logout_redirect_uri`),
   #34): `/dashboard/logout` ends the IdP SSO session, not just the local cookie,
   so a shared workstation can't silently re-authenticate — additive, opt-in,

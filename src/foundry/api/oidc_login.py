@@ -109,6 +109,14 @@ class OidcLogin:
     verifier: OidcVerifier
     signer: SessionSigner
     subject_claim: str = "email"
+    # The verified id_token claim carrying the caller's org/tenant (issue #34,
+    # multi-tenancy #156). When set, ``complete`` stamps the claim's value into
+    # the signed session cookie so the dashboard's cookie-authenticated reads are
+    # scoped to the operator's own org (the read-path twin of the bearer-token
+    # ``api/tenant.py`` resolution), and ``renew_session`` preserves it across
+    # sliding re-mints. ``None`` (the default) => single-tenant: no org in the
+    # cookie and the dashboard runs in the default org, byte-for-byte unchanged.
+    org_claim: str | None = None
     scopes: tuple[str, ...] = _DEFAULT_SCOPES
     session_ttl_seconds: int = _DEFAULT_SESSION_TTL
     login_ttl_seconds: int = _DEFAULT_LOGIN_TTL
@@ -212,10 +220,26 @@ class OidcLogin:
         # Stamp the original login time so sliding renewals (``renew_session``)
         # can enforce the absolute max-lifetime cap across re-mints. Harmless
         # when sliding is off - the field is just unread.
-        return self.signer.mint(
-            {"sub": identity, "iat": int(self.signer.clock())},
-            ttl_seconds=self.session_ttl_seconds,
-        )
+        payload: dict[str, Any] = {"sub": identity, "iat": int(self.signer.clock())}
+        # Bind the verified org onto the cookie (issue #34/#156). The value comes
+        # only from the cryptographically-verified id_token (invariant #5), and
+        # the cookie itself is HMAC-signed, so a cookie-authenticated dashboard
+        # read is scoped to the operator's own org. Absent claim => default org.
+        org = self._org_from_claims(claims)
+        if org is not None:
+            payload["org"] = org
+        return self.signer.mint(payload, ttl_seconds=self.session_ttl_seconds)
+
+    def _org_from_claims(self, claims: Mapping[str, Any]) -> str | None:
+        """The caller's org from the verified claims, or ``None`` if unconfigured
+        / absent / blank (=> the cookie carries no org and reads fall to the
+        default org)."""
+        if not self.org_claim:
+            return None
+        value = claims.get(self.org_claim)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
 
     def renew_session(self, cookie: str | None) -> str | None:
         """Return a refreshed session cookie with a slid expiry, or ``None``.
@@ -249,7 +273,13 @@ class OidcLogin:
         ttl = min(self.session_ttl_seconds, int(remaining_to_cap))
         if ttl < 1:
             return None
-        return self.signer.mint({"sub": sub, "iat": int(iat)}, ttl_seconds=ttl)
+        renewed: dict[str, Any] = {"sub": sub, "iat": int(iat)}
+        # Carry the org forward so a sliding re-mint never silently drops the
+        # operator's tenant scope back to the default org (issue #34/#156).
+        org = payload.get("org")
+        if isinstance(org, str) and org.strip():
+            renewed["org"] = org.strip()
+        return self.signer.mint(renewed, ttl_seconds=ttl)
 
     def end_session_url(self) -> str | None:
         """The IdP RP-initiated logout URL, or ``None`` if not configured.

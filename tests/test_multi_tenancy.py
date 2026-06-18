@@ -16,6 +16,8 @@ from fastapi.testclient import TestClient
 from foundry.agents.manual import InMemoryFakeProvider
 from foundry.api.app import create_app
 from foundry.api.oidc import OidcAuthError
+from foundry.api.oidc_login import SESSION_COOKIE, OidcLogin
+from foundry.api.sessions import SessionSigner
 from foundry.api.tenant import resolve_request_org
 from foundry.compliance.evidence import verify_integrity
 from foundry.db import (
@@ -267,6 +269,105 @@ def test_resolve_request_org_reads_only_the_verified_token() -> None:
         resolve_request_org(scope("tok-acme"), verifier=verifier, org_claim=None)
         == DEFAULT_ORG_ID
     )
+
+
+def test_resolve_request_org_reads_org_from_session_cookie() -> None:
+    """The dashboard authenticates with a signed SSO session cookie (no bearer
+    token). Its stamped, verified ``org`` scopes the request — the read-path twin
+    of the bearer-token resolution (issue #34/#156)."""
+    signer = SessionSigner("session-secret")
+
+    def scope(*, cookie: str | None = None, token: str | None = None) -> dict:
+        headers = []
+        if token is not None:
+            headers.append((b"authorization", f"Bearer {token}".encode()))
+        if cookie is not None:
+            headers.append((b"cookie", f"{SESSION_COOKIE}={cookie}".encode()))
+        return {"type": "http", "headers": headers}
+
+    acme_cookie = signer.mint({"sub": "a@acme", "org": "acme"}, ttl_seconds=3600)
+
+    # A valid session cookie's org wins when no bearer token is present.
+    assert (
+        resolve_request_org(
+            scope(cookie=acme_cookie), verifier=None, org_claim="org",
+            session_signer=signer,
+        )
+        == "acme"
+    )
+    # A cookie minted by a single-tenant login (no org) -> default org.
+    plain = signer.mint({"sub": "x"}, ttl_seconds=3600)
+    assert (
+        resolve_request_org(
+            scope(cookie=plain), verifier=None, org_claim="org", session_signer=signer
+        )
+        == DEFAULT_ORG_ID
+    )
+    # A tampered/forged cookie (wrong secret) -> default org, never an error.
+    forged = SessionSigner("other-secret").mint({"org": "acme"}, ttl_seconds=3600)
+    assert (
+        resolve_request_org(
+            scope(cookie=forged), verifier=None, org_claim="org", session_signer=signer
+        )
+        == DEFAULT_ORG_ID
+    )
+    # No org_claim configured -> single-tenant default even with an org cookie.
+    assert (
+        resolve_request_org(
+            scope(cookie=acme_cookie), verifier=None, org_claim=None,
+            session_signer=signer,
+        )
+        == DEFAULT_ORG_ID
+    )
+    # The bearer token wins over the cookie when both are present.
+    verifier = _FakeVerifier({"tok-globex": {"sub": "u", "org": "globex"}})
+    assert (
+        resolve_request_org(
+            scope(cookie=acme_cookie, token="tok-globex"), verifier=verifier,
+            org_claim="org", session_signer=signer,
+        )
+        == "globex"
+    )
+
+
+def test_api_runs_listing_is_isolated_by_dashboard_session_cookie(session_factory) -> None:
+    """End-to-end: the dashboard's cookie-authenticated GET /runs is scoped to the
+    org stamped into the signed SSO session cookie, never request input (#34/#156)."""
+    acme_run = _intake(session_factory, org="acme")
+    _intake(session_factory, org="globex")
+
+    signer = SessionSigner("session-secret")
+    login = OidcLogin(
+        client_id="dash",
+        client_secret="s",
+        authorization_endpoint="https://idp.example.com/authorize",
+        token_endpoint="https://idp.example.com/token",
+        redirect_uri="https://foundry.example.com/cb",
+        verifier=_FakeVerifier({}),
+        signer=signer,
+        org_claim="org",
+    )
+    app = create_app(
+        webhook_secret="whsecret",
+        session_factory=session_factory,
+        orchestrator=FoundryOrchestrator(
+            session_factory, provider=InMemoryFakeProvider()
+        ),
+        oidc_verifier=_FakeVerifier({}),
+        oidc_org_claim="org",
+        oidc_login=login,
+    )
+    client = TestClient(app)
+
+    acme_cookie = signer.mint({"sub": "a@acme", "org": "acme"}, ttl_seconds=3600)
+    resp = client.get("/runs", headers={"Cookie": f"{SESSION_COOKIE}={acme_cookie}"})
+    assert resp.status_code == 200
+    assert {r["id"] for r in resp.json()["runs"]} == {acme_run}
+
+    # A single-tenant cookie (no org) sees the default org, neither tenant's runs.
+    plain = signer.mint({"sub": "x"}, ttl_seconds=3600)
+    resp = client.get("/runs", headers={"Cookie": f"{SESSION_COOKIE}={plain}"})
+    assert {r["id"] for r in resp.json()["runs"]} == set()
 
 
 def test_api_runs_listing_is_isolated_by_verified_token(session_factory) -> None:

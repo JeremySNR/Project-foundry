@@ -8,19 +8,24 @@ contextvar it sets propagates into every downstream handler — including sync
 endpoints dispatched to the threadpool, which copy the current context — and
 covers endpoints that don't themselves authenticate (e.g. ``GET /runs``).
 
-The org is derived **only** from the cryptographically-verified OIDC bearer
-token (its configured ``org_claim``), never from a request payload (invariant
-#5). When multi-tenancy is not configured (no ``org_claim`` or no verifier — the
-default), or the request carries no usable token, the request runs in the single
-default org, so a single-tenant deployment is byte-for-byte unchanged and pays
-no extra token verification.
+The org is derived **only** from a cryptographically-verified principal, never
+from a request payload (invariant #5): the configured ``org_claim`` of an OIDC
+bearer token (the API path) or, for the browser dashboard, the ``org`` that
+``OidcLogin.complete`` stamped into the HMAC-signed SSO session cookie from the
+verified id_token at login time (issue #34/#156). When multi-tenancy is not
+configured (no ``org_claim`` — the default), or the request carries neither a
+usable token nor a valid session cookie, the request runs in the single default
+org, so a single-tenant deployment is byte-for-byte unchanged.
 """
 
 from __future__ import annotations
 
+from http.cookies import SimpleCookie
 from typing import Any, Callable
 
 from foundry.api.oidc import OidcAuthError, OidcVerifier
+from foundry.api.oidc_login import SESSION_COOKIE
+from foundry.api.sessions import SessionSigner
 from foundry.db.tenant import DEFAULT_ORG_ID, reset_current_org, set_current_org
 
 
@@ -36,30 +41,58 @@ def _bearer_token_from_scope(scope: dict[str, Any]) -> str | None:
     return None
 
 
+def _session_cookie_from_scope(scope: dict[str, Any]) -> str | None:
+    """The dashboard SSO session cookie value from an ASGI scope, or None."""
+    for key, value in scope.get("headers", []):
+        if key == b"cookie":
+            jar = SimpleCookie()
+            jar.load(value.decode("latin-1"))
+            morsel = jar.get(SESSION_COOKIE)
+            return morsel.value if morsel is not None else None
+    return None
+
+
 def resolve_request_org(
     scope: dict[str, Any],
     *,
     verifier: OidcVerifier | None,
     org_claim: str | None,
+    session_signer: SessionSigner | None = None,
 ) -> str:
-    """The caller's org for this request, from the verified token only.
+    """The caller's org for this request, from the authenticated principal only.
 
-    Returns :data:`~foundry.db.tenant.DEFAULT_ORG_ID` unless multi-tenancy is
-    configured (``org_claim`` set, a verifier present) *and* the request carries
-    a valid OIDC bearer token whose ``org_claim`` is a non-empty string.
+    Two principals can carry an org, both cryptographically verified — never a
+    request payload (invariant #5):
+
+    * an **OIDC bearer token** (the API path): its verified ``org_claim``, or
+    * the **dashboard SSO session cookie** (the browser path): the ``org`` value
+      ``OidcLogin.complete`` stamped into the HMAC-signed cookie from the
+      verified id_token at login time.
+
+    The bearer token wins when both are present. Returns
+    :data:`~foundry.db.tenant.DEFAULT_ORG_ID` unless multi-tenancy is configured
+    (``org_claim`` set) and one of those principals yields a non-empty org, so a
+    single-tenant deployment is byte-for-byte unchanged.
     """
-    if not org_claim or verifier is None:
+    if not org_claim:
         return DEFAULT_ORG_ID
-    token = _bearer_token_from_scope(scope)
-    if not token:
-        return DEFAULT_ORG_ID
-    try:
-        claims = verifier.verify(token)
-    except OidcAuthError:
-        return DEFAULT_ORG_ID
-    value = claims.get(org_claim)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+    if verifier is not None:
+        token = _bearer_token_from_scope(scope)
+        if token:
+            try:
+                claims = verifier.verify(token)
+            except OidcAuthError:
+                claims = None
+            if claims is not None:
+                value = claims.get(org_claim)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    if session_signer is not None:
+        payload = session_signer.read(_session_cookie_from_scope(scope))
+        if payload is not None:
+            org = payload.get("org")
+            if isinstance(org, str) and org.strip():
+                return org.strip()
     return DEFAULT_ORG_ID
 
 
