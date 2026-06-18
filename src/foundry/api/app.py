@@ -423,14 +423,16 @@ def create_app(
     # (issue #156). Registered first, which Starlette makes the *outermost*
     # middleware (it wraps user middleware in reverse), so the org is set in the
     # request's own event-loop task and propagates into every downstream handler,
-    # including the ungated reads. Derives the org only from the verified OIDC
-    # token; default (single-tenant) otherwise.
+    # including the ungated reads. Derives the org only from a verified principal
+    # — the OIDC bearer token's org_claim or the signed dashboard SSO session
+    # cookie's stamped org; default (single-tenant) otherwise.
     app.add_middleware(
         TenantMiddleware,
         resolve_org=lambda scope: resolve_request_org(
             scope,
             verifier=app.state.oidc_verifier,
             org_claim=app.state.oidc_org_claim,
+            session_signer=app.state.session_signer,
         ),
     )
 
@@ -2827,6 +2829,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
             verifier=id_token_verifier,
             signer=SessionSigner(settings.session_secret),
             subject_claim=settings.oidc_subject_claim,
+            org_claim=settings.oidc_org_claim,
             scopes=settings.oidc_scopes,
             session_ttl_seconds=settings.oidc_session_ttl_seconds,
             session_max_lifetime_seconds=settings.oidc_session_max_lifetime_seconds,

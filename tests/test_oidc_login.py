@@ -56,13 +56,15 @@ def _keypair(kid: str = KID):
 
 
 def _id_token(priv, *, nonce, sub="alice@example.com", email="alice@example.com",
-              issuer=ISSUER, audience=CLIENT_ID, key=None):
+              issuer=ISSUER, audience=CLIENT_ID, key=None, org=None):
     now = int(time.time())
     claims = {"sub": sub, "iss": issuer, "aud": audience, "iat": now, "exp": now + 3600}
     if nonce is not None:
         claims["nonce"] = nonce
     if email is not None:
         claims["email"] = email
+    if org is not None:
+        claims["org"] = org
     return jwt.encode(claims, key or priv, algorithm="RS256", headers={"kid": KID})
 
 
@@ -196,6 +198,47 @@ def test_complete_happy_path_returns_session_cookie():
     state, cookie = _begin_and_arm(login, holder)
     session = login.complete(code="auth-code", state=state, login_cookie=cookie)
     assert login.signer.read(session)["sub"] == "alice@example.com"
+
+
+def test_complete_stamps_verified_org_when_configured():
+    """With ``org_claim`` set, the session cookie carries the org from the
+    verified id_token so cookie-authenticated dashboard reads are tenant-scoped
+    (issue #34/#156). The value comes only from the verified token (invariant #5)."""
+    priv, jwks = _keypair()
+
+    def exchange(form):  # noqa: ANN001
+        return {"id_token": _id_token(priv, nonce=holder.get("nonce"), org="acme")}
+
+    login, holder = _make_login(priv, jwks, exchange=exchange, org_claim="org")
+    state, cookie = _begin_and_arm(login, holder)
+    session = login.complete(code="c", state=state, login_cookie=cookie)
+    payload = login.signer.read(session)
+    assert payload["sub"] == "alice@example.com"
+    assert payload["org"] == "acme"
+
+
+def test_complete_omits_org_when_no_org_claim_configured():
+    """Default (single-tenant): no ``org_claim`` => no org in the cookie even if
+    the token carries one, so the dashboard runs in the default org unchanged."""
+    priv, jwks = _keypair()
+
+    def exchange(form):  # noqa: ANN001
+        return {"id_token": _id_token(priv, nonce=holder.get("nonce"), org="acme")}
+
+    login, holder = _make_login(priv, jwks, exchange=exchange)  # org_claim defaults to None
+    state, cookie = _begin_and_arm(login, holder)
+    session = login.complete(code="c", state=state, login_cookie=cookie)
+    assert "org" not in login.signer.read(session)
+
+
+def test_complete_omits_org_when_claim_absent_from_token():
+    """``org_claim`` configured but the token doesn't carry it => no org stamped
+    (the request falls to the default org, fail-safe)."""
+    priv, jwks = _keypair()
+    login, holder = _make_login(priv, jwks, org_claim="org")  # default exchange: no org claim
+    state, cookie = _begin_and_arm(login, holder)
+    session = login.complete(code="c", state=state, login_cookie=cookie)
+    assert "org" not in login.signer.read(session)
 
 
 def test_complete_rejects_state_mismatch():
@@ -373,6 +416,25 @@ def test_renew_session_slides_expiry_forward():
     assert payload["sub"] == "alice@example.com"
     assert payload["iat"] == 1000  # origin preserved across the re-mint
     assert payload["exp"] == 1050 + 100  # slid forward a fresh idle window
+
+
+def test_renew_session_preserves_org():
+    """A sliding re-mint carries the org forward so the operator's tenant scope
+    is never silently dropped back to the default org (issue #34/#156)."""
+    priv, jwks = _keypair()
+    clock = {"t": 1000.0}
+    signer = SessionSigner("session-secret", clock=lambda: clock["t"])
+    login, _ = _make_login(
+        priv, jwks, signer=signer, session_ttl_seconds=100,
+        session_max_lifetime_seconds=10_000,
+    )
+    cookie = signer.mint(
+        {"sub": "alice@example.com", "iat": 1000, "org": "acme"}, ttl_seconds=100
+    )
+    clock["t"] = 1050
+    payload = signer.read(login.renew_session(cookie))
+    assert payload["org"] == "acme"
+    assert payload["iat"] == 1000
 
 
 def test_renew_session_caps_ttl_at_absolute_deadline():
