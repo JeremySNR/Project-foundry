@@ -68,6 +68,7 @@ from foundry.connectors.transport import (
 )
 from foundry.db.base import init_schema, make_engine, make_session_factory
 from foundry.db.encryption import configure_cipher_from_key
+from foundry.db.tenant import tenant_context
 from foundry.db.models import (
     FoundryAgentJob,
     FoundryArtifact,
@@ -117,10 +118,10 @@ from .sessions import SessionSigner
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
 from .tenant import TenantMiddleware, resolve_request_org
+from .webhook_org import WebhookOrgSecrets, org_for_hmac, org_for_token
 from .security import (
     is_authorised_approver,
     parse_command,
-    verify_signature,
     verify_slack_signature,
 )
 
@@ -248,6 +249,7 @@ def create_app(
     gitlab_webhook_secret: str | None = None,
     gitlab_connector: GitLabConnector | None = None,
     slack_signing_secret: str | None = None,
+    webhook_org_secrets: WebhookOrgSecrets | None = None,
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
     trigger_status: str = _TRIGGER_STATUS,
@@ -338,6 +340,34 @@ def create_app(
     app.state.jira_allow_query_token = jira_allow_query_token
     app.state.gitlab_webhook_secret = gitlab_webhook_secret
     app.state.slack_signing_secret = slack_signing_secret
+    # Per-org webhook secrets (issue #34 follow-up): map a verified webhook
+    # delivery to its tenant org from *which committed secret matched*, never the
+    # payload (invariant #5). Empty (the default) => single-tenant, every delivery
+    # in the default org, byte-for-byte unchanged. A per-org secret must not
+    # collide with any global provider secret, or a delivery's org would be
+    # ambiguous (the global secret wins, so the tenant secret would be dead) —
+    # rejected fail-closed at build (deploy-time, not a first-delivery surprise).
+    app.state.webhook_org_secrets = webhook_org_secrets or WebhookOrgSecrets()
+    _global_webhook_secrets = {
+        s
+        for s in (
+            webhook_secret,
+            app.state.github_webhook_secret,
+            jira_webhook_secret,
+            gitlab_webhook_secret,
+            slack_signing_secret,
+        )
+        if s
+    }
+    _colliding = _global_webhook_secrets.intersection(
+        app.state.webhook_org_secrets.secrets()
+    )
+    if _colliding:
+        raise ValueError(
+            "webhook_org_secrets reuse a global webhook/signing secret; each "
+            "tenant org needs a secret distinct from the default-org secrets so "
+            "deliveries route unambiguously"
+        )
     # Without a transport the connector is diff-blind (file gates skipped),
     # mirroring GitHubConnector with no transport.
     app.state.gitlab_connector = gitlab_connector or GitLabConnector()
@@ -639,67 +669,81 @@ def create_app(
         if content_type and "application/json" not in content_type:
             raise HTTPException(status_code=400, detail="content-type must be application/json")
         raw = await request.body()
-        if not verify_signature(app.state.webhook_secret, raw, linear_signature):
-            # Reject unauthorised webhooks; no workflow starts.
+        # The verified principal is the secret that signed the delivery: a global
+        # secret => default org; a per-org secret => that tenant (issue #34). None
+        # => signed by no configured secret, so no workflow starts.
+        org = org_for_hmac(
+            default_secret=app.state.webhook_secret,
+            tenants=app.state.webhook_org_secrets,
+            body=raw,
+            signature=linear_signature,
+        )
+        if org is None:
             raise HTTPException(status_code=401, detail="invalid webhook signature")
 
-        payload = await request.json()
-        orch: FoundryOrchestrator = app.state.orchestrator
+        # Bind the tenant for the whole delivery so dedup, the active-run lookup,
+        # and the created run are all isolated to the org the secret proved.
+        with tenant_context(org):
+            payload = await request.json()
+            orch: FoundryOrchestrator = app.state.orchestrator
 
-        # Replay-age guard (opt-in): a captured, validly-signed delivery still
-        # fails once it is older than the window. Linear sends webhookTimestamp
-        # (epoch ms); fail-closed when the check is on but no timestamp is sent.
-        max_age = app.state.webhook_replay_max_age_seconds
-        if max_age is not None and not webhook_timestamp_fresh(
-            payload.get("webhookTimestamp"),
-            now=app.state.clock(),
-            max_age_seconds=max_age,
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="stale or missing webhook timestamp (possible replay)",
+            # Replay-age guard (opt-in): a captured, validly-signed delivery still
+            # fails once it is older than the window. Linear sends webhookTimestamp
+            # (epoch ms); fail-closed when the check is on but no timestamp is sent.
+            max_age = app.state.webhook_replay_max_age_seconds
+            if max_age is not None and not webhook_timestamp_fresh(
+                payload.get("webhookTimestamp"),
+                now=app.state.clock(),
+                max_age_seconds=max_age,
+            ):
+                raise HTTPException(
+                    status_code=401,
+                    detail="stale or missing webhook timestamp (possible replay)",
+                )
+
+            event_id = _extract_event_id(payload, delivery_id)
+            ticket = app.state.ticket_mapper(payload)
+
+            # Durable dedup: marks the delivery processed and tells us if it was
+            # already seen (across workers and restarts), then we branch on intent.
+            if app.state.deduplicator.seen("linear", event_id):
+                return {
+                    "status": "duplicate",
+                    "run": _existing_run(orch, ticket.issue_id),
+                }
+
+            # Approval commands arrive as Linear comments. The webhook signature
+            # authenticates the payload, and the actor identity comes from Linear
+            # itself - this is the primary, already-authenticated approval surface.
+            data = payload.get("data", {}) or {}
+            body_text = data.get("body") or payload.get("body") or ""
+            command = parse_command(body_text)
+            if command and command.command in {"approve", "reject", "stop"}:
+                return _handle_linear_decision(
+                    app, orch, ticket.issue_id, command.command, payload
+                )
+
+            if not _is_trigger(
+                payload, label=app.state.trigger_label, status=app.state.trigger_status
+            ):
+                return {"status": "ignored", "reason": "no trigger condition matched"}
+
+            if not ticket.issue_id:
+                raise HTTPException(status_code=400, detail="missing issue id in payload")
+
+            # At most one *active* run per issue. A finished, blocked, rejected or
+            # needs-clarification run does not pin the issue forever: an updated
+            # ticket can be re-analysed with a fresh trigger.
+            active_id = orch.find_active_run_id_for_issue(ticket.issue_id)
+            if active_id is not None:
+                return {"status": "exists", "run": _run_to_dict(orch.get_run(active_id))}
+
+            run_id = app.state.driver.start(
+                ticket,
+                trigger_type=_trigger_type(payload, status=app.state.trigger_status),
+                created_by=(data.get("actor") or {}).get("name"),
             )
-
-        event_id = _extract_event_id(payload, delivery_id)
-        ticket = app.state.ticket_mapper(payload)
-
-        # Durable dedup: marks the delivery processed and tells us if it was
-        # already seen (across workers and restarts), then we branch on intent.
-        if app.state.deduplicator.seen("linear", event_id):
-            return {"status": "duplicate", "run": _existing_run(orch, ticket.issue_id)}
-
-        # Approval commands arrive as Linear comments. The webhook signature
-        # authenticates the payload, and the actor identity comes from Linear
-        # itself - this is the primary, already-authenticated approval surface.
-        data = payload.get("data", {}) or {}
-        body_text = data.get("body") or payload.get("body") or ""
-        command = parse_command(body_text)
-        if command and command.command in {"approve", "reject", "stop"}:
-            return _handle_linear_decision(
-                app, orch, ticket.issue_id, command.command, payload
-            )
-
-        if not _is_trigger(
-            payload, label=app.state.trigger_label, status=app.state.trigger_status
-        ):
-            return {"status": "ignored", "reason": "no trigger condition matched"}
-
-        if not ticket.issue_id:
-            raise HTTPException(status_code=400, detail="missing issue id in payload")
-
-        # At most one *active* run per issue. A finished, blocked, rejected or
-        # needs-clarification run does not pin the issue forever: an updated
-        # ticket can be re-analysed with a fresh trigger.
-        active_id = orch.find_active_run_id_for_issue(ticket.issue_id)
-        if active_id is not None:
-            return {"status": "exists", "run": _run_to_dict(orch.get_run(active_id))}
-
-        run_id = app.state.driver.start(
-            ticket,
-            trigger_type=_trigger_type(payload, status=app.state.trigger_status),
-            created_by=(data.get("actor") or {}).get("name"),
-        )
-        return {"status": "started", "run": _run_to_dict(orch.get_run(run_id))}
+            return {"status": "started", "run": _run_to_dict(orch.get_run(run_id))}
 
     @app.post("/webhooks/github", status_code=202)
     async def github_webhook(
@@ -712,32 +756,44 @@ def create_app(
         if content_type and "application/json" not in content_type:
             raise HTTPException(status_code=400, detail="content-type must be application/json")
         raw = await request.body()
-        if not verify_signature(app.state.github_webhook_secret, raw, signature):
+        # The signing secret is the verified principal: global => default org, a
+        # per-org secret => that tenant (issue #34). Bind it for the whole
+        # delivery so dedup, the issue-intake run, and the PR correlation all run
+        # in the org the secret proved — a tenant's PR observation finds the
+        # tenant's run, not the default org's.
+        org = org_for_hmac(
+            default_secret=app.state.github_webhook_secret,
+            tenants=app.state.webhook_org_secrets,
+            body=raw,
+            signature=signature,
+        )
+        if org is None:
             raise HTTPException(status_code=401, detail="invalid webhook signature")
 
-        payload = await request.json()
+        with tenant_context(org):
+            payload = await request.json()
 
-        # Durable dedup spans every GitHub delivery, not just intake: a
-        # replayed pull_request / check_run event re-drives real state
-        # (re-dispatch, status flips), so dedup before any of those paths.
-        # GitHub carries no timestamp, only the X-GitHub-Delivery UUID, so this
-        # delivery-id dedup *is* GitHub's replay protection.
-        if app.state.deduplicator.seen("github", delivery_id):
-            return {"status": "duplicate"}
+            # Durable dedup spans every GitHub delivery, not just intake: a
+            # replayed pull_request / check_run event re-drives real state
+            # (re-dispatch, status flips), so dedup before any of those paths.
+            # GitHub carries no timestamp, only the X-GitHub-Delivery UUID, so this
+            # delivery-id dedup *is* GitHub's replay protection.
+            if app.state.deduplicator.seen("github", delivery_id):
+                return {"status": "duplicate"}
 
-        # GitHub Issues as the tracker: the issue is the ticket, the label is
-        # the trigger, and /foundry commands work in issue comments.
-        if event in {"issues", "issue_comment"}:
-            return _handle_github_issue_event(app, event, payload)
+            # GitHub Issues as the tracker: the issue is the ticket, the label is
+            # the trigger, and /foundry commands work in issue comments.
+            if event in {"issues", "issue_comment"}:
+                return _handle_github_issue_event(app, event, payload)
 
-        # Best-effort: keep catalog staleness detection live between sweeps.
-        _nudge_catalog_pushed_at(app, payload)
+            # Best-effort: keep catalog staleness detection live between sweeps.
+            _nudge_catalog_pushed_at(app, payload)
 
-        connector: GitHubConnector = app.state.github_connector
-        pr_state = connector.pr_state_from_event(event or "", payload)
-        if pr_state is None:
-            return {"status": "ignored", "reason": f"event '{event}' not handled"}
-        return _observe_pr(pr_state)
+            connector: GitHubConnector = app.state.github_connector
+            pr_state = connector.pr_state_from_event(event or "", payload)
+            if pr_state is None:
+                return {"status": "ignored", "reason": f"event '{event}' not handled"}
+            return _observe_pr(pr_state)
 
     def _observe_pr(pr_state) -> dict[str, Any]:
         """Correlate an observed PR/MR state to a run and record it.
@@ -769,22 +825,30 @@ def create_app(
         event: str | None = Header(default=None, alias="X-Gitlab-Event"),
     ) -> dict[str, Any]:
         """GitLab MR/pipeline events. GitLab sends the shared secret verbatim
-        in X-Gitlab-Token (no HMAC); compared in constant time, fail-closed
-        when unconfigured."""
-        if not app.state.gitlab_webhook_secret:
+        in X-Gitlab-Token (no HMAC); compared in constant time, fail-closed when
+        neither a global nor any per-org secret is configured. A token matching a
+        per-org secret binds that tenant for the delivery (issue #34)."""
+        tenants = app.state.webhook_org_secrets
+        if not app.state.gitlab_webhook_secret and tenants.is_empty():
             raise HTTPException(
                 status_code=403,
                 detail="gitlab webhook disabled: configure FOUNDRY_GITLAB_WEBHOOK_SECRET",
             )
-        if not hmac.compare_digest(app.state.gitlab_webhook_secret, token or ""):
+        org = org_for_token(
+            default_secret=app.state.gitlab_webhook_secret,
+            tenants=tenants,
+            token=token,
+        )
+        if org is None:
             raise HTTPException(status_code=401, detail="invalid webhook token")
 
-        connector: GitLabConnector = app.state.gitlab_connector
-        payload = await request.json()
-        pr_state = connector.pr_state_from_event(event or "", payload)
-        if pr_state is None:
-            return {"status": "ignored", "reason": f"event '{event}' not handled"}
-        return _observe_pr(pr_state)
+        with tenant_context(org):
+            connector: GitLabConnector = app.state.gitlab_connector
+            payload = await request.json()
+            pr_state = connector.pr_state_from_event(event or "", payload)
+            if pr_state is None:
+                return {"status": "ignored", "reason": f"event '{event}' not handled"}
+            return _observe_pr(pr_state)
 
     @app.post("/webhooks/jira", status_code=202)
     async def jira_webhook(
@@ -796,8 +860,11 @@ def create_app(
         header. The token is effectively an approver-level credential, so it
         is header-only by default — query delivery (?token=, which leaks into
         access logs/proxies/link history) must be opted in with
-        ``tracker.jira_allow_query_token``. Fail-closed when unconfigured."""
-        if not app.state.jira_webhook_secret:
+        ``tracker.jira_allow_query_token``. Fail-closed when neither a global nor
+        any per-org secret is configured; a token matching a per-org secret binds
+        that tenant for the delivery (issue #34)."""
+        tenants = app.state.webhook_org_secrets
+        if not app.state.jira_webhook_secret and tenants.is_empty():
             raise HTTPException(
                 status_code=403,
                 detail="jira webhook disabled: configure FOUNDRY_JIRA_WEBHOOK_SECRET",
@@ -808,10 +875,16 @@ def create_app(
             else None
         )
         supplied = token or query_token or ""
-        if not hmac.compare_digest(app.state.jira_webhook_secret, supplied):
+        org = org_for_token(
+            default_secret=app.state.jira_webhook_secret,
+            tenants=tenants,
+            token=supplied,
+        )
+        if org is None:
             raise HTTPException(status_code=401, detail="invalid webhook token")
-        payload = await request.json()
-        return _handle_jira_event(app, payload)
+        with tenant_context(org):
+            payload = await request.json()
+            return _handle_jira_event(app, payload)
 
     @app.post("/webhooks/slack", status_code=200)
     async def slack_webhook(
@@ -2859,6 +2932,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         gitlab_webhook_secret=settings.gitlab_webhook_secret,
         gitlab_connector=gitlab_connector,
         slack_signing_secret=settings.slack_signing_secret,
+        webhook_org_secrets=WebhookOrgSecrets.from_pairs(settings.webhook_org_secrets),
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,
         control_mappings=settings.compliance_control_mappings,
