@@ -60,6 +60,26 @@ class ArtifactCipher:
     def decrypt(self, stored: str) -> str:  # pragma: no cover - interface
         raise NotImplementedError
 
+    def needs_reencrypt(self, stored: str) -> bool:
+        """Whether ``stored`` should be re-wrapped under the current primary key.
+
+        ``True`` for a value not yet protected by the active primary key - legacy
+        plaintext written before a key was configured, or ciphertext under a
+        rotated-away key. ``False`` (the safe default) means "leave it alone": no
+        cipher, or already under the primary key. Used by the offline re-wrap
+        maintenance pass (``db/maintenance.py``).
+        """
+        return False
+
+    def reencrypt(self, stored: str) -> str:
+        """Re-wrap ``stored`` under the current primary key, preserving plaintext.
+
+        Decrypts with whichever configured key works and re-encrypts the *same*
+        plaintext, so the plaintext content hash is untouched. The no-cipher base
+        is a pass-through.
+        """
+        return stored
+
 
 class NullCipher(ArtifactCipher):
     """No key configured: store and return plaintext (the historical behaviour).
@@ -98,7 +118,12 @@ class FernetArtifactCipher(ArtifactCipher):
         # Imported lazily: the no-key path never needs ``cryptography``.
         from cryptography.fernet import Fernet, MultiFernet
 
-        self._fernet = MultiFernet([Fernet(k.encode("ascii")) for k in keys])
+        fernets = [Fernet(k.encode("ascii")) for k in keys]
+        self._fernet = MultiFernet(fernets)
+        # The first key encrypts new writes; keep it on its own so
+        # ``needs_reencrypt`` can tell "already under the primary key" from
+        # "encrypted under a rotated-away key" - MultiFernet can't, it tries all.
+        self._primary = fernets[0]
 
     def encrypt(self, plaintext: str) -> str:
         token = self._fernet.encrypt(plaintext.encode("utf-8")).decode("ascii")
@@ -111,6 +136,26 @@ class FernetArtifactCipher(ArtifactCipher):
             return stored
         token = stored[len(_PREFIX):]
         return self._fernet.decrypt(token.encode("ascii")).decode("utf-8")
+
+    def needs_reencrypt(self, stored: str) -> bool:
+        if not stored.startswith(_PREFIX):
+            # Legacy plaintext: readable, but not actually encrypted at rest -
+            # re-wrap it now that a key is configured.
+            return True
+        from cryptography.fernet import InvalidToken
+
+        token = stored[len(_PREFIX):].encode("ascii")
+        try:
+            self._primary.decrypt(token)
+        except InvalidToken:
+            # Decryptable by the MultiFernet (some configured key) but not by the
+            # primary alone => encrypted under a rotated-away key. Re-wrap it so
+            # that old key can finally be retired.
+            return True
+        return False
+
+    def reencrypt(self, stored: str) -> str:
+        return self.encrypt(self.decrypt(stored))
 
 
 def build_cipher(key: str | None) -> ArtifactCipher:
