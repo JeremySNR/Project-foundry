@@ -151,9 +151,12 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   Both heuristic halves are operator-extensible without forking — the diff globs
   via `policy.sensitive_path_globs`, the ticket-text keywords via
   `risk.extra_sensitive_keywords` (#31, merged onto the built-in floor, strictly
-  additive). Genuinely new, dynamically-named risk *categories* (beyond the seven
-  fixed `SensitiveAreas`) remain open on #31, alongside live user-loadable OPA
-  bundles.
+  additive). Genuinely new, dynamically-named risk *categories* beyond the seven
+  fixed `SensitiveAreas` have **landed** (`risk.custom_risk_categories`, #155):
+  operator-declared categories (name + trigger keywords/globs → required approval
+  roles) loaded from committed config and namespaced so they can't collide with or
+  weaken a built-in area — escalate-only (invariant #1), engine↔Rego in lock-step
+  (invariant #2).
 - **Multi-tenant DB with row-level isolation (#156):** every tenant-scoped table
   carries an `org_id` and a central session seam (`db/base.py`) stamps it on
   write and filters every read/write to the active org (`db/tenant.py`
@@ -340,10 +343,19 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   shape as the per-path rule: orchestrator-only, strictly additive (a freeze only
   ever holds work for a human, never releases it), surfaced in `explain` /
   `check` / the dashboard policy panels; default empty = unchanged; the initial
-  human-approved dispatch is not gated. **Live user-loadable** OPA bundles and
-  **custom risk categories** remain the open items on the programmable-policy
-  epic (#31).
-- No Slack/Teams surface; approvals are tracker comments or the REST endpoint.
+  human-approved dispatch is not gated. **Live user-loadable policy bundles** have
+  landed too (`policy.bundle_path`, `policy/overlay.py`, issue #154): an operator
+  points Foundry at a separately-authored, committed bundle merged **on top of**
+  the resolved config as a strictly-additive overlay — the base config + built-in
+  rules remain a non-overridable floor, so the bundle can only ever make the gate
+  *stricter* (a one-way ratchet; a knob that would weaken the floor fails closed at
+  load — invariant #1), loaded from a configured path, never request input
+  (invariant #5). With custom risk categories (#155) landed too, the headline
+  criteria of the programmable-policy epic (#31) are delivered.
+- **Slack approvals** have landed (`api/slack.py`, `connectors/slack.py`, issue
+  #32): Slack-signed approve/reject/stop interactivity drives the same
+  `_apply_decision` path as the REST and tracker surfaces (actor = Slack-signed
+  user id; fail-closed on the signing secret). No Microsoft Teams surface yet.
 
 A C#/.NET port of the core lives in unmerged PR #1 (`dotnet/`); the Python
 implementation is canonical — genuine defects get fixed in both.
