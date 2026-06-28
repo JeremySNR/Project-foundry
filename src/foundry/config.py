@@ -480,6 +480,17 @@ class Settings:
     # expected files/areas (the template planner declares none), so for the
     # default template planner this changes nothing; set False to disable.
     enforce_plan_scope: bool = True
+    # Plan out-of-scope escalation (issue #169, slice 1): the out-of-scope twin of
+    # ``enforce_plan_scope``. When on (the default), a PR whose diff changes a
+    # path/area the approved plan explicitly listed in ``out_of_scope`` (promised
+    # *not* to touch) escalates the run to REVIEW_REQUIRED - a stronger off-plan
+    # signal than mere scope drift. Same family as the drift check: enforced
+    # diff-aware in the orchestrator re-check (no policy-engine/Rego concern,
+    # invariant #2 does not apply), strictly additive (escalate-only, never
+    # releases a run - invariant #1), and inert unless the plan actually declares
+    # out-of-scope entries (the template planner declares none). Set False to
+    # disable.
+    enforce_plan_out_of_scope: bool = True
     # Change-freeze / maintenance windows (issue #31, the "time windows" policy
     # dimension). During an active window the orchestrator holds an *autonomous*
     # re-dispatch (a remediation retry) and escalates the run to REVIEW_REQUIRED
@@ -1136,6 +1147,8 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         )
     if "enforce_plan_scope" in policy:
         out["enforce_plan_scope"] = bool(policy["enforce_plan_scope"])
+    if "enforce_plan_out_of_scope" in policy:
+        out["enforce_plan_out_of_scope"] = bool(policy["enforce_plan_out_of_scope"])
     if "change_freeze_windows" in policy:
         out["change_freeze_windows"] = tuple(
             window_from_mapping(entry)

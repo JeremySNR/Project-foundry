@@ -144,8 +144,13 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   the run to `REVIEW_REQUIRED` (orchestrator-only, escalate-only, `category:
   plan_scope_drift`; toggle `policy.enforce_plan_scope`, default on but inert
   when the plan declares no expected areas — the template planner declares none).
-  A *plan-aware* gate that reasons about whether the change satisfies the plan
-  (beyond file scope) remains future work.
+  The same re-check now also consumes the plan's `out_of_scope` (#169 slice 1):
+  a PR reaching into a path/area the plan explicitly promised *not* to touch is a
+  *stronger* off-plan signal and escalates first (orchestrator-only, escalate-only,
+  `category: plan_out_of_scope`; toggle `policy.enforce_plan_out_of_scope`, default
+  on, likewise inert when the plan declares no out-of-scope entries). A *plan-aware*
+  gate that reasons about whether the change satisfies the plan **prose** (test-plan
+  satisfaction, goal/scope intent — #169 slices 2–3) remains future work.
 - Risk-from-ticket is keyword matching by default (risk-from-diff globs are
   precise); `risk.provider: llm` adds judgment + cited evidence, escalate-only.
   Both heuristic halves are operator-extensible without forking — the diff globs

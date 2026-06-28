@@ -251,6 +251,28 @@ def files_outside_scope(scope: Sequence[str], files: Sequence[str]) -> list[str]
     ]
 
 
+def files_matching_scope(scope: Sequence[str], files: Sequence[str]) -> list[str]:
+    """Changed files that match *any* declared scope entry - the inverse of
+    :func:`files_outside_scope`.
+
+    ``scope`` is a plan's ``out_of_scope``: paths/areas the plan explicitly
+    promised **not** to touch. A returned file therefore hit a forbidden-by-plan
+    entry. Matching reuses the same generous :func:`_scope_entry_covers`
+    convention (exact / glob / directory prefix / bare-area segment) the drift
+    check uses, so an LLM planner naming an out-of-scope *area* still flags a diff
+    that reaches into it. An empty/whitespace-only scope returns ``[]`` (nothing
+    declared off-limits), so the check this powers is inert unless the planner
+    actually scoped something out. The check is escalate-only - it can hand a PR
+    that touches an off-limits path to a human, never release one.
+    """
+    cleaned = [e for e in (_normalise_scope_entry(s) for s in scope) if e]
+    if not cleaned:
+        return []
+    return [
+        f for f in files if any(_scope_entry_covers(f, e) for e in cleaned)
+    ]
+
+
 def sensitive_areas_for_paths(
     files: list[str], globs_map: Mapping[str, tuple[str, ...]]
 ) -> dict[str, list[str]]:

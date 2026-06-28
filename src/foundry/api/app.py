@@ -2799,6 +2799,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         repo_min_approvals=settings.repo_min_approvals_map,
         path_required_roles=settings.path_required_roles_map,
         enforce_plan_scope=settings.enforce_plan_scope,
+        enforce_plan_out_of_scope=settings.enforce_plan_out_of_scope,
         sensitive_path_globs=settings.sensitive_globs_map,
         extra_sensitive_keywords=extra_risk_keywords,
         custom_risk_categories=settings.custom_risk_categories,
