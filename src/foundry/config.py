@@ -491,6 +491,17 @@ class Settings:
     # out-of-scope entries (the template planner declares none). Set False to
     # disable.
     enforce_plan_out_of_scope: bool = True
+    # Plan-satisfaction judge (issue #169, slice 3): the headline plan-aware gate.
+    # "none" (the default) means no judge - the deterministic plan-scope checks
+    # above are all that run. "llm" turns on an escalate-only LLM pass
+    # (``policy.plan_satisfaction.provider: llm``) that reads the approved plan's
+    # intent (goal/scope/steps) plus the PR diff summary and escalates the run to
+    # REVIEW_REQUIRED when the change does not plausibly *satisfy* the plan -
+    # beyond mere file containment. Degrade-to-noop on any LLM failure (an outage
+    # never blocks or releases a run), mirroring ``risk.provider``/``planner.provider``.
+    # Orchestrator-only, no Rego mirror (invariant #2 does not apply).
+    plan_satisfaction_provider: str = "none"
+    plan_satisfaction_model: str = "gpt-5.5"
     # Change-freeze / maintenance windows (issue #31, the "time windows" policy
     # dimension). During an active window the orchestrator holds an *autonomous*
     # re-dispatch (a remediation retry) and escalates the run to REVIEW_REQUIRED
@@ -690,6 +701,11 @@ class Settings:
             raise ValueError(
                 "planner_provider must be 'template' or 'llm', got "
                 f"{self.planner_provider!r}"
+            )
+        if self.plan_satisfaction_provider not in ("none", "llm"):
+            raise ValueError(
+                "plan_satisfaction_provider must be 'none' or 'llm', got "
+                f"{self.plan_satisfaction_provider!r}"
             )
         if self.decomposition_provider not in ("heuristic", "llm"):
             raise ValueError(
@@ -1149,6 +1165,11 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["enforce_plan_scope"] = bool(policy["enforce_plan_scope"])
     if "enforce_plan_out_of_scope" in policy:
         out["enforce_plan_out_of_scope"] = bool(policy["enforce_plan_out_of_scope"])
+    plan_satisfaction = policy.get("plan_satisfaction", {}) or {}
+    if "provider" in plan_satisfaction:
+        out["plan_satisfaction_provider"] = plan_satisfaction["provider"]
+    if "model" in plan_satisfaction:
+        out["plan_satisfaction_model"] = plan_satisfaction["model"]
     if "change_freeze_windows" in policy:
         out["change_freeze_windows"] = tuple(
             window_from_mapping(entry)
@@ -1357,6 +1378,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_PLANNER_MODEL": "planner_model",
         "FOUNDRY_DECOMPOSITION_PROVIDER": "decomposition_provider",
         "FOUNDRY_DECOMPOSITION_MODEL": "decomposition_model",
+        "FOUNDRY_PLAN_SATISFACTION_PROVIDER": "plan_satisfaction_provider",
+        "FOUNDRY_PLAN_SATISFACTION_MODEL": "plan_satisfaction_model",
         "TEMPORAL_ADDRESS": "temporal_address",
         "FOUNDRY_TASK_QUEUE": "task_queue",
         "FOUNDRY_CONTEXT_PROVIDER": "context_provider",

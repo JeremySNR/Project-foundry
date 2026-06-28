@@ -21,6 +21,12 @@ from .llm_risk import (
     build_llm_risk_classifier,
 )
 from .llm_planner import LlmPlanner, build_llm_planner
+from .llm_plan_satisfaction import (
+    LlmPlanSatisfactionJudge,
+    PlanSatisfactionJudge,
+    PlanSatisfactionVerdict,
+    build_llm_plan_satisfaction_judge,
+)
 from .decomposition import (
     EpicDecomposer,
     EpicDecomposition,
@@ -67,6 +73,10 @@ __all__ = [
     "TemplatePlanner",
     "LlmPlanner",
     "build_llm_planner",
+    "PlanSatisfactionJudge",
+    "PlanSatisfactionVerdict",
+    "LlmPlanSatisfactionJudge",
+    "build_llm_plan_satisfaction_judge",
     "EpicDecomposer",
     "EpicDecomposition",
     "HeuristicDecomposer",

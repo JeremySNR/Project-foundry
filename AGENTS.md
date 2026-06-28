@@ -148,9 +148,19 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   a PR reaching into a path/area the plan explicitly promised *not* to touch is a
   *stronger* off-plan signal and escalates first (orchestrator-only, escalate-only,
   `category: plan_out_of_scope`; toggle `policy.enforce_plan_out_of_scope`, default
-  on, likewise inert when the plan declares no out-of-scope entries). A *plan-aware*
-  gate that reasons about whether the change satisfies the plan **prose** (test-plan
-  satisfaction, goal/scope intent — #169 slices 2–3) remains future work.
+  on, likewise inert when the plan declares no out-of-scope entries). Beyond file
+  *containment*, the **plan-satisfaction judge** (#169 slice 3, the headline
+  plan-aware gate) reasons about whether the diff actually *does what the plan
+  said*: `policy.plan_satisfaction.provider: llm` (default `none`) runs an
+  escalate-only LLM pass (`engines/llm_plan_satisfaction.py`,
+  `_plan_unsatisfied`) over the approved plan's **prose intent** (goal / scope /
+  steps) plus the PR diff summary, escalating `category: plan_unsatisfied` when
+  the change does not plausibly satisfy the plan — checked *last* (after the cheap
+  deterministic gates short-circuit) and degrade-to-noop on any LLM failure (an
+  outage never blocks *or* releases a run), mirroring `risk.provider: llm`.
+  Orchestrator-only, no Rego mirror (invariant #2 doesn't apply). The remaining
+  #169 future work is the deterministic **test-plan satisfaction** heuristic
+  (slice 2): escalate when the plan promised tests but the diff touches none.
 - Risk-from-ticket is keyword matching by default (risk-from-diff globs are
   precise); `risk.provider: llm` adds judgment + cited evidence, escalate-only.
   Both heuristic halves are operator-extensible without forking — the diff globs
