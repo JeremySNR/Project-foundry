@@ -65,6 +65,7 @@ from foundry.engines.risk import (
     GlobDiffRiskClassifier,
     HeuristicRiskClassifier,
     RiskClassifier,
+    files_matching_scope,
     files_outside_scope,
     glob_match,
     merge_sensitive_keywords,
@@ -170,6 +171,7 @@ class FoundryOrchestrator:
         repo_min_approvals: Mapping[str, int] | None = None,
         path_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         enforce_plan_scope: bool = True,
+        enforce_plan_out_of_scope: bool = True,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         extra_sensitive_keywords: Mapping[str, Sequence[str]] | None = None,
         custom_risk_categories: Sequence[CustomRiskCategory] | None = None,
@@ -284,6 +286,15 @@ class FoundryOrchestrator:
         # template planner's default), so the only runs it engages are ones a
         # code-aware planner scoped - the kill switch is this flag.
         self._enforce_plan_scope = enforce_plan_scope
+        # The out-of-scope twin of the drift check: a PR touching a path/area the
+        # approved plan explicitly listed in ``out_of_scope`` is a *stronger*
+        # off-plan signal than merely straying outside ``expected_files_or_areas``
+        # (the plan promised not to touch it), so it escalates the run to a human.
+        # Same family as plan-scope drift - orchestrator-only, escalate-only
+        # (invariant #1), no Rego mirror (invariant #2 does not apply), and
+        # data-inert whenever the plan declares no out-of-scope entries (the
+        # template planner's default) - and the kill switch is this flag.
+        self._enforce_plan_out_of_scope = enforce_plan_out_of_scope
         if sensitive_path_globs is None:
             from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
 
@@ -2187,6 +2198,33 @@ class FoundryOrchestrator:
             )
             return RunStatus.REVIEW_REQUIRED
 
+        off_limits = self._unexpected_out_of_scope_files(
+            session, run_id, pr_state.files_changed
+        )
+        if off_limits:
+            # The agent's PR touched a path/area the approved plan explicitly
+            # promised *not* to change (``out_of_scope``) - a stronger off-plan
+            # signal than mere scope drift, so it is checked first and hands the
+            # run to a human. Recorded as a RISK_ESCALATED event (like the other
+            # diff-aware escalations) so the trail says *why* and the
+            # approval-queue clock dates the wait from this transition.
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "category": "plan_out_of_scope",
+                        "reason": (
+                            "diff changes files the approved plan explicitly "
+                            "marked out of scope"
+                        ),
+                        "out_of_scope_files": sorted(off_limits),
+                    },
+                )
+            )
+            return RunStatus.REVIEW_REQUIRED
+
         drift = self._unexpected_plan_files(
             session, run_id, pr_state.files_changed
         )
@@ -2306,6 +2344,31 @@ class FoundryOrchestrator:
         except OrchestratorError:
             return []
         return files_outside_scope(plan.expected_files_or_areas, files)
+
+    def _unexpected_out_of_scope_files(
+        self, session, run_id: str, files: list[str]
+    ) -> list[str]:
+        """Changed files that hit a path/area the plan marked ``out_of_scope``.
+
+        The out-of-scope twin of :meth:`_unexpected_plan_files`: it consumes the
+        approved plan's ``out_of_scope`` (paths/areas the plan promised *not* to
+        touch) and returns any changed file matching one of them - a stronger
+        off-plan signal than mere scope drift, so the run escalates to a human.
+        Returns the offending files (empty = none). Inert - returns ``[]`` - when
+        the kill switch is off, the plan artifact is missing, or the plan declared
+        no out-of-scope entries (the template planner's default), so the only runs
+        it engages are ones a code-aware planner actually scoped. Strictly additive
+        (escalate-only), so it never releases a run (invariant #1).
+        """
+        if not self._enforce_plan_out_of_scope:
+            return []
+        try:
+            plan: DeliveryPlan = self._load(
+                session, run_id, ArtifactType.DELIVERY_PLAN
+            )
+        except OrchestratorError:
+            return []
+        return files_matching_scope(plan.out_of_scope, files)
 
     def _unexpected_sensitive_areas(
         self, session, run_id: str, files: list[str]

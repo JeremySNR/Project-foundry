@@ -199,6 +199,14 @@ policy:
   # expected files/areas: the default template planner declares none, so this
   # changes nothing until you enable planner.provider: llm. Set False to disable.
   # enforce_plan_scope: true
+  # Plan out-of-scope escalation (issue #169): the out-of-scope twin of
+  # enforce_plan_scope. When on (the default), a PR whose diff changes a path/area
+  # the approved plan explicitly listed under out_of_scope (promised *not* to
+  # touch) escalates the run to "review required" - a stronger off-plan signal
+  # than mere scope drift. Same family: orchestrator-only (no Rego rule), strictly
+  # additive (escalate-only), and inert unless the plan declares out_of_scope
+  # entries (the template planner declares none). Set False to disable.
+  # enforce_plan_out_of_scope: true
   # Change-freeze / maintenance windows (issue #31, the "time windows" policy
   # dimension). During an active window Foundry holds an *autonomous* re-dispatch
   # (the auto-retry on CI failure / changes requested) and escalates the run to
