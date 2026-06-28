@@ -2700,6 +2700,15 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         from foundry.engines.llm_decomposition import build_llm_decomposer
 
         decomposer = build_llm_decomposer(model=settings.decomposition_model)
+    plan_satisfaction_judge = None
+    if settings.plan_satisfaction_provider == "llm":
+        from foundry.engines.llm_plan_satisfaction import (
+            build_llm_plan_satisfaction_judge,
+        )
+
+        plan_satisfaction_judge = build_llm_plan_satisfaction_judge(
+            model=settings.plan_satisfaction_model
+        )
     tracker = None
     if settings.tracker_provider == "github_issues":
         if not settings.github_api_token:
@@ -2800,6 +2809,7 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         path_required_roles=settings.path_required_roles_map,
         enforce_plan_scope=settings.enforce_plan_scope,
         enforce_plan_out_of_scope=settings.enforce_plan_out_of_scope,
+        plan_satisfaction_judge=plan_satisfaction_judge,
         sensitive_path_globs=settings.sensitive_globs_map,
         extra_sensitive_keywords=extra_risk_keywords,
         custom_risk_categories=settings.custom_risk_categories,

@@ -207,6 +207,17 @@ policy:
   # additive (escalate-only), and inert unless the plan declares out_of_scope
   # entries (the template planner declares none). Set False to disable.
   # enforce_plan_out_of_scope: true
+  # Plan-satisfaction judge (issue #169, slice 3): the headline plan-aware gate.
+  # The two checks above reason about file *containment*; this one reasons about
+  # whether the diff actually *does what the plan said*. With provider: llm an
+  # escalate-only LLM pass reads the approved plan's intent (goal/scope/steps) +
+  # the PR diff summary and escalates the run to "review required" when the change
+  # does not plausibly satisfy the plan. Orchestrator-only (no Rego rule),
+  # escalate-only, and degrade-to-noop: any LLM failure leaves the deterministic
+  # gates in charge (never blocks or releases a run). Default "none" = no judge.
+  # plan_satisfaction:
+  #   provider: llm                # "none" (default) | "llm"
+  #   model: gpt-5.5
   # Change-freeze / maintenance windows (issue #31, the "time windows" policy
   # dimension). During an active window Foundry holds an *autonomous* re-dispatch
   # (the auto-retry on CI failure / changes requested) and escalates the run to

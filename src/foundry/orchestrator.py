@@ -53,6 +53,7 @@ from foundry.db.models import (
 )
 from foundry.engines.analyzer import HeuristicAnalyzer, TicketAnalyzer
 from foundry.engines.enrichment import ContextEnricher, StaticContextEnricher
+from foundry.engines.llm_plan_satisfaction import PlanSatisfactionJudge
 from foundry.engines.planner import (
     DEFAULT_FORBIDDEN_GLOBS,
     DeliveryPlanner,
@@ -172,6 +173,7 @@ class FoundryOrchestrator:
         path_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         enforce_plan_scope: bool = True,
         enforce_plan_out_of_scope: bool = True,
+        plan_satisfaction_judge: PlanSatisfactionJudge | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         extra_sensitive_keywords: Mapping[str, Sequence[str]] | None = None,
         custom_risk_categories: Sequence[CustomRiskCategory] | None = None,
@@ -295,6 +297,17 @@ class FoundryOrchestrator:
         # data-inert whenever the plan declares no out-of-scope entries (the
         # template planner's default) - and the kill switch is this flag.
         self._enforce_plan_out_of_scope = enforce_plan_out_of_scope
+        # Plan-satisfaction judge (issue #169, slice 3): the headline plan-aware
+        # gate that reasons about whether the diff actually *does what the plan
+        # said* (goal/scope/steps), beyond the deterministic file-containment
+        # checks above. Injected only when ``plan_satisfaction.provider: llm`` is
+        # configured; ``None`` (the default) means the check is a pure no-op, so
+        # offline deployments are byte-for-byte unchanged. Escalate-only and
+        # degrade-to-noop: it can only ever raise a run to REVIEW_REQUIRED, and an
+        # LLM failure leaves the deterministic gates in charge (never blocks or
+        # releases a run). Orchestrator-only, no Rego mirror (invariant #2 does
+        # not apply).
+        self._plan_satisfaction_judge = plan_satisfaction_judge
         if sensitive_path_globs is None:
             from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
 
@@ -2250,6 +2263,32 @@ class FoundryOrchestrator:
                 )
             )
             return RunStatus.REVIEW_REQUIRED
+
+        unsatisfied = self._plan_unsatisfied(session, run_id, pr_state)
+        if unsatisfied is not None:
+            # The headline plan-aware gate (issue #169 slice 3): the diff stayed
+            # inside the plan's declared file scope, but the LLM judge found it
+            # does not plausibly *satisfy* the plan's intent (goal/scope/steps).
+            # Checked last so the cheap deterministic gates short-circuit first
+            # and the LLM call only fires on an otherwise-clean diff. Escalate-only
+            # and audited like the other diff-aware escalations so the trail says
+            # *why* and the approval-queue clock dates the wait from this transition.
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "category": "plan_unsatisfied",
+                        "reason": (
+                            unsatisfied.reason
+                            or "the approved plan's intent is not satisfied by the diff"
+                        ),
+                        "source": "llm",
+                    },
+                )
+            )
+            return RunStatus.REVIEW_REQUIRED
         return RunStatus.PR_OPEN
 
     def _unapproved_path_roles(
@@ -2369,6 +2408,44 @@ class FoundryOrchestrator:
         except OrchestratorError:
             return []
         return files_matching_scope(plan.out_of_scope, files)
+
+    def _plan_unsatisfied(
+        self, session, run_id: str, pr_state: PullRequestState
+    ):
+        """LLM judgement that the diff does not satisfy the approved plan's intent.
+
+        The headline plan-aware gate (issue #169 slice 3), the consumer of the
+        approved :class:`DeliveryPlan`'s prose intent (goal / scope /
+        implementation steps) that the deterministic file-containment checks
+        ignore. Returns the escalating :class:`PlanSatisfactionVerdict` when the
+        judge found the change does not plausibly satisfy the plan, else ``None``.
+
+        Inert - returns ``None`` - when no judge is injected (the default,
+        ``plan_satisfaction.provider: none``) or the plan artifact is missing, so
+        offline deployments are byte-for-byte unchanged. Degrade-to-noop: a
+        ``degraded`` verdict (LLM failure) or any unexpected error from the judge
+        is treated as "nothing to escalate", so an outage never blocks *or*
+        releases a run. Escalate-only, so it can only ever raise REVIEW_REQUIRED
+        (invariant #1).
+        """
+        if self._plan_satisfaction_judge is None:
+            return None
+        try:
+            plan: DeliveryPlan = self._load(
+                session, run_id, ArtifactType.DELIVERY_PLAN
+            )
+        except OrchestratorError:
+            return None
+        try:
+            verdict = self._plan_satisfaction_judge.judge(plan, pr_state)
+        except Exception:
+            # Defence in depth: the LLM judge already degrades on LLMError, but a
+            # bug in a custom judge must never break PR-event processing - treat
+            # it as a no-op (the deterministic gates above stay in charge).
+            return None
+        if verdict.degraded or verdict.satisfied:
+            return None
+        return verdict
 
     def _unexpected_sensitive_areas(
         self, session, run_id: str, files: list[str]

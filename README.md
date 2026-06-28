@@ -208,6 +208,12 @@ policy:
                                   # plan listed under out_of_scope (promised not to touch)
                                   # escalates to REVIEW_REQUIRED - a stronger off-plan signal
                                   # (additive; inert when the plan declares none). Set false to disable.
+  plan_satisfaction:              # plan-satisfaction judge (#169): the headline plan-aware gate.
+    provider: none                # "llm" runs an escalate-only LLM pass over the approved plan's
+    model: gpt-5.5                # intent (goal/scope/steps) + the PR diff summary, escalating to
+                                  # REVIEW_REQUIRED when the change doesn't plausibly satisfy the
+                                  # plan - beyond file containment. Degrade-to-noop on any LLM error.
+                                  # Default "none" = no judge (deterministic plan checks only).
   sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
     auth: ["**/auth/**", "**/login/**", "**/sso/**"]
     payments: ["**/billing/**", "**/stripe/**"]
@@ -367,7 +373,7 @@ These are enforced, tested, and not negotiable by a prompt:
 - The network surfaces are rate limited. Signatures stop *unauthorised* callers; a coarse per-client cap (on by default, configurable under `rate_limit:`) stops a flood of authorised-looking ones - a replayed webhook in a loop, a runaway integration, a token brute-force - from exhausting the process. Webhooks and the API get independent budgets so a burst on one can't starve the other.
 - Risk is checked twice: once from the ticket (before dispatch) and again from the **diff** (after the PR opens). A ticket that said "fix the button" whose PR touches `auth/` escalates to human review - and the guardrails re-run on *every push*, so an agent can't open a clean PR and sneak files in later. With `risk.provider: llm`, a model pass writes its cited reasoning into the audit trail ("touches session issuance in `auth/tokens.py`") - and it may only *escalate* over the deterministic keyword/glob floor, never downgrade it.
 - Bigger-than-expected PRs and anything touching forbidden paths get bounced to a human.
-- When a code-aware planner (`planner.provider: llm`) scoped the run to specific files/areas, a PR that strays *outside* that approved scope is bounced to a human too (`policy.enforce_plan_scope`, on by default) - the "agent went off-plan" signal. It's inert for the default template planner, which declares no expected scope. A PR that reaches into a path/area the plan explicitly marked *out of scope* is bounced too (`policy.enforce_plan_out_of_scope`, on by default) - a stronger off-plan signal, likewise inert until a planner declares out-of-scope entries.
+- When a code-aware planner (`planner.provider: llm`) scoped the run to specific files/areas, a PR that strays *outside* that approved scope is bounced to a human too (`policy.enforce_plan_scope`, on by default) - the "agent went off-plan" signal. It's inert for the default template planner, which declares no expected scope. A PR that reaches into a path/area the plan explicitly marked *out of scope* is bounced too (`policy.enforce_plan_out_of_scope`, on by default) - a stronger off-plan signal, likewise inert until a planner declares out-of-scope entries. Those checks reason about file *containment*; turning on `policy.plan_satisfaction.provider: llm` adds the headline plan-aware gate that judges whether the diff actually *does what the plan said* (goal/scope/steps vs. the PR summary) and bounces it to a human when it doesn't - escalate-only, and an LLM outage is a no-op (it never blocks or releases a run).
 - The agent may retry its own failing PR, but every retry is a fresh policy decision: approvals re-checked, attempts capped, budget capped, all audited. Past the cap, a human takes over. A forbidden-path block is never retried.
 - No auto-merge. Ever, in this version.
 - Secrets never end up in an agent prompt; job inputs are scanned before dispatch.
