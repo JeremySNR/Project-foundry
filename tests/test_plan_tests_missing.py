@@ -209,6 +209,21 @@ def test_kill_switch_off_disables_check(session_factory) -> None:
     assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
 
 
+@pytest.mark.parametrize("test_path_globs", [[], ["  ", ""]])
+def test_no_configured_test_path_globs_keeps_orchestrator_inert(
+    session_factory, test_path_globs
+) -> None:
+    """No usable test convention disables the heuristic instead of escalating."""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        planner=_TestPlanPlanner(_TestPlan(unit_tests=["favourites persist"])),
+        enforce_plan_tests=True,
+        test_path_globs=test_path_globs,
+    )
+    pr = _pr(files_changed=["src/features/favourites/index.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.PR_OPEN
+
+
 def test_template_planner_engages_when_enabled(session_factory) -> None:
     """The default (template) planner promises a unit test per AC, so with the
     switch *on* a no-tests diff escalates - inertness here rides on the kill

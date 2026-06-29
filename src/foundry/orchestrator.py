@@ -2465,9 +2465,9 @@ class FoundryOrchestrator:
         ``test_path_globs`` convention, the run is escalated to a human - the "the
         plan promised tests, the diff shipped none" signal. Returns ``False`` (no
         escalation) when the kill switch is off (the default - so historical
-        behaviour is unchanged), the plan artifact is missing, or the plan promised
-        no tests. Strictly additive (escalate-only), so it never releases a run
-        (invariant #1).
+        behaviour is unchanged), the plan artifact is missing, the plan promised
+        no tests, or no test-path convention is configured. Strictly additive
+        (escalate-only), so it never releases a run (invariant #1).
         """
         if not self._enforce_plan_tests:
             return False
@@ -2480,6 +2480,8 @@ class FoundryOrchestrator:
         tp = plan.test_plan
         promised = bool(tp.unit_tests or tp.integration_tests or tp.e2e_tests)
         if not promised:
+            return False
+        if not any(glob.strip() for glob in self._test_path_globs):
             return False
         return not diff_touches_tests(files, self._test_path_globs)
 
