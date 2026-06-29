@@ -8,19 +8,28 @@ end-to-end.
 
 from __future__ import annotations
 
+import base64
+
 from foundry.api.security import (
     SLACK_MAX_AGE_SECONDS,
     ApprovalCommand,
     compute_signature,
     compute_slack_signature,
+    compute_teams_signature,
     is_authorised_approver,
     parse_command,
     verify_signature,
     verify_slack_signature,
+    verify_teams_signature,
 )
 
 BODY = b'{"hello":"world"}'
 SECRET = "test-secret"
+
+# Teams issues the shared token as base64; the signature is keyed by its decoded
+# bytes (see security.py).
+TEAMS_SECRET = base64.b64encode(b"teams-shared-secret").decode("ascii")
+TEAMS_BODY = b'{"type":"message","text":"approve issue-r"}'
 
 SLACK_BODY = b"payload=%7B%22type%22%3A%22block_actions%22%7D"
 SLACK_TS = "1718370123"
@@ -117,6 +126,49 @@ def test_verify_slack_signature_rejects_a_stale_request() -> None:
     assert not verify_slack_signature(SECRET, SLACK_BODY, SLACK_TS, sig, now=stale)
     future = float(SLACK_TS) - SLACK_MAX_AGE_SECONDS - 1
     assert not verify_slack_signature(SECRET, SLACK_BODY, SLACK_TS, sig, now=future)
+
+
+# -- verify_teams_signature ----------------------------------------------------
+
+
+def _teams_auth(secret=TEAMS_SECRET, body=TEAMS_BODY):
+    return "HMAC " + compute_teams_signature(secret, body)
+
+
+def test_verify_teams_signature_accepts_a_correct_signature() -> None:
+    assert verify_teams_signature(TEAMS_SECRET, TEAMS_BODY, _teams_auth())
+
+
+def test_verify_teams_signature_rejects_a_wrong_signature() -> None:
+    assert not verify_teams_signature(TEAMS_SECRET, TEAMS_BODY, "HMAC deadbeef")
+    other = base64.b64encode(b"other-secret").decode("ascii")
+    assert not verify_teams_signature(
+        TEAMS_SECRET, TEAMS_BODY, _teams_auth(secret=other)
+    )
+
+
+def test_verify_teams_signature_is_body_sensitive() -> None:
+    assert not verify_teams_signature(
+        TEAMS_SECRET, TEAMS_BODY + b" ", _teams_auth()
+    )
+
+
+def test_verify_teams_signature_requires_the_hmac_scheme() -> None:
+    # A bare base64 signature without the ``HMAC `` scheme prefix is refused.
+    bare = compute_teams_signature(TEAMS_SECRET, TEAMS_BODY)
+    assert not verify_teams_signature(TEAMS_SECRET, TEAMS_BODY, bare)
+    assert not verify_teams_signature(TEAMS_SECRET, TEAMS_BODY, "Bearer " + bare)
+
+
+def test_verify_teams_signature_fails_closed_without_secret_or_header() -> None:
+    assert not verify_teams_signature("", TEAMS_BODY, _teams_auth())
+    assert not verify_teams_signature(TEAMS_SECRET, TEAMS_BODY, None)
+    assert not verify_teams_signature(TEAMS_SECRET, TEAMS_BODY, "HMAC ")
+
+
+def test_verify_teams_signature_rejects_a_non_base64_secret() -> None:
+    # A misconfigured (non-base64) token must fail closed, not raise.
+    assert not verify_teams_signature("not-base64!!!", TEAMS_BODY, _teams_auth())
 
 
 # -- parse_command -------------------------------------------------------------

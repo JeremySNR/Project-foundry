@@ -379,7 +379,23 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
 - **Slack approvals** have landed (`api/slack.py`, `connectors/slack.py`, issue
   #32): Slack-signed approve/reject/stop interactivity drives the same
   `_apply_decision` path as the REST and tracker surfaces (actor = Slack-signed
-  user id; fail-closed on the signing secret). No Microsoft Teams surface yet.
+  user id; fail-closed on the signing secret). **Microsoft Teams approvals**
+  have now landed too (`api/teams.py`, `connectors/teams.py`, issue #173 — the
+  unbuilt half of #32): the Teams-native twin of the Slack surface. Inbound is a
+  Teams **Outgoing Webhook** (`POST /webhooks/teams`) verified against Teams'
+  `Authorization: HMAC <base64(HMAC-SHA256(base64decode(token), raw_body))>`
+  body signature (`verify_teams_signature`, fail-closed/constant-time, no
+  `FOUNDRY_TEAMS_SECURITY_TOKEN` ⇒ endpoint disabled); the approver @mentions the
+  bot and types `approve|reject|stop <issue-id>`, the actor is the Teams-signed
+  `from.aadObjectId`/`from.id` (never a payload field), roles come from config —
+  and it drives the same `_apply_decision` path as every other surface, so it
+  adds **no gate rule / `PolicyInput` field / Rego change** (a new approval
+  *ingress*, not a new gate; invariant #2 doesn't apply). Outbound is a Teams
+  **Incoming Webhook** posting an Adaptive Card (`TeamsNotifier` +
+  `teams_transport`, `FOUNDRY_TEAMS_WEBHOOK_URL`). Slack and Teams now fan out
+  through `MultiNotifier` (best-effort, isolated per surface, so one chat outage
+  can't starve the other). Both Teams halves are fail-closed/opt-in (unset ⇒
+  unchanged).
 
 A C#/.NET port of the core lives in unmerged PR #1 (`dotnet/`); the Python
 implementation is canonical — genuine defects get fixed in both.

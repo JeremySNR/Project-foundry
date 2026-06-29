@@ -15,10 +15,13 @@ chat outage must never break a run, exactly like the tracker write-back).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from foundry.schemas.common import RunStatus
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,38 @@ class RunNotifier(Protocol):
     ) -> None: ...
 
     def approval_progress(self, progress: ApprovalProgress) -> None: ...
+
+
+class MultiNotifier:
+    """Fan a run's notifications out to several chat surfaces (e.g. Slack + Teams).
+
+    The orchestrator holds exactly one ``RunNotifier``; this lets more than one
+    live surface receive every approval message / status update / progress nudge.
+    Each child is isolated: a surface that raises is logged and skipped so it
+    can never starve the others (the orchestrator already swallows a notifier
+    failure, but that catch would stop a naive loop at the first raising child).
+    """
+
+    def __init__(self, notifiers: "list[RunNotifier]") -> None:
+        self._notifiers = list(notifiers)
+
+    def _fan_out(self, method: str, *args: object) -> None:
+        for notifier in self._notifiers:
+            try:
+                getattr(notifier, method)(*args)
+            except Exception:
+                _log.exception("notifier %r failed on %s", notifier, method)
+
+    def approval_requested(self, request: ApprovalRequest) -> None:
+        self._fan_out("approval_requested", request)
+
+    def status_changed(
+        self, issue_id: str, issue_key: str | None, status: RunStatus
+    ) -> None:
+        self._fan_out("status_changed", issue_id, issue_key, status)
+
+    def approval_progress(self, progress: ApprovalProgress) -> None:
+        self._fan_out("approval_progress", progress)
 
 
 @dataclass

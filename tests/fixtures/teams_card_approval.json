@@ -1,0 +1,76 @@
+{
+  "type": "message",
+  "summary": "Run awaiting approval: Add customer favourites (LIN-123)",
+  "attachments": [
+    {
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.4",
+        "body": [
+          {
+            "type": "TextBlock",
+            "text": "Foundry: approval needed",
+            "wrap": true,
+            "weight": "Bolder",
+            "size": "Large"
+          },
+          {
+            "type": "TextBlock",
+            "text": "Add customer favourites",
+            "wrap": true,
+            "weight": "Bolder"
+          },
+          {
+            "type": "FactSet",
+            "facts": [
+              {
+                "title": "Issue",
+                "value": "LIN-123"
+              },
+              {
+                "title": "Work type",
+                "value": "feature"
+              },
+              {
+                "title": "Risk",
+                "value": "medium"
+              },
+              {
+                "title": "Mode",
+                "value": "draft_pr"
+              },
+              {
+                "title": "Repo",
+                "value": "customer-web"
+              },
+              {
+                "title": "Required approval",
+                "value": "engineering"
+              }
+            ]
+          },
+          {
+            "type": "TextBlock",
+            "text": "Acceptance criteria",
+            "wrap": true,
+            "weight": "Bolder"
+          },
+          {
+            "type": "TextBlock",
+            "text": "- A favourites button exists\n- Favourites persist across sessions",
+            "wrap": true
+          },
+          {
+            "type": "TextBlock",
+            "text": "To decide, @mention this bot and reply: `approve issue-r` (or `reject issue-r` / `stop issue-r`).",
+            "wrap": true,
+            "isSubtle": true,
+            "spacing": "Medium"
+          }
+        ]
+      }
+    }
+  ]
+}

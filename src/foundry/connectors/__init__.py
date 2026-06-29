@@ -18,9 +18,11 @@ from .notify import (
     ApprovalProgress,
     ApprovalRequest,
     InMemoryNotifier,
+    MultiNotifier,
     RunNotifier,
 )
 from .slack import SlackNotifier, status_label
+from .teams import TeamsNotifier
 
 __all__ = [
     "IssueTracker",
@@ -33,9 +35,11 @@ __all__ = [
     "JiraConnector",
     "RunNotifier",
     "InMemoryNotifier",
+    "MultiNotifier",
     "ApprovalRequest",
     "ApprovalProgress",
     "SlackNotifier",
+    "TeamsNotifier",
     "status_label",
     "format_analysis_comment",
     "format_approval_progress_comment",

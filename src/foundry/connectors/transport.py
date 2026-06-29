@@ -412,6 +412,47 @@ def slack_transport(
     return transport
 
 
+def teams_transport(
+    webhook_url: str,
+    *,
+    client: Any | None = None,
+) -> Callable[[str, dict[str, Any]], dict[str, Any]]:
+    """Build the ``transport(text, card) -> response`` for a Teams Incoming Webhook.
+
+    Posts the Adaptive Card wrapped in the message envelope Teams expects
+    (``attachments`` with the adaptive-card content type). The webhook URL is
+    fixed at construction (config), so the notifier never chooses the channel.
+    No retry: posting a card is non-idempotent, and a blind replay after a 502
+    the server actually processed would double-post a notification.
+
+    Teams signals failure with the HTTP status (no Slack-style ``ok: false``
+    body), so a non-2xx is surfaced as the usual ``raise_for_status`` error.
+    """
+    get_client = _client_provider(client)
+
+    def transport(text: str, card: dict[str, Any]) -> dict[str, Any]:
+        http = get_client()
+        payload = {
+            "type": "message",
+            "summary": text,
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": card,
+                }
+            ],
+        }
+        response = http.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        response.raise_for_status()
+        return {"status_code": response.status_code}
+
+    return transport
+
+
 def _retryable_status(response: Any) -> bool:
     """True if a response status warrants a retry (for idempotent requests).
 

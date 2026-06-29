@@ -173,6 +173,17 @@ class Settings:
     slack_bot_token: str | None = None
     slack_channel: str | None = None
 
+    # --- Microsoft Teams approvals (secret: env); None => /webhooks/teams disabled ---
+    # Teams Outgoing Webhooks sign each delivery with an HMAC of the raw body
+    # under this (base64) shared token; approvers are keyed by their Teams/AAD
+    # object id. None => the inbound Teams endpoint is disabled (fail-closed).
+    teams_security_token: str | None = None
+    # --- Teams outbound notifications (Incoming Webhook URL: env) ---
+    # The Incoming Webhook URL Foundry posts approval cards + status updates to.
+    # None => no Teams notifier (silent, like no tracker), mirroring Slack's
+    # fail-closed posture.
+    teams_webhook_url: str | None = None
+
     # --- API auth (secret: env); None => mutating API endpoints are disabled ---
     api_token: str | None = None
 
@@ -1398,6 +1409,8 @@ def _from_env(env: Mapping[str, str]) -> dict[str, Any]:
         "FOUNDRY_SLACK_SIGNING_SECRET": "slack_signing_secret",
         "FOUNDRY_SLACK_BOT_TOKEN": "slack_bot_token",
         "FOUNDRY_SLACK_CHANNEL": "slack_channel",
+        "FOUNDRY_TEAMS_SECURITY_TOKEN": "teams_security_token",
+        "FOUNDRY_TEAMS_WEBHOOK_URL": "teams_webhook_url",
         "FOUNDRY_API_TOKEN": "api_token",
         "FOUNDRY_ARTIFACT_ENCRYPTION_KEY": "artifact_encryption_key",
         "FOUNDRY_SCIM_BEARER_TOKEN": "scim_bearer_token",
