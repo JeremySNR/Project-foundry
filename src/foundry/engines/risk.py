@@ -273,6 +273,25 @@ def files_matching_scope(scope: Sequence[str], files: Sequence[str]) -> list[str
     ]
 
 
+def diff_touches_tests(files: Sequence[str], test_globs: Sequence[str]) -> bool:
+    """True if any changed file looks like a test, per the configured globs.
+
+    Powers the plan-tests-satisfaction signal (issue #169, slice 2): when the
+    approved plan promised tests but the diff touches *no* test file, the run is
+    escalated to a human. ``test_globs`` is the operator-tunable test-path
+    convention (default ``**/test_*.py`` / ``**/*_test.*`` / ``tests/**`` and a
+    few common JS/TS layouts). Reuses the same ``**/``-aware :func:`glob_match`
+    the sensitive-path checks use, so a pattern like ``**/test_*.py`` also matches
+    a top-level ``test_foo.py``. An empty/whitespace-only ``test_globs`` returns
+    ``False`` (no convention configured = nothing is recognised as a test), so the
+    escalate-only check this powers stays inert rather than firing on every diff.
+    """
+    cleaned = [p for p in (g.strip() for g in test_globs) if p]
+    if not cleaned:
+        return False
+    return any(glob_match(f, p) for f in files for p in cleaned)
+
+
 def sensitive_areas_for_paths(
     files: list[str], globs_map: Mapping[str, tuple[str, ...]]
 ) -> dict[str, list[str]]:

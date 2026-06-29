@@ -53,6 +53,19 @@ DEFAULT_FORBIDDEN_GLOBS = (
     "**/.env*",
     "**/secrets/**",
 )
+# Path patterns that identify a changed file as a *test*. Used by the diff-aware
+# plan-tests-satisfaction check (issue #169, slice 2): when the approved plan
+# promised tests but the diff touches none of these, the run is escalated to a
+# human. Operator-tunable per repo via ``policy.test_path_globs``.
+DEFAULT_TEST_PATH_GLOBS: tuple[str, ...] = (
+    "**/test_*.py",
+    "**/*_test.*",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "tests/**",
+    "**/tests/**",
+    "**/__tests__/**",
+)
 DEFAULT_TRIGGER_LABEL = "foundry:candidate"
 DEFAULT_TRIGGER_STATUS = "Ready for AI Analysis"
 
@@ -502,6 +515,25 @@ class Settings:
     # Orchestrator-only, no Rego mirror (invariant #2 does not apply).
     plan_satisfaction_provider: str = "none"
     plan_satisfaction_model: str = "gpt-5.5"
+    # Plan-tests-satisfaction escalation (issue #169, slice 2): a deterministic
+    # member of the same orchestrator-only, escalate-only plan-aware family as
+    # ``enforce_plan_scope`` / ``enforce_plan_out_of_scope``. When on, a PR whose
+    # approved plan promised tests (any ``test_plan.unit_tests`` /
+    # ``integration_tests`` / ``e2e_tests``) but whose diff touches *no* test file
+    # (per ``test_path_globs``) escalates the run to REVIEW_REQUIRED - the "the
+    # plan promised tests, the diff shipped none" signal. Defaults **off**: it is
+    # a heuristic that may need per-repo tuning of ``test_path_globs`` before it is
+    # trustworthy enough to gate on - so the *default* (off) keeps historical
+    # behaviour byte-for-byte. Orchestrator-only (no Rego mirror, invariant #2 does
+    # not apply), strictly additive (escalate-only, never releases a run - invariant
+    # #1), and inert whenever the plan declares no tests.
+    enforce_plan_tests: bool = False
+    # Test-path convention the plan-tests check uses to recognise a changed file
+    # as a test. Operator-tunable per repo; the default covers the common Python
+    # (``test_*.py``/``*_test.py``), JS/TS (``*.test.*``/``*.spec.*``) and
+    # ``tests/``-directory layouts. Matched with the same ``**/``-aware glob the
+    # sensitive-path checks use.
+    test_path_globs: tuple[str, ...] = DEFAULT_TEST_PATH_GLOBS
     # Change-freeze / maintenance windows (issue #31, the "time windows" policy
     # dimension). During an active window the orchestrator holds an *autonomous*
     # re-dispatch (a remediation retry) and escalates the run to REVIEW_REQUIRED
@@ -1165,6 +1197,10 @@ def _from_yaml(path: Path) -> dict[str, Any]:
         out["enforce_plan_scope"] = bool(policy["enforce_plan_scope"])
     if "enforce_plan_out_of_scope" in policy:
         out["enforce_plan_out_of_scope"] = bool(policy["enforce_plan_out_of_scope"])
+    if "enforce_plan_tests" in policy:
+        out["enforce_plan_tests"] = bool(policy["enforce_plan_tests"])
+    if "test_path_globs" in policy:
+        out["test_path_globs"] = tuple(policy["test_path_globs"])
     plan_satisfaction = policy.get("plan_satisfaction", {}) or {}
     if "provider" in plan_satisfaction:
         out["plan_satisfaction_provider"] = plan_satisfaction["provider"]

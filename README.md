@@ -208,6 +208,11 @@ policy:
                                   # plan listed under out_of_scope (promised not to touch)
                                   # escalates to REVIEW_REQUIRED - a stronger off-plan signal
                                   # (additive; inert when the plan declares none). Set false to disable.
+  enforce_plan_tests: false       # test-plan satisfaction (#169): a plan promising tests but a diff
+                                  # touching no test file (per test_path_globs) escalates to
+                                  # REVIEW_REQUIRED (additive; inert when the plan promises no tests).
+                                  # Default OFF - heuristic; set true to enable.
+  # test_path_globs: ["**/test_*.py", "**/*_test.*", "tests/**", ...]  # what counts as a test file
   plan_satisfaction:              # plan-satisfaction judge (#169): the headline plan-aware gate.
     provider: none                # "llm" runs an escalate-only LLM pass over the approved plan's
     model: gpt-5.5                # intent (goal/scope/steps) + the PR diff summary, escalating to

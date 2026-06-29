@@ -2809,6 +2809,8 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
         path_required_roles=settings.path_required_roles_map,
         enforce_plan_scope=settings.enforce_plan_scope,
         enforce_plan_out_of_scope=settings.enforce_plan_out_of_scope,
+        enforce_plan_tests=settings.enforce_plan_tests,
+        test_path_globs=settings.test_path_globs,
         plan_satisfaction_judge=plan_satisfaction_judge,
         sensitive_path_globs=settings.sensitive_globs_map,
         extra_sensitive_keywords=extra_risk_keywords,

@@ -66,6 +66,7 @@ from foundry.engines.risk import (
     GlobDiffRiskClassifier,
     HeuristicRiskClassifier,
     RiskClassifier,
+    diff_touches_tests,
     files_matching_scope,
     files_outside_scope,
     glob_match,
@@ -173,6 +174,8 @@ class FoundryOrchestrator:
         path_required_roles: Mapping[str, tuple[str, ...]] | None = None,
         enforce_plan_scope: bool = True,
         enforce_plan_out_of_scope: bool = True,
+        enforce_plan_tests: bool = False,
+        test_path_globs: Sequence[str] | None = None,
         plan_satisfaction_judge: PlanSatisfactionJudge | None = None,
         sensitive_path_globs: Mapping[str, tuple[str, ...]] | None = None,
         extra_sensitive_keywords: Mapping[str, Sequence[str]] | None = None,
@@ -297,6 +300,25 @@ class FoundryOrchestrator:
         # data-inert whenever the plan declares no out-of-scope entries (the
         # template planner's default) - and the kill switch is this flag.
         self._enforce_plan_out_of_scope = enforce_plan_out_of_scope
+        # Plan-tests-satisfaction (issue #169, slice 2): a deterministic member of
+        # the same orchestrator-only, escalate-only plan-aware family. When on, a
+        # PR whose approved plan promised tests (any unit/integration/e2e entry in
+        # ``test_plan``) but whose diff touches *no* test file (per
+        # ``test_path_globs``) escalates the run to a human - the "the plan
+        # promised tests, the diff shipped none" signal. Default off: it is a
+        # heuristic whose ``test_path_globs`` convention may need per-repo tuning
+        # before it is trustworthy enough to gate on - so the *default* behaviour
+        # is byte-for-byte unchanged (unlike the scope checks, the template planner
+        # *does* promise a unit test per AC, so inertness here rides on the switch,
+        # not on an empty plan field). Escalate-only (invariant #1), no Rego mirror
+        # (invariant #2 does not apply), and data-inert whenever the plan declares
+        # no tests at all.
+        self._enforce_plan_tests = enforce_plan_tests
+        if test_path_globs is None:
+            from foundry.config import DEFAULT_TEST_PATH_GLOBS
+
+            test_path_globs = DEFAULT_TEST_PATH_GLOBS
+        self._test_path_globs = tuple(test_path_globs)
         # Plan-satisfaction judge (issue #169, slice 3): the headline plan-aware
         # gate that reasons about whether the diff actually *does what the plan
         # said* (goal/scope/steps), beyond the deterministic file-containment
@@ -2264,6 +2286,29 @@ class FoundryOrchestrator:
             )
             return RunStatus.REVIEW_REQUIRED
 
+        if self._plan_tests_missing(session, run_id, pr_state.files_changed):
+            # The approved plan promised tests but the diff shipped none (issue
+            # #169 slice 2). A deterministic plan-satisfaction signal, checked
+            # before the (optional) LLM judge so the cheap heuristic short-circuits
+            # first. Escalate-only and audited like the other diff-aware
+            # escalations so the trail says *why* and the approval-queue clock
+            # dates the wait from this transition.
+            session.add(
+                build_audit_event(
+                    run_id=run_id,
+                    event_type=AuditEventType.RISK_ESCALATED,
+                    actor_type="foundry",
+                    metadata={
+                        "category": "plan_tests_missing",
+                        "reason": (
+                            "the approved plan promised tests but the diff "
+                            "touches no test file"
+                        ),
+                    },
+                )
+            )
+            return RunStatus.REVIEW_REQUIRED
+
         unsatisfied = self._plan_unsatisfied(session, run_id, pr_state)
         if unsatisfied is not None:
             # The headline plan-aware gate (issue #169 slice 3): the diff stayed
@@ -2408,6 +2453,37 @@ class FoundryOrchestrator:
         except OrchestratorError:
             return []
         return files_matching_scope(plan.out_of_scope, files)
+
+    def _plan_tests_missing(
+        self, session, run_id: str, files: list[str]
+    ) -> bool:
+        """True when the approved plan promised tests but the diff ships none.
+
+        The deterministic test-plan satisfaction signal (issue #169, slice 2): if
+        the approved :class:`DeliveryPlan`'s ``test_plan`` declares any
+        unit/integration/e2e tests yet no changed file matches the configured
+        ``test_path_globs`` convention, the run is escalated to a human - the "the
+        plan promised tests, the diff shipped none" signal. Returns ``False`` (no
+        escalation) when the kill switch is off (the default - so historical
+        behaviour is unchanged), the plan artifact is missing, the plan promised
+        no tests, or no test-path convention is configured. Strictly additive
+        (escalate-only), so it never releases a run (invariant #1).
+        """
+        if not self._enforce_plan_tests:
+            return False
+        try:
+            plan: DeliveryPlan = self._load(
+                session, run_id, ArtifactType.DELIVERY_PLAN
+            )
+        except OrchestratorError:
+            return False
+        tp = plan.test_plan
+        promised = bool(tp.unit_tests or tp.integration_tests or tp.e2e_tests)
+        if not promised:
+            return False
+        if not any(glob.strip() for glob in self._test_path_globs):
+            return False
+        return not diff_touches_tests(files, self._test_path_globs)
 
     def _plan_unsatisfied(
         self, session, run_id: str, pr_state: PullRequestState

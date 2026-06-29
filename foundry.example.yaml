@@ -207,6 +207,26 @@ policy:
   # additive (escalate-only), and inert unless the plan declares out_of_scope
   # entries (the template planner declares none). Set False to disable.
   # enforce_plan_out_of_scope: true
+  # Plan-tests satisfaction escalation (issue #169, slice 2): when on, a PR whose
+  # approved plan promised tests (any test_plan.unit_tests / integration_tests /
+  # e2e_tests) but whose diff touches *no* test file (per test_path_globs below)
+  # escalates the run to "review required" - the "plan promised tests, diff shipped
+  # none" signal. Same family: orchestrator-only (no Rego rule), strictly additive
+  # (escalate-only), and inert when the plan declares no tests. Defaults OFF: it is
+  # a heuristic whose test-path convention may need per-repo tuning first, and the
+  # template planner already promises a unit test per AC, so leaving it off keeps
+  # current behaviour unchanged. Set True to enable.
+  # enforce_plan_tests: false
+  # Test-path convention enforce_plan_tests uses to recognise a changed file as a
+  # test. Tune per repo; the default covers common Python, JS/TS and tests/ layouts.
+  # test_path_globs:
+  #   - "**/test_*.py"
+  #   - "**/*_test.*"
+  #   - "**/*.test.*"
+  #   - "**/*.spec.*"
+  #   - "tests/**"
+  #   - "**/tests/**"
+  #   - "**/__tests__/**"
   # Plan-satisfaction judge (issue #169, slice 3): the headline plan-aware gate.
   # The two checks above reason about file *containment*; this one reasons about
   # whether the diff actually *does what the plan said*. With provider: llm an
