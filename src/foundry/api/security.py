@@ -6,6 +6,8 @@ authorised users approve a run. Signature verification is constant-time.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import time
@@ -84,6 +86,49 @@ def verify_slack_signature(
         return False
     expected = compute_slack_signature(secret, timestamp, body)
     return hmac.compare_digest(expected, signature)
+
+
+# --- Microsoft Teams request signing -----------------------------------------
+
+# Teams Outgoing Webhooks sign each delivery with an HMAC-SHA256 of the raw body
+# under a shared secret, delivered as ``Authorization: HMAC <base64-signature>``.
+# The secret Teams shows the operator at registration is itself base64, so it is
+# decoded to raw bytes before keying the HMAC.
+# https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-outgoing-webhook
+TEAMS_AUTH_SCHEME = "HMAC"
+
+
+def compute_teams_signature(secret: str, body: bytes) -> str:
+    """Teams Outgoing Webhook signature for ``body`` (for tests/clients).
+
+    The shared ``secret`` is base64 (as Teams issues it); it is decoded to raw
+    key bytes, and the result is the base64-encoded HMAC-SHA256 of the raw body
+    — the value Teams puts after ``HMAC `` in the ``Authorization`` header.
+    """
+    key = base64.b64decode(secret)
+    digest = hmac.new(key, body, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def verify_teams_signature(
+    secret: str, body: bytes, authorization: str | None
+) -> bool:
+    """Verify a Teams Outgoing Webhook ``Authorization: HMAC <sig>`` header.
+
+    Fail-closed: returns False when no secret is configured (an empty secret
+    cannot authenticate anything), when the header is missing or not the ``HMAC``
+    scheme, or when the secret is not valid base64. Comparison is constant-time.
+    """
+    if not secret or not authorization:
+        return False
+    scheme, _, provided = authorization.partition(" ")
+    if scheme != TEAMS_AUTH_SCHEME or not provided:
+        return False
+    try:
+        expected = compute_teams_signature(secret, body)
+    except (binascii.Error, ValueError):
+        return False
+    return hmac.compare_digest(expected, provided.strip())
 
 
 # --- approval commands -------------------------------------------------------

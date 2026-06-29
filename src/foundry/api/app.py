@@ -117,12 +117,14 @@ from .scim import (
 from .sessions import SessionSigner
 from .ratelimit import RateLimiter
 from .slack import parse_slack_interaction
+from .teams import format_teams_reply, parse_teams_interaction
 from .tenant import TenantMiddleware, resolve_request_org
 from .webhook_org import WebhookOrgSecrets, org_for_hmac, org_for_token
 from .security import (
     is_authorised_approver,
     parse_command,
     verify_slack_signature,
+    verify_teams_signature,
 )
 
 # Trigger conditions: a run starts only on an explicit opt-in, never for every
@@ -249,6 +251,7 @@ def create_app(
     gitlab_webhook_secret: str | None = None,
     gitlab_connector: GitLabConnector | None = None,
     slack_signing_secret: str | None = None,
+    teams_security_token: str | None = None,
     webhook_org_secrets: WebhookOrgSecrets | None = None,
     driver: RunDriver | None = None,
     trigger_label: str = _TRIGGER_LABEL,
@@ -340,6 +343,9 @@ def create_app(
     app.state.jira_allow_query_token = jira_allow_query_token
     app.state.gitlab_webhook_secret = gitlab_webhook_secret
     app.state.slack_signing_secret = slack_signing_secret
+    # Teams Outgoing-Webhook shared token (base64). Fail-closed: no token =>
+    # the inbound Teams endpoint is disabled, same posture as Slack/Jira/GitLab.
+    app.state.teams_security_token = teams_security_token
     # Per-org webhook secrets (issue #34 follow-up): map a verified webhook
     # delivery to its tenant org from *which committed secret matched*, never the
     # payload (invariant #5). Empty (the default) => single-tenant, every delivery
@@ -356,6 +362,7 @@ def create_app(
             jira_webhook_secret,
             gitlab_webhook_secret,
             slack_signing_secret,
+            teams_security_token,
         )
         if s
     }
@@ -939,6 +946,57 @@ def create_app(
             interaction.command,
             interaction.user,
         )
+
+    @app.post("/webhooks/teams", status_code=200)
+    async def teams_webhook(
+        request: Request,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> dict[str, Any]:
+        """Microsoft Teams Outgoing-Webhook approvals (approve/reject/stop).
+
+        The Teams twin of the Slack surface: an Outgoing-Webhook delivery is
+        verified against Teams' ``Authorization: HMAC <sig>`` body signature,
+        then driven through the same policy-gated decision path as every other
+        surface. Fail-closed: no security token => disabled.
+
+        The acting identity is the Teams/AAD object id Teams signs into the
+        payload (``from.aadObjectId``/``from.id``), so it cannot be forged
+        without the token. Configure approvers by that id (as Slack approvers are
+        keyed by ``user.id``). Roles come from config, never the payload. The
+        approver @mentions the bot and types ``approve <issue-id>``. The HTTP
+        response is rendered back into the channel as a short outcome message.
+        """
+        if not app.state.teams_security_token:
+            raise HTTPException(
+                status_code=403,
+                detail="teams webhook disabled: configure FOUNDRY_TEAMS_SECURITY_TOKEN",
+            )
+        raw = await request.body()
+        if not verify_teams_signature(
+            app.state.teams_security_token, raw, authorization
+        ):
+            raise HTTPException(status_code=401, detail="invalid teams signature")
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return format_teams_reply(
+                {"status": "ignored", "reason": "unparseable activity payload"}
+            )
+
+        interaction = parse_teams_interaction(payload)
+        if interaction is None:
+            return format_teams_reply(
+                {"status": "ignored", "reason": "no actionable foundry decision"}
+            )
+        result = _apply_decision(
+            app,
+            app.state.orchestrator,
+            interaction.issue_id,
+            interaction.command,
+            interaction.user,
+        )
+        return format_teams_reply(result)
 
     @app.get("/runs")
     def list_runs(skip: int = 0, limit: int = 100) -> dict[str, Any]:
@@ -2742,18 +2800,38 @@ def build_orchestrator(settings: Settings, session_factory) -> FoundryOrchestrat
     else:
         raise ValueError(f"unknown tracker.provider: {settings.tracker_provider!r}")
 
-    # Outbound Slack notifications are fail-closed: wired only when BOTH the bot
-    # token and a channel are configured, mirroring the no-token-=>-no-connector
-    # posture of the tracker. Either missing => the orchestrator simply has no
-    # notifier and runs as before.
-    notifier = None
+    # Outbound chat notifications are fail-closed: each surface is wired only when
+    # its credentials are present, mirroring the no-token-=>-no-connector posture
+    # of the tracker. When more than one is configured they fan out through a
+    # MultiNotifier (best-effort, isolated per surface); none configured => the
+    # orchestrator simply has no notifier and runs as before.
+    notifiers: list[Any] = []
     if settings.slack_bot_token and settings.slack_channel:
         from foundry.connectors.slack import SlackNotifier
         from foundry.connectors.transport import slack_transport
 
-        notifier = SlackNotifier(
-            transport=slack_transport(settings.slack_bot_token, settings.slack_channel)
+        notifiers.append(
+            SlackNotifier(
+                transport=slack_transport(
+                    settings.slack_bot_token, settings.slack_channel
+                )
+            )
         )
+    if settings.teams_webhook_url:
+        from foundry.connectors.teams import TeamsNotifier
+        from foundry.connectors.transport import teams_transport
+
+        notifiers.append(
+            TeamsNotifier(transport=teams_transport(settings.teams_webhook_url))
+        )
+    if not notifiers:
+        notifier = None
+    elif len(notifiers) == 1:
+        notifier = notifiers[0]
+    else:
+        from foundry.connectors.notify import MultiNotifier
+
+        notifier = MultiNotifier(notifiers)
 
     repo_keywords = {repo: list(kws) for repo, kws in settings.context_repo_keywords}
     if settings.context_provider in ("catalog", "code"):
@@ -2945,6 +3023,7 @@ def app_from_settings(settings: Settings) -> FastAPI:
         gitlab_webhook_secret=settings.gitlab_webhook_secret,
         gitlab_connector=gitlab_connector,
         slack_signing_secret=settings.slack_signing_secret,
+        teams_security_token=settings.teams_security_token,
         webhook_org_secrets=WebhookOrgSecrets.from_pairs(settings.webhook_org_secrets),
         trigger_label=settings.trigger_label,
         trigger_status=settings.trigger_status,

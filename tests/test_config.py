@@ -556,6 +556,21 @@ def test_slack_notifications_from_env_and_yaml(tmp_path) -> None:
     assert Settings.from_env({}).slack_channel is None
 
 
+def test_teams_approvals_from_env() -> None:
+    # Both the inbound HMAC token and the outbound webhook URL are env-only.
+    s = Settings.from_env(
+        {
+            "FOUNDRY_TEAMS_SECURITY_TOKEN": "dGVhbXM=",
+            "FOUNDRY_TEAMS_WEBHOOK_URL": "https://example.webhook.office.com/hook",
+        }
+    )
+    assert s.teams_security_token == "dGVhbXM="
+    assert s.teams_webhook_url == "https://example.webhook.office.com/hook"
+    # Default: Teams surface unconfigured (fail-closed).
+    assert Settings.from_env({}).teams_security_token is None
+    assert Settings.from_env({}).teams_webhook_url is None
+
+
 def test_env_overrides_yaml(tmp_path) -> None:
     path = tmp_path / "foundry.yaml"
     path.write_text(_YAML)

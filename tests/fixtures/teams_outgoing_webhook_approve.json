@@ -1,0 +1,15 @@
+{
+  "type": "message",
+  "id": "1718370000123",
+  "timestamp": "2026-06-29T12:00:00.000Z",
+  "channelId": "msteams",
+  "from": {
+    "id": "29:1ABCdefGHIjklMNOpqrSTUvwx",
+    "aadObjectId": "00000000-0000-0000-0000-000000000abc",
+    "name": "Engineering Lead"
+  },
+  "conversation": {
+    "id": "19:meeting_channel@thread.tacv2"
+  },
+  "text": "<at>Foundry</at> approve issue-r"
+}
