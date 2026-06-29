@@ -88,3 +88,13 @@ def test_empty_response_raises_llm_error() -> None:
 def test_non_json_response_raises_llm_error() -> None:
     with pytest.raises(LLMError, match="not valid JSON"):
         _generate(_FakeCompletions(content="certainly! here is the JSON:"))
+
+
+@pytest.mark.parametrize("content", ["[1, 2, 3]", '"a string"', "42", "null"])
+def test_non_object_json_response_raises_llm_error(content: str) -> None:
+    # generate() is contracted to return a JSON *object*; a valid-but-wrong-shape
+    # top-level array/scalar/null must surface as LLMError (not be returned as a
+    # non-dict), so the degrade-to-floor callers catch it instead of crashing
+    # when they index into the result.
+    with pytest.raises(LLMError, match="not a JSON object"):
+        _generate(_FakeCompletions(content=content))
