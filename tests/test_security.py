@@ -9,9 +9,11 @@ end-to-end.
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 
 from foundry.api.security import (
     SLACK_MAX_AGE_SECONDS,
+    TEAMS_MAX_AGE_SECONDS,
     ApprovalCommand,
     compute_signature,
     compute_slack_signature,
@@ -21,6 +23,7 @@ from foundry.api.security import (
     verify_signature,
     verify_slack_signature,
     verify_teams_signature,
+    verify_teams_timestamp,
 )
 
 BODY = b'{"hello":"world"}'
@@ -169,6 +172,31 @@ def test_verify_teams_signature_fails_closed_without_secret_or_header() -> None:
 def test_verify_teams_signature_rejects_a_non_base64_secret() -> None:
     # A misconfigured (non-base64) token must fail closed, not raise.
     assert not verify_teams_signature("not-base64!!!", TEAMS_BODY, _teams_auth())
+
+
+def test_verify_teams_timestamp_accepts_a_fresh_activity() -> None:
+    now = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    assert verify_teams_timestamp("2026-06-29T12:00:00.000Z", now=now)
+
+
+def test_verify_teams_timestamp_rejects_a_stale_activity() -> None:
+    now = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    stale = "2026-06-29T11:54:59.000Z"
+    future = "2026-06-29T12:05:01.000Z"
+    assert not verify_teams_timestamp(stale, now=now)
+    assert not verify_teams_timestamp(future, now=now)
+    assert not verify_teams_timestamp(
+        "2026-06-29T11:54:59.000Z",
+        now=now,
+        max_age_seconds=TEAMS_MAX_AGE_SECONDS,
+    )
+
+
+def test_verify_teams_timestamp_fails_closed_without_an_iso_timestamp() -> None:
+    now = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    assert not verify_teams_timestamp(None, now=now)
+    assert not verify_teams_timestamp("not-a-date", now=now)
+    assert not verify_teams_timestamp("2026-06-29T12:00:00", now=now)
 
 
 # -- parse_command -------------------------------------------------------------

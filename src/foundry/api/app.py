@@ -125,6 +125,7 @@ from .security import (
     parse_command,
     verify_slack_signature,
     verify_teams_signature,
+    verify_teams_timestamp,
 )
 
 # Trigger conditions: a run starts only on an explicit opt-in, never for every
@@ -983,6 +984,8 @@ def create_app(
             return format_teams_reply(
                 {"status": "ignored", "reason": "unparseable activity payload"}
             )
+        if not verify_teams_timestamp(payload.get("timestamp"), now=app.state.clock()):
+            raise HTTPException(status_code=401, detail="stale teams activity")
 
         interaction = parse_teams_interaction(payload)
         if interaction is None:

@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 
 class WebhookAuthError(Exception):
@@ -96,6 +97,7 @@ def verify_slack_signature(
 # decoded to raw bytes before keying the HMAC.
 # https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-outgoing-webhook
 TEAMS_AUTH_SCHEME = "HMAC"
+TEAMS_MAX_AGE_SECONDS = SLACK_MAX_AGE_SECONDS
 
 
 def compute_teams_signature(secret: str, body: bytes) -> str:
@@ -129,6 +131,32 @@ def verify_teams_signature(
     except (binascii.Error, ValueError):
         return False
     return hmac.compare_digest(expected, provided.strip())
+
+
+def verify_teams_timestamp(
+    timestamp: str | None,
+    *,
+    now: datetime | None = None,
+    max_age_seconds: int = TEAMS_MAX_AGE_SECONDS,
+) -> bool:
+    """Verify the Teams activity timestamp replay window.
+
+    Teams signs only the body, so the signed activity ``timestamp`` is the
+    freshness signal. Fail closed when it is missing, malformed, timezone-naive,
+    or outside the replay window.
+    """
+    if not timestamp:
+        return False
+    try:
+        sent_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if sent_at.tzinfo is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return abs((current - sent_at).total_seconds()) <= max_age_seconds
 
 
 # --- approval commands -------------------------------------------------------

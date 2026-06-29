@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,7 @@ TEAMS_SECRET = base64.b64encode(b"teams-shared-secret").decode("ascii")
 # Approvers are keyed by the Teams/AAD object id (as Slack keys by user.id).
 APPROVER = "00000000-0000-0000-0000-0000000000aa"
 APPROVERS = {APPROVER: []}
+NOW = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -53,6 +55,7 @@ def _make_client(**overrides) -> TestClient:
         orchestrator=orch,
         approvers=APPROVERS,
         teams_security_token=TEAMS_SECRET,
+        clock=lambda: NOW,
     )
     kwargs.update(overrides)
     return TestClient(create_app(**kwargs))
@@ -94,6 +97,7 @@ def _activity(command: str, issue_id: str, user: str = APPROVER) -> dict:
     return {
         "type": "message",
         "from": {"id": "29:abc", "aadObjectId": user, "name": "Lead"},
+        "timestamp": "2026-06-29T12:00:00.000Z",
         "text": f"<at>Foundry</at> {command} {issue_id}",
     }
 
@@ -143,6 +147,15 @@ def test_teams_missing_authorization_header_rejected(client) -> None:
     assert resp.status_code == 401
 
 
+def test_teams_stale_activity_rejected(client) -> None:
+    run_id = _start_ready_run(client)
+    payload = _activity("approve", "issue-r")
+    payload["timestamp"] = "2026-06-29T11:54:59.000Z"
+    resp = _post_teams(client, payload)
+    assert resp.status_code == 401
+    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+
+
 # -- decision behaviour --------------------------------------------------------
 
 
@@ -182,6 +195,7 @@ def test_teams_non_foundry_message_is_ignored(client) -> None:
     payload = {
         "type": "message",
         "from": {"aadObjectId": APPROVER},
+        "timestamp": "2026-06-29T12:00:00.000Z",
         "text": "<at>Foundry</at> what is the status?",
     }
     resp = _post_teams(client, payload)
