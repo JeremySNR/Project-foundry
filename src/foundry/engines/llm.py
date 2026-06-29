@@ -103,6 +103,17 @@ class OpenAIStructuredLLM:
         if not content:
             raise LLMError("OpenAI returned an empty response")
         try:
-            return json.loads(content)
+            parsed = json.loads(content)
         except json.JSONDecodeError as exc:
             raise LLMError(f"OpenAI response was not valid JSON: {exc}") from exc
+        # The structured contract (and this method's return type) is a JSON
+        # *object*. A model can still emit a valid-but-wrong-shaped top-level
+        # JSON array/scalar/null (the default is strict=False); surface it as
+        # LLMError here so it flows through every caller's degrade-to-floor
+        # path instead of crashing a consumer that indexes into the result.
+        if not isinstance(parsed, dict):
+            raise LLMError(
+                "OpenAI response was valid JSON but not a JSON object "
+                f"(got {type(parsed).__name__})"
+            )
+        return parsed

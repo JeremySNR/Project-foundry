@@ -86,6 +86,15 @@ class OpenAITicketAnalyzer:
                 schema=schema,
                 schema_name="TicketAnalysis",
             )
+            # A conforming StructuredLLM returns a JSON object, but guard the
+            # shape before indexing so a non-dict response degrades to the
+            # heuristic floor (issue contract: an LLM never fails intake)
+            # rather than raising an uncaught TypeError from the assignments.
+            if not isinstance(raw, dict):
+                last_error = LLMError(
+                    f"LLM returned a JSON {type(raw).__name__}, expected an object"
+                )
+                continue
             # Identity comes from the ticket, never the model.
             raw["ticket_id"] = ticket.issue_key or ticket.issue_id
             raw["title"] = ticket.title

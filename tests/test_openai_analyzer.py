@@ -102,6 +102,30 @@ def test_persistently_invalid_degrades_to_heuristic_loudly() -> None:
     assert any("LLM analysis unavailable" in a for a in analysis.assumptions)
 
 
+def test_non_object_response_degrades_to_heuristic_not_crash() -> None:
+    # A StructuredLLM that returns a non-object (a JSON array/scalar slipping
+    # past a non-strict model) previously raised an uncaught TypeError from the
+    # identity-field assignments, aborting intake. It must degrade to the
+    # heuristic floor like any other unusable LLM output.
+    class _NonDict:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            return ["not", "an", "object"]
+
+    llm = _NonDict()
+    ticket = _ticket(description="Acceptance criteria:\n- The heart saves the item")
+    analysis = OpenAITicketAnalyzer(llm, max_attempts=2).analyse(ticket)
+
+    expected = HeuristicAnalyzer().analyse(ticket)
+    assert analysis.implementation_readiness is expected.implementation_readiness
+    assert any("LLM analysis unavailable" in a for a in analysis.assumptions)
+    # The non-object response is retried like any invalid output before degrading.
+    assert llm.calls == 2
+
+
 def test_sdk_failure_degrades_to_heuristic_and_keeps_hard_rules() -> None:
     # An LLM raising (rate limit, timeout, outage) degrades the same way -
     # and the conservative heuristic still parks an AC-less ticket.
