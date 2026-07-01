@@ -350,3 +350,35 @@ def test_glob_match_handles_leading_doublestar() -> None:
     assert glob_match("auth/handler.py", "**/auth/**")
     assert glob_match("src/auth/handler.py", "**/auth/**")
     assert not glob_match("src/author/file.py", "**/auth/**")
+
+
+def test_forbidden_path_match_is_depth_agnostic_for_bare_globs() -> None:
+    """Issue #177: a bare relative forbidden glob blocks the dir at any depth,
+    not just the repo root, so an operator's ``secrets/**`` protects a nested
+    ``app/secrets/...`` too (the sticky BLOCK, not the softer escalation)."""
+    from foundry.engines.risk import forbidden_path_match, glob_match
+
+    # The gap glob_match leaves: a bare relative glob only matches the top level.
+    assert not glob_match("app/secrets/key.pem", "secrets/**")
+    assert not glob_match("services/api/migrations/0001.py", "migrations/**")
+
+    # forbidden_path_match closes it - bare relative pattern matches at any depth.
+    assert forbidden_path_match("app/secrets/key.pem", "secrets/**")
+    assert forbidden_path_match("secrets/key.pem", "secrets/**")
+    assert forbidden_path_match("services/api/migrations/0001.py", "migrations/**")
+
+    # A bare filename glob is likewise depth-agnostic (stricter = safe).
+    assert forbidden_path_match("build/Dockerfile", "Dockerfile")
+
+    # Still a strict superset of glob_match: everything glob_match blocks, this
+    # blocks too (the depth-agnostic default globs are unchanged).
+    assert forbidden_path_match("services/api/migrations/0001.py", "**/migrations/**")
+    assert forbidden_path_match("app/.env.local", "**/.env*")
+
+    # A rooted pattern is honoured as written - not expanded to any depth.
+    assert not forbidden_path_match("app/secrets/key.pem", "/secrets/**")
+    assert forbidden_path_match("secrets/key.pem", "/secrets/**") is False
+
+    # Genuine non-matches stay non-matches (no over-broad blocking).
+    assert not forbidden_path_match("src/secretsmanager/util.py", "secrets/**")
+    assert not forbidden_path_match("src/app/config.py", "secrets/**")

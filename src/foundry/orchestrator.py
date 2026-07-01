@@ -69,6 +69,7 @@ from foundry.engines.risk import (
     diff_touches_tests,
     files_matching_scope,
     files_outside_scope,
+    forbidden_path_match,
     glob_match,
     merge_sensitive_keywords,
 )
@@ -2798,7 +2799,11 @@ class FoundryOrchestrator:
         violations: list[str] = []
         for path in files:
             for pattern in globs:
-                if glob_match(path, pattern):
+                # Depth-agnostic: a bare relative glob (secrets/**) blocks the
+                # dir wherever it is nested, not just at the repo root - the
+                # sticky BLOCK a forbidden entry promises. Strictly stricter
+                # than glob_match, which is left untouched for scope-coverage.
+                if forbidden_path_match(path, pattern):
                     violations.append(path)
                     break
         return violations
