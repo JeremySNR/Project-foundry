@@ -693,6 +693,35 @@ def test_path_required_role_escalation_is_audited(session_factory) -> None:
     assert meta["paths"]["security"] == ["src/legal/terms.ts"]
 
 
+def test_bare_path_required_glob_escalates_at_depth(session_factory) -> None:
+    """Issue #179: an operator's *bare* per-path rule (``legal/**``) requires its
+    role for a nested ``src/legal/...`` too, not just a top-level ``legal/``.
+
+    Before the escalate-only depth-agnostic matcher, a bare ``legal/**`` only
+    matched at the repo root, so a nested legal-subtree diff advanced to PR_OPEN
+    without the security sign-off the operator's rule demanded - the gate was
+    silently only half-enforced (the same under-match #177 fixed for forbidden).
+    """
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"path_required_roles": {"legal/**": ("security",)}},
+    )
+    pr = _pr(files_changed=["src/legal/terms.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
+
+
+def test_bare_sensitive_glob_escalates_at_depth(session_factory) -> None:
+    """Issue #179: an operator's *bare* sensitive-area glob (``money/**``) flags
+    the area at any depth, escalating a nested diff the root-anchored match
+    silently let through."""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        orch_kwargs={"sensitive_path_globs": {"payments": ("money/**",)}},
+    )
+    pr = _pr(files_changed=["services/billing/money/charge.ts"])
+    assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
+
+
 def test_forbidden_path_beats_path_required_role(session_factory) -> None:
     """A forbidden path is a sticky BLOCK and wins over the softer per-path
     role escalation when a diff trips both."""

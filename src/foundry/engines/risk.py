@@ -118,8 +118,14 @@ class CustomRiskCategory:
         return [kw for kw in self.keywords if kw in blob]
 
     def matches_path(self, path: str) -> bool:
-        """True if a changed file path matches any of this category's globs."""
-        return any(glob_match(path, pattern) for pattern in self.path_globs)
+        """True if a changed file path matches any of this category's globs.
+
+        Uses the depth-agnostic :func:`escalating_path_match`: this is an
+        escalate-only gate (a match only ever *adds* a required approval role), so
+        an operator's bare ``crypto_keys: ["keys/**"]`` protects a nested
+        ``app/keys/...`` too, not just the repo root (issue #179).
+        """
+        return any(escalating_path_match(path, pattern) for pattern in self.path_globs)
 
 
 def custom_category_from_mapping(name: str, data: Any) -> CustomRiskCategory:
@@ -205,24 +211,41 @@ def glob_match(path: str, pattern: str) -> bool:
     return pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:])
 
 
-def forbidden_path_match(path: str, pattern: str) -> bool:
-    """Depth-agnostic match for the sticky forbidden-path *block*.
+def escalating_path_match(path: str, pattern: str) -> bool:
+    """Depth-agnostic path match for the *escalate-only* path gates.
 
     Like :func:`glob_match`, but a **bare relative** pattern also matches at any
-    directory depth: ``secrets/**`` blocks ``app/secrets/key.pem``, not just a
+    directory depth: ``secrets/**`` matches ``app/secrets/key.pem``, not just a
     top-level ``secrets/``. Operators write the natural ``secrets/**`` /
-    ``migrations/**`` and expect every such directory protected wherever it
-    lives; ``fnmatch`` anchors at the string start, so a bare pattern otherwise
-    matches only the top level and a nested match would slip through with the
-    softer sensitive-area escalation instead of the sticky BLOCK the forbidden
-    list promises.
+    ``migrations/**`` and expect every such directory covered wherever it lives;
+    ``fnmatch`` anchors at the string start, so a bare pattern otherwise matches
+    only the top level and a nested match silently slips through - the gate the
+    operator configured is only partially enforced.
 
-    This is deliberately **not** folded into :func:`glob_match`, which is shared
+    This is the shared matcher for **every escalate-only path gate**, where
+    matching *more* paths only ever makes the gate *stricter* (AGENTS.md
+    invariant #1):
+
+    * the sticky forbidden-path **BLOCK** (``_forbidden_violations``, issue #177,
+      the original consumer - see the :data:`forbidden_path_match` alias),
+    * the diff-stage **sensitive-area** globs (:func:`sensitive_areas_for_paths`,
+      ``policy.sensitive_path_globs``),
+    * **per-path approval roles** (``_unapproved_path_roles``,
+      ``policy.path_required_roles``),
+    * operator-defined **custom-risk-category** path globs
+      (:meth:`CustomRiskCategory.matches_path`, ``risk.custom_risk_categories``).
+
+    All of these can only ever *add* a denial / required approval / risk area, so
+    a broader match is always the safe direction - a bare operator glob that only
+    protected the repo root now protects the directory at any depth (issue #179,
+    the operator-glob follow-up to #177, which fixed only the forbidden BLOCK).
+
+    It is deliberately **not** folded into :func:`glob_match`, which is shared
     with :func:`files_outside_scope` / :func:`_scope_entry_covers` (plan-scope
-    drift). For the forbidden gate, matching *more* paths only ever makes the
-    block stricter (AGENTS.md invariant #1); for scope-coverage the direction is
-    inverted (more matches → fewer files flagged outside scope → *weaker*
-    escalation), so the shared matcher must stay as-is there.
+    drift) and :func:`diff_touches_tests`: for those the direction is inverted -
+    matching *more* paths marks *more* files in-scope / recognised-as-a-test, so
+    *fewer* runs escalate, which would **weaken** the gate. The shared matcher
+    must stay as-is there.
 
     A pattern that is rooted (``/…``) or already anchored (``**/…``) is honoured
     exactly as written - only a bare relative pattern is expanded to any depth,
@@ -234,6 +257,13 @@ def forbidden_path_match(path: str, pattern: str) -> bool:
     if pattern.startswith("/") or pattern.startswith("**/"):
         return False
     return glob_match(path, "**/" + pattern)
+
+
+# Historical name: the sticky forbidden-path BLOCK (issue #177) was the first
+# consumer of this matcher. Kept as an alias so the forbidden call-site and its
+# tests read naturally; the matcher itself is shared by every escalate-only path
+# gate (see :func:`escalating_path_match`).
+forbidden_path_match = escalating_path_match
 
 
 def _normalise_scope_entry(entry: str) -> str:
@@ -331,11 +361,16 @@ def sensitive_areas_for_paths(
     This is the diff-aware half of risk classification: the upfront pass reads
     the *ticket text*, but the risk that matters materialises in the *diff*.
     Returns ``{area: [matching files...]}`` for every area actually touched.
+
+    Matching uses the depth-agnostic :func:`escalating_path_match`: flagging a
+    sensitive area is escalate-only (it only ever *adds* an area/approval), so an
+    operator's bare ``sensitive_path_globs`` entry (or the built-in ``infra/**``)
+    flags the directory at any depth, not just the repo root (issue #179).
     """
     touched: dict[str, list[str]] = {}
     for path in files:
         for area, patterns in globs_map.items():
-            if any(glob_match(path, p) for p in patterns):
+            if any(escalating_path_match(path, p) for p in patterns):
                 touched.setdefault(area, []).append(path)
     return {area: sorted(paths) for area, paths in sorted(touched.items())}
 
