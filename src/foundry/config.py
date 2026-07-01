@@ -40,11 +40,13 @@ from foundry.policy.freeze import (
 
 _TRUE = {"1", "true", "yes", "on"}
 
-# Root-anchored *and* depth-agnostic variants: `migrations/**` only matches a
-# top-level dir, so the `**/...` siblings ensure a nested `services/api/migrations/`
-# is caught by the sticky forbidden-path block too (not just the softer
-# sensitive-area escalation). `**/.env*` and `**/secrets/**` already match at any
-# depth via the `**/` prefix handling in `glob_match`.
+# The forbidden-path block matches these with `forbidden_path_match` (issue
+# #177), which treats a bare relative glob as depth-agnostic - so `migrations/**`
+# alone now catches a nested `services/api/migrations/` too, not just a top-level
+# dir. The explicit `**/...` siblings below are therefore redundant, but kept as
+# belt-and-suspenders (and so a config that copies this list stays stricter under
+# any matcher). Operator-supplied `policy.forbidden_globs` get the same
+# depth-agnostic treatment, which is the point of #177.
 DEFAULT_FORBIDDEN_GLOBS = (
     "infra/**",
     "**/infra/**",

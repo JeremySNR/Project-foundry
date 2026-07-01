@@ -205,6 +205,37 @@ def glob_match(path: str, pattern: str) -> bool:
     return pattern.startswith("**/") and fnmatch.fnmatch(path, pattern[3:])
 
 
+def forbidden_path_match(path: str, pattern: str) -> bool:
+    """Depth-agnostic match for the sticky forbidden-path *block*.
+
+    Like :func:`glob_match`, but a **bare relative** pattern also matches at any
+    directory depth: ``secrets/**`` blocks ``app/secrets/key.pem``, not just a
+    top-level ``secrets/``. Operators write the natural ``secrets/**`` /
+    ``migrations/**`` and expect every such directory protected wherever it
+    lives; ``fnmatch`` anchors at the string start, so a bare pattern otherwise
+    matches only the top level and a nested match would slip through with the
+    softer sensitive-area escalation instead of the sticky BLOCK the forbidden
+    list promises.
+
+    This is deliberately **not** folded into :func:`glob_match`, which is shared
+    with :func:`files_outside_scope` / :func:`_scope_entry_covers` (plan-scope
+    drift). For the forbidden gate, matching *more* paths only ever makes the
+    block stricter (AGENTS.md invariant #1); for scope-coverage the direction is
+    inverted (more matches → fewer files flagged outside scope → *weaker*
+    escalation), so the shared matcher must stay as-is there.
+
+    A pattern that is rooted (``/…``) or already anchored (``**/…``) is honoured
+    exactly as written - only a bare relative pattern is expanded to any depth,
+    so the new matches are a strict superset of :func:`glob_match` (stricter
+    only, never a behaviour change for the depth-agnostic default globs).
+    """
+    if glob_match(path, pattern):
+        return True
+    if pattern.startswith("/") or pattern.startswith("**/"):
+        return False
+    return glob_match(path, "**/" + pattern)
+
+
 def _normalise_scope_entry(entry: str) -> str:
     """Trim a plan ``expected_files_or_areas`` entry to a comparable form."""
     entry = (entry or "").strip()

@@ -1989,6 +1989,22 @@ def test_custom_forbidden_globs_replace_the_defaults(session_factory) -> None:
     assert orch.record_pr(run_id, pr) is not RunStatus.BLOCKED
 
 
+def test_custom_bare_forbidden_glob_blocks_a_nested_path(session_factory) -> None:
+    """Issue #177: an operator-supplied bare relative glob (``secrets/**``) hard-
+    blocks a *nested* match, not just a top-level dir. Before the depth-agnostic
+    forbidden matcher, ``secrets/**`` matched only ``secrets/...`` at the repo
+    root, so ``app/secrets/key.pem`` slipped past the sticky BLOCK with only the
+    softer sensitive-area escalation."""
+    orch, run_id = _dispatched_run(
+        session_factory, orch_kwargs={"forbidden_globs": ("secrets/**",)}
+    )
+    pr = _pr(files_changed=["app/secrets/service_key.pem"])
+    assert orch.record_pr(run_id, pr) is RunStatus.BLOCKED
+    # Sticky: a subsequent clean push cannot revive the forbidden-path block.
+    with pytest.raises(OrchestratorError):
+        orch.record_pr(run_id, _pr())
+
+
 # -- retry cap boundary: max_agent_retries == 0 ---------------------------------
 
 

@@ -18,9 +18,10 @@ from foundry.schemas.risk import RiskAssessment
 from foundry.schemas.ticket import RawTicket
 
 # Default forbidden globs for the coding agent (also enforced by the orchestrator).
-# Kept in lock-step with ``foundry.config.DEFAULT_FORBIDDEN_GLOBS``. The `**/...`
-# variants make the block depth-agnostic: a nested `services/api/migrations/0001.py`
-# is forbidden, not merely flagged as a sensitive area.
+# Kept in lock-step with ``foundry.config.DEFAULT_FORBIDDEN_GLOBS``. The block is
+# depth-agnostic - a nested `services/api/migrations/0001.py` is forbidden, not
+# merely flagged as a sensitive area - via `forbidden_path_match` (issue #177);
+# the explicit `**/...` variants are kept as belt-and-suspenders.
 DEFAULT_FORBIDDEN_GLOBS = [
     "infra/**",
     "**/infra/**",
