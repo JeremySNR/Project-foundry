@@ -67,10 +67,10 @@ from foundry.engines.risk import (
     HeuristicRiskClassifier,
     RiskClassifier,
     diff_touches_tests,
+    escalating_path_match,
     files_matching_scope,
     files_outside_scope,
     forbidden_path_match,
-    glob_match,
     merge_sensitive_keywords,
 )
 from foundry.policy.engine import (
@@ -2360,7 +2360,10 @@ class FoundryOrchestrator:
         unapproved: dict[str, list[str]] = {}
         for path in files:
             for pattern, roles in self._path_required_roles.items():
-                if not glob_match(path, pattern):
+                # Depth-agnostic, escalate-only match (issue #179): a bare
+                # ``secrets/**`` rule requires its roles for a nested
+                # ``app/secrets/...`` too, not just a top-level ``secrets/``.
+                if not escalating_path_match(path, pattern):
                     continue
                 for role in roles:
                     if role.value in granted:

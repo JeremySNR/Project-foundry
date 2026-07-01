@@ -382,3 +382,64 @@ def test_forbidden_path_match_is_depth_agnostic_for_bare_globs() -> None:
     # Genuine non-matches stay non-matches (no over-broad blocking).
     assert not forbidden_path_match("src/secretsmanager/util.py", "secrets/**")
     assert not forbidden_path_match("src/app/config.py", "secrets/**")
+
+
+def test_forbidden_path_match_is_the_escalating_matcher() -> None:
+    """Issue #179: the depth-agnostic matcher is shared by *every* escalate-only
+    path gate, not just the forbidden BLOCK; ``forbidden_path_match`` is the
+    historical alias for the general ``escalating_path_match``."""
+    from foundry.engines.risk import escalating_path_match, forbidden_path_match
+
+    assert forbidden_path_match is escalating_path_match
+    # Same depth-agnostic behaviour under the general name.
+    assert escalating_path_match("app/secrets/key.pem", "secrets/**")
+    assert not escalating_path_match("app/secrets/key.pem", "/secrets/**")
+
+
+def test_sensitive_areas_for_paths_bare_glob_matches_at_depth() -> None:
+    """Issue #179: an operator's *bare* sensitive-area glob flags the directory
+    at any depth, not just the repo root - flagging an area is escalate-only, so
+    a broader match is the safe direction (mirrors the forbidden-path fix #177).
+    """
+    from foundry.engines.risk import sensitive_areas_for_paths
+
+    globs = {"payments": ("money/**",)}
+    # Bare 'money/**' now flags a nested services/billing/money/charge.py, which
+    # the old root-anchored glob_match silently let through.
+    assert sensitive_areas_for_paths(["services/billing/money/charge.py"], globs) == {
+        "payments": ["services/billing/money/charge.py"]
+    }
+    # A rooted pattern is still honoured as written (top-level only).
+    assert sensitive_areas_for_paths(
+        ["services/billing/money/charge.py"], {"payments": ("/money/**",)}
+    ) == {}
+
+
+def test_default_sensitive_infra_glob_matches_nested_path() -> None:
+    """Issue #179 (audit finding): the built-in ``infra/**`` sensitive glob was
+    the one default without a ``**/`` twin, so a nested ``services/api/infra/...``
+    dodged the infrastructure flag. The escalate-only matcher closes that gap."""
+    from foundry.config import DEFAULT_SENSITIVE_PATH_GLOBS
+    from foundry.engines.risk import sensitive_areas_for_paths
+
+    touched = sensitive_areas_for_paths(
+        ["services/api/infra/main.tf"], dict(DEFAULT_SENSITIVE_PATH_GLOBS)
+    )
+    assert touched == {"infrastructure": ["services/api/infra/main.tf"]}
+
+
+def test_custom_risk_category_matches_bare_glob_at_depth() -> None:
+    """Issue #179: a custom category's *bare* path glob demands its role at any
+    depth - escalate-only, so a broader match is safe."""
+    from foundry.engines.risk import CustomRiskCategory
+
+    cat = CustomRiskCategory(
+        name="crypto_keys", path_globs=("keys/**",), required_roles=("security",)
+    )
+    assert cat.matches_path("app/service/keys/signing.pem")
+    assert cat.matches_path("keys/signing.pem")
+    # Rooted pattern honoured as written; unrelated path untouched.
+    assert not CustomRiskCategory(
+        name="crypto_keys", path_globs=("/keys/**",), required_roles=("security",)
+    ).matches_path("app/service/keys/signing.pem")
+    assert not cat.matches_path("app/keychain/util.py")

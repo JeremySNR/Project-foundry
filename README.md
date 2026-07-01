@@ -194,7 +194,9 @@ policy:
     payments-service: 2                  # so a repo can only ever demand *more*, never fewer
   path_required_roles:            # per-PATH approval roles (#31/#35): diff-aware, monorepo
     "**/billing/**": ["security"]        # subtree -> role; a PR touching it that no approver
-                                         # signed for escalates to REVIEW_REQUIRED (additive)
+                                         # signed for escalates to REVIEW_REQUIRED (additive).
+                                         # Like forbidden_globs, a bare glob ("billing/**") is
+                                         # depth-agnostic - it matches the dir at any nesting (#179).
   change_freeze_windows:          # time windows (#31): hold AUTONOMOUS retries during a freeze
     - reason: "Weekend release blackout"  # recurring weekly (weekdays + start/end local time,
       weekdays: ["sat", "sun"]            # IANA tz) or an absolute starts_at/ends_at range.
@@ -220,9 +222,9 @@ policy:
                                   # REVIEW_REQUIRED when the change doesn't plausibly satisfy the
                                   # plan - beyond file containment. Degrade-to-noop on any LLM error.
                                   # Default "none" = no judge (deterministic plan checks only).
-  sensitive_path_globs:           # diff-aware risk: PRs touching these escalate
-    auth: ["**/auth/**", "**/login/**", "**/sso/**"]
-    payments: ["**/billing/**", "**/stripe/**"]
+  sensitive_path_globs:           # diff-aware risk: PRs touching these escalate (a bare glob
+    auth: ["**/auth/**", "**/login/**", "**/sso/**"]   # like "auth/**" is depth-agnostic, matching
+    payments: ["**/billing/**", "**/stripe/**"]        # the dir at any nesting - escalate-only (#179)
 remediation:
   max_agent_retries: 2            # CI-failure/review retries before a human takes over
   retry_on: ["ci_failed", "changes_requested"]
