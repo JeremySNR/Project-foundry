@@ -302,6 +302,8 @@ The fastest path to a deployed instance is **[`docs/quickstart.md`](./docs/quick
 
 Tagged releases (`vX.Y.Z`) publish a container image to GHCR (`ghcr.io/jeremysnr/project-foundry`) automatically, gated on the full test suite.
 
+**Foundry dogfoods itself.** This repository is its own dogfood target: [`foundry.dogfood.yaml`](./foundry.dogfood.yaml) points Foundry at this repo with GitHub Issues as the tracker, and `scripts/smoke_e2e_github.py` drives one live governed run — intake, plan, approval, policy gate, dispatch, audit timeline — against a real issue using only a GitHub token. The full runbook (including deploying it webhook-driven and flipping the agent from `manual` to `claude_code`) is [`docs/dogfooding.md`](./docs/dogfooding.md).
+
 For development:
 
 ```bash

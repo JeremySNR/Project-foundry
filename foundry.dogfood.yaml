@@ -1,0 +1,58 @@
+# Dogfood config: Foundry governing its own repository.
+#
+# Project-foundry is developed by AI coding agents working from GitHub Issues -
+# exactly the workflow Foundry governs. This config points Foundry at this repo
+# so its own tickets run through its own intake, gates, approvals and audit
+# trail. See docs/dogfooding.md for the runbook (deploying it, or driving a
+# single live run with scripts/smoke_e2e_github.py).
+#
+# Secrets come from the environment, never from here:
+#   FOUNDRY_GITHUB_API_TOKEN   - repo-scoped token for JeremySNR/Project-foundry
+#   FOUNDRY_GITHUB_WEBHOOK_SECRET - webhook signing secret (deployed setup only)
+#   FOUNDRY_DATABASE_URL       - Postgres in a deployed setup (SQLite default)
+
+# The intelligence layers stay on the deterministic no-key defaults so a
+# dogfood run needs only a GitHub token. Flip any of them to their LLM
+# provider (plus OPENAI_API_KEY) to dogfood the model-backed paths too.
+analyzer:
+  provider: heuristic
+
+risk:
+  provider: heuristic
+
+planner:
+  provider: template
+
+tracker:
+  # The issue IS the ticket. Trigger intake with the `foundry:candidate` label
+  # or a `/foundry analyse` comment; approve with `/foundry approve`.
+  provider: github_issues
+
+agent:
+  # `manual` records a governed handoff and spends nothing - the safe default
+  # for the first dogfood runs. Flip to `claude_code` once
+  # .github/workflows/foundry-claude-code.yml is on the default branch and the
+  # repo has an ANTHROPIC_API_KEY secret: Foundry then dispatches approved work
+  # to Claude Code via workflow_dispatch and watches the PR it opens.
+  provider: manual
+  claude_workflow_file: "foundry-claude-code.yml"
+
+context:
+  # A GitHub issue carries its host repo as an explicit association (routing
+  # confidence 90), so static keywords are only a fallback here.
+  provider: static
+  repo_keywords:
+    JeremySNR/Project-foundry:
+      ["foundry", "policy", "orchestrator", "gate", "audit", "governance"]
+
+approval:
+  # GitHub Issues approvers are keyed by GitHub login, not email. Roles are
+  # config, never request payload (invariant #5).
+  approvers:
+    - email: "JeremySNR"
+      roles: ["engineering", "security", "product", "qa"]
+
+# Policy stays on the built-in defaults: default-deny gate, forbidden-path
+# blocks (migrations/**, secrets/** ... at any depth), retry cap, and the
+# >=1-human-approval rule. This repo's own AGENTS.md invariants are enforced
+# by the same defaults it documents.
