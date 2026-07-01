@@ -119,6 +119,7 @@ pip install -e ".[test]" && pytest          # full offline suite (~500 tests)
 ruff check src tests                        # lint
 opa test src/foundry/policy -v --ignore '*.yaml'  # Rego tests (needs opa CLI; ignore preset configs)
 python scripts/demo.py                      # offline end-to-end demo
+python scripts/smoke_e2e_github.py          # LIVE dogfood run against a real GitHub issue (FOUNDRY_E2E=1 + token; see docs/dogfooding.md)
 foundry-policy presets                      # browse the starter policy library
 foundry-policy check --config foundry.yaml --against soc2  # verify your config meets a baseline (exits non-zero if weaker; add --format json for CI)
 make dev                                    # uvicorn API on :8000, SQLite
@@ -397,5 +398,18 @@ Postgres smoke, live E2E (`FOUNDRY_E2E=1` + real credentials — never in CI).
   can't starve the other). Both Teams halves are fail-closed/opt-in (unset ⇒
   unchanged).
 
-A C#/.NET port of the core lives in unmerged PR #1 (`dotnet/`); the Python
-implementation is canonical — genuine defects get fixed in both.
+A C#/.NET port of the core lives in `dotnet/` (merged PR #1, a snapshot of the
+core as of mid-June); the Python implementation is canonical — genuine defects
+get fixed in both.
+
+## Dogfooding (Foundry on Foundry)
+
+This repo is its own dogfood target: `foundry.dogfood.yaml` points Foundry at
+`JeremySNR/Project-foundry` with GitHub Issues as the tracker, and
+`.github/workflows/foundry-claude-code.yml` is the reference install of the
+`claude_code` runner (inert until dispatched with an `ANTHROPIC_API_KEY` repo
+secret). `scripts/smoke_e2e_github.py` drives one live governed run
+(intake → plan → approval → gate → dispatch, audit timeline printed) against a
+real issue with only a GitHub token — the GitHub Issues twin of
+`scripts/smoke_e2e.py`. Runbook: `docs/dogfooding.md`. Live-only, never in CI
+(invariant #3 untouched).
