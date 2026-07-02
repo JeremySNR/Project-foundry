@@ -312,25 +312,75 @@ def files_outside_scope(scope: Sequence[str], files: Sequence[str]) -> list[str]
     ]
 
 
+def _scope_entry_covers_at_depth(path: str, entry: str) -> bool:
+    """Depth-agnostic form of :func:`_scope_entry_covers` for the *escalate-on-match*
+    out-of-scope gate.
+
+    :func:`_scope_entry_covers` is depth-**anchored** (a bare ``payments/**`` /
+    ``src/vendor`` covers only a *top-level* ``payments/`` / ``src/vendor/``)
+    because it is shared with the plan-scope **drift** check
+    (:func:`files_outside_scope`), which escalates when a file matches *nothing* -
+    there, matching *more* paths marks *more* files in-scope, so *fewer* runs
+    escalate, and broadening would **weaken** the gate (invariant #1). See the
+    same polarity argument in :func:`escalating_path_match`.
+
+    The out-of-scope gate (:func:`files_matching_scope`) has the **opposite**
+    polarity: it escalates when a file *matches* an entry. So there, under-matching
+    a nested bare entry silently **fails to escalate** - a plan's
+    ``out_of_scope: ["payments/**"]`` protects only a repo-root ``payments/`` and
+    lets a nested ``app/payments/charge.py`` ride through, exactly the depth gap
+    :func:`escalating_path_match` was created to close for the other escalate-only
+    path gates (issue #179). This variant restores depth-agnostic coverage for that
+    gate while leaving the drift check's anchored matcher untouched.
+
+    Mirrors :func:`escalating_path_match`: a rooted (``/…``) or already-anchored
+    (``**/…``) entry is honoured exactly as written; only a **bare relative** entry
+    is expanded to any depth. Broadening is the safe direction here - a match can
+    only ever *add* an escalation (invariant #1).
+    """
+    if _scope_entry_covers(path, entry):
+        return True
+    if entry.startswith("/") or entry.startswith("**/"):
+        return False
+    if any(ch in entry for ch in "*?["):
+        # Bare relative glob (``payments/**``): reuse the shared escalate-only
+        # matcher, which matches such a glob at any directory depth.
+        return escalating_path_match(path, entry)
+    # Bare relative directory/path entry (``src/vendor``): it covers a file when
+    # its segments appear as a contiguous run anywhere in the path - a nested
+    # directory prefix, not just the repo root. (The single-segment bare-area
+    # case is already depth-agnostic in ``_scope_entry_covers``; this generalises
+    # it to multi-segment prefixes.)
+    entry_segs = entry.split("/")
+    segs = path.split("/")
+    return any(
+        segs[i : i + len(entry_segs)] == entry_segs
+        for i in range(len(segs) - len(entry_segs) + 1)
+    )
+
+
 def files_matching_scope(scope: Sequence[str], files: Sequence[str]) -> list[str]:
     """Changed files that match *any* declared scope entry - the inverse of
     :func:`files_outside_scope`.
 
     ``scope`` is a plan's ``out_of_scope``: paths/areas the plan explicitly
     promised **not** to touch. A returned file therefore hit a forbidden-by-plan
-    entry. Matching reuses the same generous :func:`_scope_entry_covers`
-    convention (exact / glob / directory prefix / bare-area segment) the drift
-    check uses, so an LLM planner naming an out-of-scope *area* still flags a diff
-    that reaches into it. An empty/whitespace-only scope returns ``[]`` (nothing
-    declared off-limits), so the check this powers is inert unless the planner
-    actually scoped something out. The check is escalate-only - it can hand a PR
-    that touches an off-limits path to a human, never release one.
+    entry. Matching uses the depth-agnostic :func:`_scope_entry_covers_at_depth`
+    (exact / glob / directory prefix / bare-area segment, matched at *any* depth
+    for bare relative entries), so an LLM planner naming an out-of-scope *area* -
+    or a bare ``payments/**`` glob - flags a diff that reaches into it wherever it
+    is nested, not just at the repo root (the escalate-only polarity means
+    broadening only ever *adds* an escalation - invariant #1). An empty/
+    whitespace-only scope returns ``[]`` (nothing declared off-limits), so the
+    check this powers is inert unless the planner actually scoped something out.
+    The check is escalate-only - it can hand a PR that touches an off-limits path
+    to a human, never release one.
     """
     cleaned = [e for e in (_normalise_scope_entry(s) for s in scope) if e]
     if not cleaned:
         return []
     return [
-        f for f in files if any(_scope_entry_covers(f, e) for e in cleaned)
+        f for f in files if any(_scope_entry_covers_at_depth(f, e) for e in cleaned)
     ]
 
 
