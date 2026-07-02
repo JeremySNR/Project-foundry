@@ -28,7 +28,7 @@ from foundry.db import (
 )
 from foundry.db.models import AuditEventType
 from foundry.engines.planner import TemplatePlanner
-from foundry.engines.risk import files_matching_scope
+from foundry.engines.risk import files_matching_scope, files_outside_scope
 from foundry.orchestrator import FoundryOrchestrator
 from foundry.schemas.common import PRStatus, RunStatus
 from foundry.schemas.pr import PullRequestState
@@ -96,6 +96,58 @@ def test_entry_normalisation() -> None:
     """Leading ``./`` and trailing ``/`` are trimmed before matching."""
     assert files_matching_scope(["./src/billing/"], ["src/billing/charge.ts"]) == [
         "src/billing/charge.ts"
+    ]
+
+
+# -- depth-agnostic matching (the escalate-only polarity fix) --------------------
+#
+# The out-of-scope gate escalates when a file *matches* an entry, so under-matching
+# a nested bare entry silently fails to escalate - the same depth gap
+# ``escalating_path_match`` closed for the other escalate-only path gates (#179),
+# missed here because ``files_matching_scope`` shared the drift check's anchored
+# helper. A bare relative entry must now match at *any* directory depth.
+
+
+def test_bare_glob_matches_nested_directory() -> None:
+    """``payments/**`` flags a nested ``app/payments/...``, not just the repo root."""
+    assert files_matching_scope(["payments/**"], ["app/payments/charge.py"]) == [
+        "app/payments/charge.py"
+    ]
+    # Negative: a sibling directory at depth is not matched.
+    assert files_matching_scope(["payments/**"], ["app/billing/charge.py"]) == []
+
+
+def test_bare_directory_prefix_matches_nested_run() -> None:
+    """A multi-segment bare directory prefix (``src/vendor``) matches wherever the
+    contiguous run of segments appears, not only at the repo root."""
+    assert files_matching_scope(["src/vendor"], ["app/src/vendor/lib.py"]) == [
+        "app/src/vendor/lib.py"
+    ]
+    # Segment match is exact - ``vendored`` is not ``vendor``.
+    assert files_matching_scope(["src/vendor"], ["app/src/vendored/lib.py"]) == []
+
+
+def test_anchored_and_rooted_entries_honoured_as_written() -> None:
+    """An already-``**/``-anchored entry still matches at depth (byte-for-byte),
+    while a rooted ``/…`` entry is *not* depth-expanded - mirroring
+    ``escalating_path_match``."""
+    assert files_matching_scope(["**/payments/**"], ["app/payments/x.py"]) == [
+        "app/payments/x.py"
+    ]
+    assert files_matching_scope(["/payments/**"], ["app/payments/x.py"]) == []
+
+
+def test_drift_matcher_stays_anchored() -> None:
+    """Regression guard on the *polarity* distinction: the plan-scope drift check
+    (``files_outside_scope``, escalates when a file matches *nothing*) must **not**
+    be broadened by this fix - a nested file whose only depth-expanded match would
+    be the out-of-scope entry is still correctly reported as outside the declared
+    scope, so the drift gate is not weakened (invariant #1)."""
+    assert files_outside_scope(["payments/**"], ["app/payments/charge.py"]) == [
+        "app/payments/charge.py"
+    ]
+    assert files_outside_scope(["src/vendor"], ["app/src/vendor/lib.py"]) == [
+        "app/src/vendor/lib.py"
     ]
 
 
@@ -201,6 +253,28 @@ def test_diff_touching_out_of_scope_escalates(session_factory) -> None:
     metas = _audit_meta(session_factory, run_id, AuditEventType.RISK_ESCALATED)
     meta = next(m for m in metas if m.get("category") == "plan_out_of_scope")
     assert meta["out_of_scope_files"] == ["src/legacy/old.ts"]
+
+
+def test_diff_touching_nested_out_of_scope_glob_escalates(session_factory) -> None:
+    """End-to-end: a plan's bare ``legacy/**`` out-of-scope entry escalates a diff
+    that touches a *nested* ``app/legacy/...`` path, not only a repo-root one - the
+    depth gap this fix closes. (A non-sensitive path is used so the escalation is
+    attributable to the out-of-scope gate alone, not the sensitive-area diff check.)"""
+    orch, run_id = _dispatched_run(
+        session_factory,
+        planner=_ScopedPlanner(out_of_scope=["legacy/**"]),
+    )
+    pr = _pr(
+        files_changed=[
+            "src/features/favourites/index.ts",
+            "app/legacy/old.ts",
+        ]
+    )
+    assert orch.record_pr(run_id, pr) is RunStatus.REVIEW_REQUIRED
+
+    metas = _audit_meta(session_factory, run_id, AuditEventType.RISK_ESCALATED)
+    meta = next(m for m in metas if m.get("category") == "plan_out_of_scope")
+    assert meta["out_of_scope_files"] == ["app/legacy/old.ts"]
 
 
 def test_kill_switch_disables_check(session_factory) -> None:
