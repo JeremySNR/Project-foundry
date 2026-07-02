@@ -544,10 +544,17 @@ class FoundryOrchestrator:
             return existing
 
         # The *effective* approval roles a human must hold = the risk-derived
-        # roles unioned with any per-repo roles configured for the routed repo
-        # (issue #31). Surfaced in the tracker/chat approval prompts so an
-        # approver is told exactly which roles to sign with, matching what
-        # approve() and the gate require - no approve->blocked whiplash.
+        # roles unioned with the run's resolved extra roles: any per-repo roles
+        # configured for the routed repo (issue #31) *and* any custom risk
+        # category whose ticket-text keywords fired at intake (issue #155).
+        # Surfaced in the tracker/chat approval prompts so an approver is told
+        # exactly which roles to sign with, matching what approve() and the gate
+        # require - no approve->blocked whiplash. This must use the *same*
+        # resolver both enforcement sites use (approve()'s pre-check and the gate
+        # payload via _policy_input, both _resolved_required_roles): using the
+        # per-repo-only roles here would drop a fired custom category's roles from
+        # the prompt while approve() still enforces them, telling an approver "no
+        # special role needed" and then refusing their plain sign-off.
         repo_name = context.best_repository.repo if context.best_repository else None
         effective_roles = [
             r.value
@@ -556,7 +563,7 @@ class FoundryOrchestrator:
                     overall_risk=risk.overall_risk,
                     **risk.sensitive_areas.model_dump(),
                 ),
-                self._repo_required_roles_for(repo_name),
+                self._resolved_required_roles(repo_name, risk),
             )
         ]
         # The effective N-of-M count for the routed repo (issue #31). Surfaced in
