@@ -2373,6 +2373,46 @@ def test_per_repo_required_role_surfaces_in_tracker_comment(session_factory) -> 
     assert "security" in comment
 
 
+def test_custom_category_role_surfaces_in_tracker_comment(session_factory) -> None:
+    """A fired custom risk category's role is surfaced in the approval prompt and
+    matches what approve() enforces - no approve->blocked whiplash (issue #155).
+
+    Regression: the prompt used to resolve roles via the per-repo-only helper, so
+    a custom category firing on ticket text (with no per-repo roles configured)
+    left the prompt telling the approver "no special role needed" while approve()
+    still enforced the category's role and refused a plain sign-off. The surfaced
+    roles must come from the same _resolved_required_roles the gate/approve() use.
+    """
+    provider = InMemoryFakeProvider()
+    tracker = InMemoryIssueTracker()
+    orch = _orch(
+        session_factory,
+        provider=provider,
+        issue_tracker=tracker,
+        custom_risk_categories=[
+            CustomRiskCategory(
+                name="gdpr_subject_data",
+                keywords=("favourite",),
+                required_roles=("security",),
+            )
+        ],
+    )
+    run_id = orch.intake_and_plan(_ready_ticket(), trigger_type="label")
+
+    # The prompt names the security role the fired category actually requires.
+    comment = tracker.comments["i-1"][0]
+    assert "Required approval:" in comment
+    assert "security" in comment
+
+    # And it matches enforcement: signing with exactly the surfaced role is
+    # accepted (the run advances and dispatches), not refused.
+    orch.approve(
+        run_id, user="lead@example.com", granted_roles={ApprovalRole.SECURITY}
+    )
+    orch.dispatch_agent(run_id)
+    assert _status(session_factory, run_id) is RunStatus.AGENT_RUNNING
+
+
 # --- N-of-M approval matrix (the "two-person rule", issue #31) ---------------
 
 
