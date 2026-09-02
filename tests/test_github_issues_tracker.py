@@ -22,6 +22,8 @@ from foundry.orchestrator import FoundryOrchestrator
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SECRET = "gh-issues-secret"
+API_TOKEN = "test-api-token"
+AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
 
 
 def load(name: str) -> dict:
@@ -157,6 +159,7 @@ def client() -> TestClient:
             orchestrator=orch,
             # GitHub Issues approvers are keyed by login, not email.
             approvers={"lee-cardall": ["engineering", "security"]},
+            api_token=API_TOKEN,
         )
     )
 
@@ -189,7 +192,7 @@ def test_duplicate_delivery_ignored(client) -> None:
     post_github(client, payload, event="issues", delivery="dup")
     second = post_github(client, payload, event="issues", delivery="dup")
     assert second.json()["status"] == "duplicate"
-    assert len(client.get("/runs").json()["runs"]) == 1
+    assert len(client.get("/runs", headers=AUTH).json()["runs"]) == 1
 
 
 def test_comment_approval_dispatches_agent(client) -> None:
@@ -220,7 +223,7 @@ def test_comment_on_labelled_issue_does_not_restart_run(client) -> None:
     payload["comment"]["body"] = "looking forward to this one!"
     resp = post_github(client, payload, event="issue_comment", delivery="d9")
     assert resp.json()["status"] == "ignored"
-    assert client.get("/runs").json()["runs"] == []
+    assert client.get("/runs", headers=AUTH).json()["runs"] == []
 
 
 def test_pr_correlates_back_via_synthesised_key(client) -> None:

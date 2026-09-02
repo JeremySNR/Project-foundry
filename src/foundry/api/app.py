@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
 from typing import Any, Callable, Iterable, Mapping
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
@@ -167,6 +170,26 @@ def _pdf_response(render: Callable[[], bytes], filename: str) -> Response:
     )
 
 
+logger = logging.getLogger(__name__)
+
+# The distribution name in pyproject.toml ([project] name).
+_DISTRIBUTION = "project-foundry"
+
+
+def _package_version() -> str:
+    """The installed version of this package, as declared in pyproject.toml.
+
+    Read from the installed distribution metadata so the version FastAPI
+    reports (``/docs``, ``/openapi.json``) can never drift from the release
+    version again. Falls back to a sentinel when the package is imported from
+    a source tree that was never installed (no metadata to read).
+    """
+    try:
+        return _distribution_version(_DISTRIBUTION)
+    except PackageNotFoundError:
+        return "0.0.0+unknown"
+
+
 def _run_to_dict(run: FoundryRun) -> dict[str, Any]:
     return {
         "id": run.id,
@@ -279,7 +302,7 @@ def create_app(
         init_schema(engine)
         session_factory = make_session_factory(engine)
 
-    app = FastAPI(title="Project Foundry", version="1.1.0")
+    app = FastAPI(title="Project Foundry", version=_package_version())
     orch = orchestrator or FoundryOrchestrator(session_factory)
     # Reads use the orchestrator/DB directly; mutations go through the driver
     # seam (inline today, durable Temporal later) so there is one execution path.
@@ -999,7 +1022,11 @@ def create_app(
         return format_teams_reply(result)
 
     @app.get("/runs")
-    def list_runs(skip: int = 0, limit: int = 100) -> dict[str, Any]:
+    def list_runs(request: Request, skip: int = 0, limit: int = 100) -> dict[str, Any]:
+        """List runs. Token-gated like every other read: a run record carries
+        the approver and requester identities and the agent spend, none of
+        which belong on an anonymous surface."""
+        _require_api_token(app, request)
         orch: FoundryOrchestrator = app.state.orchestrator
         all_runs = orch.list_runs()
         with app.state.session_factory() as session:
@@ -1022,7 +1049,8 @@ def create_app(
         }
 
     @app.get("/runs/{run_id}")
-    def get_run(run_id: str) -> dict[str, Any]:
+    def get_run(run_id: str, request: Request) -> dict[str, Any]:
+        _require_api_token(app, request)
         orch: FoundryOrchestrator = app.state.orchestrator
         run = orch.get_run(run_id)
         if run is None:
@@ -2209,10 +2237,7 @@ def _nudge_catalog_pushed_at(app: FastAPI, payload: dict[str, Any]) -> None:
                 entry.pushed_at = now
                 session.commit()
     except Exception:
-        import logging
-        logging.getLogger(__name__).debug(
-            "catalog pushed_at nudge failed", exc_info=True
-        )
+        logger.debug("catalog pushed_at nudge failed", exc_info=True)
 
 
 def _existing_run(orch: FoundryOrchestrator, issue_id: str) -> dict[str, Any] | None:
@@ -2324,8 +2349,17 @@ def _require_api_token(
         token = provided[len("Bearer ") :]
         try:
             return verifier.verify(token)
-        except OidcAuthError:
-            pass
+        except OidcAuthError as exc:
+            # Fall through to the session-cookie path (and ultimately a 401),
+            # but leave a trace: a rejected IdP token is the signal an operator
+            # needs when SSO "just returns 401". The message names the reason
+            # (issuer, audience, expiry, kid, algorithm), never the token.
+            logger.warning(
+                "OIDC bearer token rejected on %s %s: %s",
+                request.method,
+                request.url.path,
+                exc,
+            )
     # Browser SSO session cookie - read endpoints only (CSRF-safe), never the
     # approval surface.
     if allow_session and _session_identity(app, request) is not None:

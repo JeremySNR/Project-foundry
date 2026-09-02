@@ -52,12 +52,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Workflow inputs are passed to the shell through env vars and quoted,
+      # never interpolated into the script text: ${{ }} expansion happens before
+      # bash parses the step, so an input such as ticket_url (which originates in
+      # a tracker payload) could otherwise inject commands into the runner.
       - name: Create the work branch
+        env:
+          BRANCH_NAME: ${{ inputs.branch_name }}
         run: |
-          git checkout -b "${{ inputs.branch_name }}"
+          git checkout -b "$BRANCH_NAME"
 
       - name: Run Claude Code
-        uses: anthropics/claude-code-base-action@beta
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
@@ -77,12 +83,15 @@ jobs:
       - name: Push branch and open PR
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+          TICKET_URL: ${{ inputs.ticket_url }}
         run: |
           git add -A
           git -c user.name="foundry-claude" -c user.email="foundry@users.noreply.github.com" \
-            commit -m "Foundry run ${{ inputs.run_id }}" || echo "nothing to commit"
-          git push origin "${{ inputs.branch_name }}"
+            commit -m "Foundry run $RUN_ID" || echo "nothing to commit"
+          git push origin "$BRANCH_NAME"
           gh pr create \
-            --head "${{ inputs.branch_name }}" \
-            --title "Foundry: ${{ inputs.run_id }}" \
-            --body "Automated change for ${{ inputs.ticket_url }} (Foundry run ${{ inputs.run_id }}). Opened by the Claude Code runner; review before merge."
+            --head "$BRANCH_NAME" \
+            --title "Foundry: $RUN_ID" \
+            --body "Automated change for $TICKET_URL (Foundry run $RUN_ID). Opened by the Claude Code runner; review before merge."

@@ -403,6 +403,8 @@ def test_api_runs_listing_is_isolated_by_verified_token(session_factory) -> None
     globex_ids = {r["id"] for r in globex.json()["runs"]}
     assert globex_ids == {globex_run}
 
-    # No token => the unscoped default org, which sees neither tenant's runs.
+    # No token => no read at all. The run listing is token-gated, so an
+    # anonymous caller cannot even reach the unscoped default org (which would
+    # have seen neither tenant's runs anyway).
     anon = client.get("/runs")
-    assert {r["id"] for r in anon.json()["runs"]} == set()
+    assert anon.status_code == 401
