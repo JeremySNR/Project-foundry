@@ -17,6 +17,8 @@ from foundry.orchestrator import FoundryOrchestrator
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SECRET = "jira-shared-token"
+API_TOKEN = "test-api-token"
+AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
 
 
 def load(name: str) -> dict:
@@ -145,6 +147,7 @@ def client() -> TestClient:
             orchestrator=orch,
             approvers={"lead@example.com": ["engineering"]},
             jira_webhook_secret=SECRET,
+            api_token=API_TOKEN,
         )
     )
 
@@ -185,7 +188,7 @@ def test_token_via_query_param_rejected_by_default(client) -> None:
     # leak into access logs/proxies; header-only is the default posture.
     resp = post_jira(client, load("jira_issue_labeled.json"), via_query=True)
     assert resp.status_code == 401
-    assert client.get("/runs").json()["runs"] == []
+    assert client.get("/runs", headers=AUTH).json()["runs"] == []
 
 
 def _query_token_client() -> TestClient:
@@ -239,4 +242,4 @@ def test_plain_comment_does_not_start_run(client) -> None:
     payload["comment"]["body"] = "can't wait!"
     resp = post_jira(client, payload)
     assert resp.json()["status"] == "ignored"
-    assert client.get("/runs").json()["runs"] == []
+    assert client.get("/runs", headers=AUTH).json()["runs"] == []

@@ -111,7 +111,7 @@ def _run_to_merged(client, issue_id="issue-r", key="LIN-123", number=42) -> None
 
 
 def _latest_run_id(client) -> str:
-    runs = client.get("/runs").json()["runs"]
+    runs = client.get("/runs", headers=AUTH).json()["runs"]
     return sorted(runs, key=lambda r: r["created_at"])[-1]["id"]
 
 

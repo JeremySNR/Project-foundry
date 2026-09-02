@@ -26,6 +26,8 @@ from foundry.db import create_all, make_engine, make_session_factory
 from foundry.orchestrator import FoundryOrchestrator
 
 SECRET = "test-secret"
+API_TOKEN = "test-api-token"
+AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
 SLACK_SECRET = "slack-signing-secret"
 # Approvers are keyed by Slack user id here (as GitHub Issues keys them by login).
 APPROVER = "U07APPROVER"
@@ -52,6 +54,7 @@ def _make_client(**overrides) -> TestClient:
         orchestrator=orch,
         approvers=APPROVERS,
         slack_signing_secret=SLACK_SECRET,
+        api_token=API_TOKEN,
     )
     kwargs.update(overrides)
     return TestClient(create_app(**kwargs))
@@ -133,14 +136,14 @@ def test_slack_invalid_signature_rejected(client) -> None:
     run_id = _start_ready_run(client)
     resp = _post_slack(client, _block_action("approve", "issue-r"), sign=False)
     assert resp.status_code == 401
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_slack_wrong_secret_rejected(client) -> None:
     run_id = _start_ready_run(client)
     resp = _post_slack(client, _block_action("approve", "issue-r"), secret="nope")
     assert resp.status_code == 401
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_slack_missing_timestamp_rejected(client) -> None:
@@ -164,7 +167,7 @@ def test_slack_stale_request_rejected(client) -> None:
     old_ts = str(int(time.time()) - 60 * 60)  # an hour old, correctly signed
     resp = _post_slack(client, _block_action("approve", "issue-r"), ts=old_ts)
     assert resp.status_code == 401
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 # -- decision behaviour --------------------------------------------------------
@@ -188,7 +191,7 @@ def test_slack_unauthorised_user_is_ignored(client) -> None:
     # Acknowledged (200) so Slack does not retry, but refused.
     assert resp.status_code == 200
     assert resp.json()["status"] == "ignored"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_slack_reject_terminates_run(client) -> None:
@@ -196,7 +199,7 @@ def test_slack_reject_terminates_run(client) -> None:
     resp = _post_slack(client, _block_action("reject", "issue-r"))
     assert resp.status_code == 200
     assert resp.json()["run"]["status"] == "rejected"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "rejected"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "rejected"
 
 
 def test_slack_non_foundry_action_is_ignored(client) -> None:

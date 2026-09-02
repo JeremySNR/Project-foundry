@@ -93,7 +93,7 @@ def test_healthz(client) -> None:
 def test_unauthorised_webhook_rejected_no_run(client) -> None:
     resp = _post_webhook(client, _basic_payload(), delivery="d1", sign=False)
     assert resp.status_code == 401
-    assert client.get("/runs").json()["runs"] == []
+    assert client.get("/runs", headers=AUTH).json()["runs"] == []
 
 
 def test_webhook_with_no_signature_header_rejected_no_run(client) -> None:
@@ -106,7 +106,7 @@ def test_webhook_with_no_signature_header_rejected_no_run(client) -> None:
         headers={"Linear-Delivery": "d-nohdr", "Content-Type": "application/json"},
     )
     assert resp.status_code == 401
-    assert client.get("/runs").json()["runs"] == []
+    assert client.get("/runs", headers=AUTH).json()["runs"] == []
 
 
 def test_github_webhook_with_no_signature_header_rejected(client) -> None:
@@ -132,7 +132,7 @@ def test_linear_webhook_fails_closed_without_configured_secret() -> None:
         headers={"Linear-Delivery": "d-nosecret", "Linear-Signature": sig},
     )
     assert resp.status_code == 401
-    assert c.get("/runs").json()["runs"] == []
+    assert c.get("/runs", headers=AUTH).json()["runs"] == []
 
 
 def test_duplicate_delivery_creates_one_run(client) -> None:
@@ -141,7 +141,7 @@ def test_duplicate_delivery_creates_one_run(client) -> None:
     second = _post_webhook(client, payload, delivery="d-dup")
     assert first.json()["status"] == "started"
     assert second.json()["status"] == "duplicate"
-    assert len(client.get("/runs").json()["runs"]) == 1
+    assert len(client.get("/runs", headers=AUTH).json()["runs"]) == 1
 
 
 def test_same_issue_active_run_does_not_duplicate(client) -> None:
@@ -149,7 +149,7 @@ def test_same_issue_active_run_does_not_duplicate(client) -> None:
     _post_webhook(client, payload, delivery="d-a")
     second = _post_webhook(client, payload, delivery="d-b")
     assert second.json()["status"] == "exists"
-    assert len(client.get("/runs").json()["runs"]) == 1
+    assert len(client.get("/runs", headers=AUTH).json()["runs"]) == 1
 
 
 def test_clarified_ticket_can_be_reanalysed(client) -> None:
@@ -163,14 +163,14 @@ def test_clarified_ticket_can_be_reanalysed(client) -> None:
     second = _post_webhook(client, improved, delivery="d-re-2")
     assert second.json()["status"] == "started"
     assert second.json()["run"]["status"] == "waiting_approval"
-    assert len(client.get("/runs").json()["runs"]) == 2
+    assert len(client.get("/runs", headers=AUTH).json()["runs"]) == 2
 
 
 def test_non_trigger_event_is_ignored(client) -> None:
     payload = {"data": {"id": "i9", "issueId": "i9", "labels": []}}
     resp = _post_webhook(client, payload, delivery="d-ignore")
     assert resp.json()["status"] == "ignored"
-    assert client.get("/runs").json()["runs"] == []
+    assert client.get("/runs", headers=AUTH).json()["runs"] == []
 
 
 def test_intake_runs_orchestrator_and_persists_status(client) -> None:
@@ -197,7 +197,28 @@ def test_comment_command_triggers_run(client) -> None:
 
 
 def test_run_status_404_for_unknown(client) -> None:
-    assert client.get("/runs/nope").status_code == 404
+    assert client.get("/runs/nope", headers=AUTH).status_code == 404
+
+
+def test_run_reads_require_token(client) -> None:
+    """``GET /runs`` and ``GET /runs/{id}`` are token-gated like every other
+    read: a run record names its approver and requester and carries the agent
+    spend, none of which belong on an anonymous surface."""
+    run_id = _post_webhook(client, _ready_payload(), delivery="d-gate").json()["run"]["id"]
+    assert client.get("/runs").status_code == 401
+    assert client.get(f"/runs/{run_id}").status_code == 401
+    wrong = {"Authorization": "Bearer wrong"}
+    assert client.get("/runs", headers=wrong).status_code == 401
+    assert client.get(f"/runs/{run_id}", headers=wrong).status_code == 401
+    assert client.get("/runs", headers=AUTH).json()["total"] == 1
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["id"] == run_id
+
+
+def test_run_reads_disabled_without_configured_token() -> None:
+    c = _make_client(api_token=None)
+    run_id = _post_webhook(c, _ready_payload(), delivery="d-gate-2").json()["run"]["id"]
+    assert c.get("/runs", headers=AUTH).status_code == 403
+    assert c.get(f"/runs/{run_id}", headers=AUTH).status_code == 403
 
 
 def _start_ready_run(client) -> str:
@@ -298,7 +319,7 @@ def test_approval_requires_bearer_token(client) -> None:
     )
     assert bad_token.status_code == 401
     # Nothing was approved.
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_approval_api_disabled_without_configured_token() -> None:
@@ -492,7 +513,7 @@ def test_linear_comment_approves_run(client) -> None:
     body = resp.json()
     assert body["status"] == "applied"
     assert body["dispatched"] is True
-    assert client.get(f"/runs/{run_id}").json()["status"] == "agent_running"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "agent_running"
 
 
 def test_linear_comment_from_unauthorised_user_is_ignored(client) -> None:
@@ -505,7 +526,7 @@ def test_linear_comment_from_unauthorised_user_is_ignored(client) -> None:
         delivery="d-stranger",
     )
     assert resp.json()["status"] == "ignored"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_linear_comment_reject(client) -> None:
@@ -516,7 +537,7 @@ def test_linear_comment_reject(client) -> None:
         delivery="d-reject",
     )
     assert resp.json()["status"] == "applied"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "rejected"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "rejected"
 
 
 # -- GitHub webhook closes the loop -------------------------------------------
@@ -570,13 +591,13 @@ def test_github_pr_for_unknown_branch_ignored(client) -> None:
 
 def test_github_pr_closes_loop_to_pr_open(client) -> None:
     run_id = _approve_and_dispatch(client)
-    assert client.get(f"/runs/{run_id}").json()["status"] == "agent_running"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "agent_running"
 
     branch = "foundry/lin-123-add-customer-favourites"
     resp = _post_github(client, _pr_payload(branch), event="pull_request")
     assert resp.json()["status"] == "recorded"
     assert resp.json()["run_status"] == "pr_open"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "pr_open"
 
 
 def test_github_pr_correlated_by_issue_key_in_branch(client) -> None:
@@ -587,7 +608,7 @@ def test_github_pr_correlated_by_issue_key_in_branch(client) -> None:
     resp = _post_github(client, _pr_payload(branch), event="pull_request")
     assert resp.json()["status"] == "recorded"
     assert resp.json()["run_id"] == run_id
-    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "pr_open"
 
 
 def test_github_pr_correlated_by_issue_key_in_title(client) -> None:
@@ -617,7 +638,7 @@ def test_github_pr_update_events_do_not_crash(client) -> None:
     review["review"] = {"state": "approved", "user": {"type": "User"}}
     third = _post_github(client, review, event="pull_request_review")
     assert third.status_code == 202
-    assert client.get(f"/runs/{run_id}").json()["status"] == "pr_open"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "pr_open"
 
 
 def test_github_merged_pr_completes_run(client) -> None:
@@ -630,7 +651,7 @@ def test_github_merged_pr_completes_run(client) -> None:
         event="pull_request",
     )
     assert resp.json()["run_status"] == "complete"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "complete"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "complete"
 
 
 def test_github_event_for_finished_run_is_ignored_not_500(client) -> None:
@@ -644,7 +665,7 @@ def test_github_event_for_finished_run_is_ignored_not_500(client) -> None:
     late = _post_github(client, _pr_payload(branch), event="pull_request")
     assert late.status_code == 202
     assert late.json()["status"] == "ignored"
-    assert client.get(f"/runs/{run_id}").json()["status"] == "complete"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "complete"
 
 
 # -- settings-driven app boot ---------------------------------------------------
@@ -657,7 +678,9 @@ def test_app_from_settings_boots_with_defaults() -> None:
     app = app_from_settings(Settings.from_env({"FOUNDRY_LINEAR_WEBHOOK_SECRET": "s"}))
     c = TestClient(app)
     assert c.get("/healthz").json() == {"status": "ok"}
-    assert c.get("/runs").json()["runs"] == []
+    # No API token and no OIDC configured: the run reads are disabled outright,
+    # the same fail-closed posture as the rest of the token-gated API.
+    assert c.get("/runs", headers=AUTH).status_code == 403
 
 
 def test_app_from_settings_wires_connectors_when_tokens_present() -> None:
@@ -722,7 +745,7 @@ def test_settings_custom_trigger_label_is_honored() -> None:
 
 def test_timeline_requires_token(client) -> None:
     _post_webhook(client, _ready_payload(), delivery="d-tl-0")
-    run_id = client.get("/runs").json()["runs"][0]["id"]
+    run_id = client.get("/runs", headers=AUTH).json()["runs"][0]["id"]
     assert client.get(f"/runs/{run_id}/timeline").status_code == 401
     assert (
         client.get(
@@ -734,8 +757,7 @@ def test_timeline_requires_token(client) -> None:
 
 def test_timeline_disabled_without_configured_token() -> None:
     client = _make_client(api_token=None)
-    _post_webhook(client, _ready_payload(), delivery="d-tl-1")
-    run_id = client.get("/runs").json()["runs"][0]["id"]
+    run_id = _post_webhook(client, _ready_payload(), delivery="d-tl-1").json()["run"]["id"]
     assert client.get(f"/runs/{run_id}/timeline", headers=AUTH).status_code == 403
 
 
@@ -801,9 +823,9 @@ def test_epic_unknown_run_404(client) -> None:
 
 def test_run_dict_exposes_parent_run_id(client) -> None:
     parent, child = _make_epic(client)
-    child_dict = client.get(f"/runs/{child}").json()
+    child_dict = client.get(f"/runs/{child}", headers=AUTH).json()
     assert child_dict["parent_run_id"] == parent
-    parent_dict = client.get(f"/runs/{parent}").json()
+    parent_dict = client.get(f"/runs/{parent}", headers=AUTH).json()
     assert parent_dict["parent_run_id"] is None
 
 
@@ -1221,7 +1243,7 @@ def test_github_webhook_nudge_absent_row_via_client(client) -> None:
 
 def test_timeline_exposes_full_decision_record(client) -> None:
     _post_webhook(client, _ready_payload(), delivery="d-tl-2")
-    run_id = client.get("/runs").json()["runs"][0]["id"]
+    run_id = client.get("/runs", headers=AUTH).json()["runs"][0]["id"]
     # Approve via the signed Linear comment surface so the agent dispatches.
     approval = {
         "data": {

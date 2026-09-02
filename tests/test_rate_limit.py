@@ -109,8 +109,8 @@ def test_api_requests_throttled_after_limit() -> None:
     client = _make_client(rate_limit_api_per_minute=3)
     # GET /runs falls in the "api" bucket.
     for _ in range(3):
-        assert client.get("/runs").status_code == 200
-    throttled = client.get("/runs")
+        assert client.get("/runs", headers=AUTH).status_code == 200
+    throttled = client.get("/runs", headers=AUTH)
     assert throttled.status_code == 429
     assert throttled.json()["detail"] == "rate limit exceeded; retry later"
     assert int(throttled.headers["Retry-After"]) >= 1
@@ -120,7 +120,7 @@ def test_api_requests_throttled_after_limit() -> None:
 
 def test_rate_limit_headers_on_allowed_response() -> None:
     client = _make_client(rate_limit_api_per_minute=5)
-    resp = client.get("/runs")
+    resp = client.get("/runs", headers=AUTH)
     assert resp.status_code == 200
     assert resp.headers["X-RateLimit-Limit"] == "5"
     assert resp.headers["X-RateLimit-Remaining"] == "4"
@@ -129,8 +129,8 @@ def test_rate_limit_headers_on_allowed_response() -> None:
 def test_webhook_and_api_buckets_are_independent() -> None:
     """Exhausting the API bucket must not throttle webhook deliveries."""
     client = _make_client(rate_limit_api_per_minute=1, rate_limit_webhook_per_minute=5)
-    assert client.get("/runs").status_code == 200
-    assert client.get("/runs").status_code == 429  # api bucket spent
+    assert client.get("/runs", headers=AUTH).status_code == 200
+    assert client.get("/runs", headers=AUTH).status_code == 429  # api bucket spent
 
     # The webhook surface still has its own budget. A correctly-signed delivery
     # is processed (202), not throttled.
@@ -178,12 +178,12 @@ def test_throttled_webhook_does_not_start_run() -> None:
     )
     assert second.status_code == 429
     # Only the first delivery created a run; the throttled one never reached intake.
-    assert len(client.get("/runs").json()["runs"]) == 1
+    assert len(client.get("/runs", headers=AUTH).json()["runs"]) == 1
 
 
 def test_disabled_rate_limiting_lets_everything_through() -> None:
     client = _make_client(rate_limit_enabled=False, rate_limit_api_per_minute=1)
     for _ in range(5):
-        resp = client.get("/runs")
+        resp = client.get("/runs", headers=AUTH)
         assert resp.status_code == 200
         assert "X-RateLimit-Limit" not in resp.headers

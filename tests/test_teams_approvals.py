@@ -26,6 +26,8 @@ from foundry.db import create_all, make_engine, make_session_factory
 from foundry.orchestrator import FoundryOrchestrator
 
 SECRET = "test-secret"
+API_TOKEN = "test-api-token"
+AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
 # Teams issues the shared token as base64; signing keys off its decoded bytes.
 TEAMS_SECRET = base64.b64encode(b"teams-shared-secret").decode("ascii")
 # Approvers are keyed by the Teams/AAD object id (as Slack keys by user.id).
@@ -53,6 +55,7 @@ def _make_client(**overrides) -> TestClient:
         orchestrator=orch,
         approvers=APPROVERS,
         teams_security_token=TEAMS_SECRET,
+        api_token=API_TOKEN,
     )
     kwargs.update(overrides)
     return TestClient(create_app(**kwargs))
@@ -122,7 +125,7 @@ def test_teams_invalid_signature_rejected(client) -> None:
     run_id = _start_ready_run(client)
     resp = _post_teams(client, _activity("approve", "issue-r"), sign=False)
     assert resp.status_code == 401
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_teams_wrong_secret_rejected(client) -> None:
@@ -130,7 +133,7 @@ def test_teams_wrong_secret_rejected(client) -> None:
     other = base64.b64encode(b"nope").decode("ascii")
     resp = _post_teams(client, _activity("approve", "issue-r"), secret=other)
     assert resp.status_code == 401
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_teams_missing_authorization_header_rejected(client) -> None:
@@ -156,7 +159,7 @@ def test_teams_authorised_approve_dispatches(client) -> None:
     assert "approve applied" in body["text"]
     assert "agent_running" in body["text"]
     # The actor is the Teams-signed AAD id, not anything from the message body.
-    assert client.get("/runs").json()["runs"][0]["approved_by"] == APPROVER
+    assert client.get("/runs", headers=AUTH).json()["runs"][0]["approved_by"] == APPROVER
 
 
 def test_teams_unauthorised_user_is_ignored(client) -> None:
@@ -166,7 +169,7 @@ def test_teams_unauthorised_user_is_ignored(client) -> None:
     # Acknowledged (200) so Teams does not retry, but refused.
     assert resp.status_code == 200
     assert "no action" in resp.json()["text"]
-    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting_approval"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "waiting_approval"
 
 
 def test_teams_reject_terminates_run(client) -> None:
@@ -174,7 +177,7 @@ def test_teams_reject_terminates_run(client) -> None:
     resp = _post_teams(client, _activity("reject", "issue-r"))
     assert resp.status_code == 200
     assert "reject applied" in resp.json()["text"]
-    assert client.get(f"/runs/{run_id}").json()["status"] == "rejected"
+    assert client.get(f"/runs/{run_id}", headers=AUTH).json()["status"] == "rejected"
 
 
 def test_teams_non_foundry_message_is_ignored(client) -> None:
@@ -220,7 +223,7 @@ def test_teams_fixture_payload_drives_a_decision() -> None:
     resp = _post_teams(c, payload)
     assert resp.status_code == 200
     assert "approve applied" in resp.json()["text"]
-    assert c.get("/runs").json()["runs"][0]["approved_by"] == user
+    assert c.get("/runs", headers=AUTH).json()["runs"][0]["approved_by"] == user
 
 
 # -- parse_teams_interaction unit contracts ------------------------------------

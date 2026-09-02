@@ -6,7 +6,8 @@ session runs, and resets it afterwards. Being a raw ASGI middleware (not
 ``BaseHTTPMiddleware``) it runs in the request's own event-loop task, so the
 contextvar it sets propagates into every downstream handler — including sync
 endpoints dispatched to the threadpool, which copy the current context — and
-covers endpoints that don't themselves authenticate (e.g. ``GET /runs``).
+covers endpoints that don't themselves authenticate (e.g. ``GET /healthz``
+and the webhook intake).
 
 The org is derived **only** from a cryptographically-verified principal, never
 from a request payload (invariant #5): the configured ``org_claim`` of an OIDC

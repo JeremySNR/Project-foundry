@@ -30,7 +30,7 @@ Two window shapes are supported:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -127,7 +127,7 @@ def validate_window(window: ChangeFreezeWindow) -> None:
     # ``tz`` must resolve for either shape (recurring uses it for the local
     # clock; absolute uses it for naive datetimes).
     try:
-        ZoneInfo(window.tz)
+        _zone(window.tz)
     except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
         raise ValueError(
             f"change_freeze_windows tz {window.tz!r} is not a known IANA zone: {exc}"
@@ -223,7 +223,7 @@ def _window_active(window: ChangeFreezeWindow, now: datetime) -> bool:
         return start <= now < end
 
     # Recurring: evaluate the local clock in the window's zone.
-    zone = ZoneInfo(window.tz)
+    zone = _zone(window.tz)
     local = now.astimezone(zone)
     start = _parse_hhmm(window.start or "00:00")
     duration = _duration_minutes(window.start or "00:00", window.end or "00:00")
@@ -257,8 +257,21 @@ def _duration_minutes(start: str, end: str) -> int:
 def _as_aware(value: datetime, tz: str) -> datetime:
     """Attach ``tz`` to a naive datetime; leave an aware one untouched."""
     if value.tzinfo is None:
-        return value.replace(tzinfo=ZoneInfo(tz))
+        return value.replace(tzinfo=_zone(tz))
     return value
+
+
+def _zone(tz: str) -> tzinfo:
+    """Resolve an IANA zone name.
+
+    ``UTC`` is the default and by far the most common value, so it is served
+    from the stdlib constant rather than the zone database: it then works even
+    where no tzdata is installed at all. Everything else goes through
+    ``zoneinfo`` (backed by the ``tzdata`` package on Windows and slim images).
+    """
+    if tz == "UTC":
+        return timezone.utc
+    return ZoneInfo(tz)
 
 
 # --------------------------------------------------------------------------- #
